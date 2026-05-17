@@ -4,7 +4,7 @@
     push:
       branches: [main]
       paths:
-        - 'DOCS/**'
+        - 'website/**'
         - '.github/workflows/deploy-docs.yml'
     workflow_dispatch:
 
@@ -26,15 +26,15 @@
           with:
             node-version: 20
             cache: npm
-            cache-dependency-path: DOCS/package-lock.json
+            cache-dependency-path: website/package-lock.json
         - run: npm ci
-          working-directory: DOCS
+          working-directory: website
         - run: npm run build
-          working-directory: DOCS
+          working-directory: website
         - uses: actions/configure-pages@v5
         - uses: actions/upload-pages-artifact@v3
           with:
-            path: DOCS/build
+            path: website/build
 
     deploy:
       needs: build
