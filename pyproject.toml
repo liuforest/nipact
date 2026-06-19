@@ -1,0 +1,61 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nipact"
+dynamic = ["version"]
+description = "Lightweight Snakemake wrapper and orchestrator for NIPACT workflows."
+readme = "README.md"
+requires-python = ">=3.12"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [
+    {name = "liuforest", email = "lshangming@gmail.com"},
+]
+keywords = [
+    "snakemake",
+    "workflow",
+    "orchestration",
+    "provenance",
+    "neuroimaging",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering",
+]
+dependencies = [
+    "fastapi>=0.115",
+    "numpy>=1.26",
+    "pydantic>=2.7",
+    "PyYAML>=6.0",
+    "rich>=13.7",
+    "snakemake>=9,<10",
+    "uvicorn>=0.30",
+]
+
+[project.urls]
+Homepage = "https://liuforest.github.io/nipact-docs/"
+Documentation = "https://liuforest.github.io/nipact-docs/"
+Source = "https://github.com/liuforest/nipact"
+Issues = "https://github.com/liuforest/nipact/issues"
+
+[project.scripts]
+nipact = "nipact.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+"nipact.gui" = ["static/index.html", "static/assets/*"]
+
+[tool.setuptools.dynamic]
+version = {attr = "nipact._version.__version__"}
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
