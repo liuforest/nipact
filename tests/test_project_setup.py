@@ -1,0 +1,762 @@
+import json
+import os
+from pathlib import Path
+import sqlite3
+
+import pytest
+import yaml
+
+import nipact.registry as registry_module
+from nipact.cli import main
+from nipact.artifacts import output_filename
+from nipact.examples.colors_processing_demo.model import DEFAULT_ENTITY_COUNT
+from nipact.examples.colors_processing_demo.demo_names import (
+    analysis_entity_ids,
+    fit_cohort_entity_ids,
+)
+from nipact.examples.dynamic_functional_connectivity_demo import (
+    project_template as dfc_template,
+)
+from nipact.examples.fmri_preprocessing_demo import project_template as fmri_template
+from nipact.hashing import sha256_digest, sha256_file_digest, short_hash
+from nipact.manifest import manifest_body, manifest_digest
+from nipact.registry import REGISTRY_SCHEMA_VERSION
+
+
+def _run_main_from(cwd: Path, argv: list[str]) -> int:
+    old_cwd = Path.cwd()
+    os.chdir(cwd)
+    try:
+        return main(argv)
+    finally:
+        os.chdir(old_cwd)
+
+
+def _init_demo(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> tuple[Path, Path]:
+    project_dir = tmp_path / "project"
+    runtime_dir = tmp_path / "runtime"
+
+    assert (
+        _run_main_from(
+            tmp_path,
+            [
+                "init",
+                "--demo",
+                "colors",
+                "--project-dir",
+                "project",
+                "--runtime-dir",
+                "runtime",
+                "--context",
+                "colors",
+            ],
+        )
+        == 0
+    )
+    output = capsys.readouterr().out
+    assert "PASS: init" in output
+    assert "manifest_hash=287318ee136c4518" in output
+    return project_dir, runtime_dir
+
+
+def _init_named_demo(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    *,
+    demo: str,
+) -> tuple[Path, Path]:
+    project_dir = tmp_path / f"{demo}_project"
+    runtime_dir = tmp_path / f"{demo}_runtime"
+
+    assert (
+        _run_main_from(
+            tmp_path,
+            [
+                "init",
+                "--demo",
+                demo,
+                "--project-dir",
+                project_dir.name,
+                "--runtime-dir",
+                runtime_dir.name,
+                "--context",
+                demo,
+            ],
+        )
+        == 0
+    )
+    output = capsys.readouterr().out
+    assert "PASS: init" in output
+    assert "source_index=sources.yaml" in output
+    return project_dir, runtime_dir
+
+
+def _write_generic_prepared_project(
+    tmp_path: Path,
+    *,
+    context: str = "mini",
+) -> tuple[Path, Path]:
+    project_dir = tmp_path / "generic_project"
+    runtime_dir = tmp_path / "generic_runtime"
+    (project_dir / "manifests").mkdir(parents=True)
+    (project_dir / "steps").mkdir()
+    (project_dir / "workflows").mkdir()
+    runtime_dir.mkdir()
+
+    _write_project_config(
+        project_dir,
+        {
+            "context": context,
+            "paths": {
+                "runtime": "../generic_runtime",
+            },
+            "sources": {
+                "index": "sources.yaml",
+            },
+            "manifests": {
+                "subjects": "manifests/subjects.yaml",
+            },
+            "steps": {
+                "directory": "steps",
+            },
+            "workflows": {
+                "main": "workflows/main.yaml",
+            },
+        },
+    )
+    _write_yaml(
+        project_dir / "sources.yaml",
+        {
+            "entities": {
+                "sub_001": {
+                    "source_text": "data/source/sub_001.txt",
+                },
+            },
+        },
+    )
+    _write_yaml(
+        project_dir / "manifests/subjects.yaml",
+        {
+            "description": "Minimal generic prepared-project manifest",
+            "entities": ["sub_001"],
+        },
+    )
+    _write_yaml(
+        project_dir / "steps/source_text.yaml",
+        {
+            "step_name": "source_text",
+            "pattern_kind": "pattern_a",
+            "execution_role": "source_import",
+            "address_scope": "entity",
+            "callable": (
+                "nipact.examples.colors_processing_demo.runtime:"
+                "import_color_source_file"
+            ),
+            "source_inputs": ["source_text"],
+            "manifest_binding": {
+                "role": "source_population",
+                "manifest": "subjects",
+            },
+            "outputs": {
+                "raw_text": {
+                    "extension": ".json",
+                    "address_scope": "entity",
+                },
+            },
+        },
+    )
+    _write_yaml(
+        project_dir / "workflows/main.yaml",
+        {
+            "workflow_name": "main",
+            "steps": [
+                {
+                    "step_name": "source_text",
+                    "output_name": "raw_text",
+                },
+            ],
+        },
+    )
+    return project_dir, runtime_dir
+
+
+def _write_project_config(project_dir: Path, payload: dict[str, object]) -> None:
+    (project_dir / "nipact.yaml").write_text(
+        yaml.safe_dump(payload, sort_keys=False),
+        encoding="utf-8",
+    )
+
+
+def _write_yaml(path: Path, payload: dict[str, object]) -> None:
+    path.write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")
+
+
+def _read_project_config(project_dir: Path) -> dict[str, object]:
+    payload = yaml.safe_load((project_dir / "nipact.yaml").read_text(encoding="utf-8"))
+    assert isinstance(payload, dict)
+    return payload
+
+
+def _assert_validate_passes(
+    project_dir: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    assert (
+        main(
+            [
+                "validate",
+                "--project-dir",
+                str(project_dir),
+                "--context",
+                "colors",
+            ]
+        )
+        == 0
+    )
+    output = capsys.readouterr().out
+    assert "validated_manifests=2" in output
+    assert "parsed_workflow_files=2" in output
+    assert "parsed_step_files=8" in output
+    assert "source_entities=200" in output
+    assert "published_outputs=0" in output
+    assert "PASS: validate" in output
+
+
+def _insert_published_output(
+    runtime_dir: Path,
+    *,
+    workflow_name: str = "base",
+    step_name: str = "color_sector_analysis",
+    output_name: str = "sector_counts",
+    address: str = "init",
+    extension: str = ".json",
+    payload: dict[str, object] | None = None,
+) -> tuple[Path, str, str]:
+    if payload is None:
+        payload = {"status": "ok", "address": address}
+    output_dir = runtime_dir / "outputs" / "colors" / workflow_name / step_name / output_name
+    output_dir.mkdir(parents=True, exist_ok=True)
+    staging_path = output_dir / f"{address}{extension}"
+    staging_path.write_text(
+        json.dumps(payload, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    output_digest = sha256_file_digest(staging_path)
+    output_hash = short_hash(output_digest)
+    output_path = output_dir / output_filename(
+        address=address,
+        output_hash=output_hash,
+        declared_extension=extension,
+    )
+    staging_path.rename(output_path)
+    relative_path = output_path.relative_to(runtime_dir).as_posix()
+    with sqlite3.connect(runtime_dir / "database/registry.db") as conn:
+        conn.execute(
+            """
+            INSERT INTO published_outputs (
+                context, workflow_name, step_name, output_name, address,
+                path, output_digest, output_hash
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "colors",
+                workflow_name,
+                step_name,
+                output_name,
+                address,
+                relative_path,
+                output_digest,
+                output_hash,
+            ),
+        )
+    return output_path, output_digest, output_hash
+
+
+def _assert_validate_fails(
+    project_dir: Path,
+    capsys: pytest.CaptureFixture[str],
+    expected_error: str,
+) -> None:
+    assert (
+        main(
+            [
+                "validate",
+                "--project-dir",
+                str(project_dir),
+                "--context",
+                "colors",
+            ]
+        )
+        == 1
+    )
+    assert expected_error in capsys.readouterr().err
+
+
+def _assert_generic_validate_passes(
+    project_dir: Path,
+    capsys: pytest.CaptureFixture[str],
+    *,
+    context: str = "mini",
+    published_outputs: int = 0,
+) -> None:
+    assert (
+        main(
+            [
+                "validate",
+                "--project-dir",
+                str(project_dir),
+                "--context",
+                context,
+            ]
+        )
+        == 0
+    )
+    output = capsys.readouterr().out
+    assert "validated_manifests=1" in output
+    assert "parsed_workflow_files=1" in output
+    assert "parsed_step_files=1" in output
+    assert "source_entities=0" in output
+    assert f"published_outputs={published_outputs}" in output
+    assert "PASS: validate" in output
+
+
+def test_init_creates_project_runtime_databases_and_validates(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    project_dir, runtime_dir = _init_demo(tmp_path, capsys)
+
+    assert (project_dir / "nipact.yaml").is_file()
+    assert (project_dir / "sources.yaml").is_file()
+    assert (project_dir / "README.md").is_file()
+    assert sorted(path.name for path in (project_dir / "manifests").glob("*.yaml")) == [
+        "demo-40.yaml",
+        "init.yaml",
+    ]
+    assert len(list((project_dir / "steps").glob("*.yaml"))) == 8
+    assert len(list((project_dir / "workflows").glob("*.yaml"))) == 2
+
+    config = _read_project_config(project_dir)
+    assert config["sources"] == {
+        "index": "sources.yaml",
+    }
+    assert config["manifests"] == {
+        "init": "manifests/init.yaml",
+        "demo-40": "manifests/demo-40.yaml",
+    }
+    source_index = yaml.safe_load(
+        (project_dir / "sources.yaml").read_text(encoding="utf-8")
+    )
+    assert source_index == {
+        "global": {
+            "colors_source": "data/color_source.json",
+        },
+    }
+    source_step = yaml.safe_load(
+        (project_dir / "steps/color_source.yaml").read_text(encoding="utf-8")
+    )
+    assert source_step["source_inputs"] == ["colors_source"]
+
+    init_manifest = yaml.safe_load(
+        (project_dir / "manifests/init.yaml").read_text(encoding="utf-8")
+    )
+    assert set(init_manifest) == {"description", "entities"}
+    assert init_manifest["description"] == "Full deterministic colors source population"
+    assert init_manifest["entities"] == analysis_entity_ids()
+
+    fit_manifest = yaml.safe_load(
+        (project_dir / "manifests/demo-40.yaml").read_text(encoding="utf-8")
+    )
+    assert set(fit_manifest) == {"description", "entities"}
+    assert fit_manifest["entities"] == fit_cohort_entity_ids()
+
+    assert (runtime_dir / "data/color_source.json").is_file()
+    assert (runtime_dir / "database/registry.db").is_file()
+    assert not (runtime_dir / "database/analysis.db").exists()
+    assert (runtime_dir / "outputs").is_dir()
+    assert not (runtime_dir / "logs").exists()
+    assert (runtime_dir / "manifests/generated").is_dir()
+
+    source_payload = json.loads(
+        (runtime_dir / "data/color_source.json").read_text(encoding="utf-8")
+    )
+    assert source_payload["metadata"]["entity_count"] == DEFAULT_ENTITY_COUNT
+    assert [record["entity_id"] for record in source_payload["records"]] == analysis_entity_ids()
+
+    with sqlite3.connect(runtime_dir / "database/registry.db") as conn:
+        schema_version = conn.execute("PRAGMA user_version").fetchone()[0]
+        manifest_rows = conn.execute(
+            """
+            SELECT name, path, entity_count, manifest_digest, manifest_hash,
+                   manifest_body
+            FROM manifests
+            ORDER BY name
+            """
+        ).fetchall()
+        artifact_rows = conn.execute(
+            """
+            SELECT origin, context, path, content_digest, output_hash, file_size,
+                   extension, source_metadata_json
+            FROM artifacts
+            ORDER BY artifact_id
+            """
+        ).fetchall()
+        published_rows = conn.execute("SELECT * FROM published_outputs").fetchall()
+    with registry_module._connect_readonly(runtime_dir / "database/registry.db") as conn:
+        foreign_keys = conn.execute("PRAGMA foreign_keys").fetchone()[0]
+    assert schema_version == REGISTRY_SCHEMA_VERSION
+    assert foreign_keys == 1
+    assert manifest_rows == [
+        (
+            "demo-40",
+            "manifests/demo-40.yaml",
+            40,
+            manifest_digest(fit_cohort_entity_ids()),
+            "9db06e41af119408",
+            manifest_body(fit_cohort_entity_ids()),
+        ),
+        (
+            "init",
+            "manifests/init.yaml",
+            200,
+            manifest_digest(analysis_entity_ids()),
+            "287318ee136c4518",
+            manifest_body(analysis_entity_ids()),
+        ),
+    ]
+    source_digest = sha256_file_digest(runtime_dir / "data/color_source.json")
+    source_identity_digest = sha256_digest(
+        json.dumps(
+            source_payload,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode("utf-8")
+    )
+    assert artifact_rows == [
+        (
+            "source",
+            "colors",
+            "data/color_source.json",
+            source_digest,
+            short_hash(source_digest),
+            (runtime_dir / "data/color_source.json").stat().st_size,
+            ".json",
+            json.dumps(
+                {
+                    "entity_count": DEFAULT_ENTITY_COUNT,
+                    "source_digest": source_identity_digest,
+                    "source_hash": short_hash(source_identity_digest),
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+        )
+    ]
+    assert published_rows == []
+    assert list((runtime_dir / "outputs").rglob("*")) == []
+
+    _assert_validate_passes(project_dir, capsys)
+
+
+@pytest.mark.parametrize(
+    ("demo", "template", "step_count", "source_file_count"),
+    [
+        ("fmri", fmri_template, 2, 4),
+        ("dfc", dfc_template, 3, 4),
+    ],
+)
+def test_init_creates_prepared_neuro_demo_project_and_registry(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    demo: str,
+    template: object,
+    step_count: int,
+    source_file_count: int,
+) -> None:
+    project_dir, runtime_dir = _init_named_demo(tmp_path, capsys, demo=demo)
+
+    output = capsys.readouterr().out
+    assert output == ""
+    assert (project_dir / "nipact.yaml").is_file()
+    assert (project_dir / "sources.yaml").is_file()
+    assert (runtime_dir / "database/registry.db").is_file()
+    assert (runtime_dir / "outputs").is_dir()
+    assert (runtime_dir / "manifests/generated").is_dir()
+    assert len(list((project_dir / "steps").glob("*.yaml"))) == step_count
+    assert len(list((project_dir / "workflows").glob("*.yaml"))) == 1
+
+    config = _read_project_config(project_dir)
+    assert config["sources"] == {"index": "sources.yaml"}
+    assert config["manifests"] == template.manifest_paths()
+    assert sorted(
+        path.relative_to(runtime_dir).as_posix()
+        for path in runtime_dir.glob("data/**/*.npy")
+    ) == sorted(template.source_file_paths())
+    source_index = yaml.safe_load(
+        (project_dir / "sources.yaml").read_text(encoding="utf-8")
+    )
+    assert source_index == template.source_index_payload()
+
+    with sqlite3.connect(runtime_dir / "database/registry.db") as conn:
+        schema_version = conn.execute("PRAGMA user_version").fetchone()[0]
+        context_row = conn.execute(
+            "SELECT runtime_path FROM contexts WHERE context = ?",
+            (demo,),
+        ).fetchone()
+        manifest_rows = conn.execute(
+            """
+            SELECT name, path, entity_count, source_artifact_path
+            FROM manifests
+            WHERE context = ?
+            ORDER BY name
+            """,
+            (demo,),
+        ).fetchall()
+        source_artifact_rows = conn.execute(
+            "SELECT COUNT(*) FROM source_artifacts WHERE context = ?",
+            (demo,),
+        ).fetchone()[0]
+        artifact_rows = conn.execute(
+            "SELECT COUNT(*) FROM artifacts WHERE context = ?",
+            (demo,),
+        ).fetchone()[0]
+    assert schema_version == REGISTRY_SCHEMA_VERSION
+    assert context_row == (str(runtime_dir),)
+    assert manifest_rows == [
+        (
+            name,
+            template.manifest_paths()[name],
+            manifest.entity_count,
+            None,
+        )
+        for name, manifest in sorted(template.build_manifests().items())
+    ]
+    assert source_artifact_rows == 0
+    assert artifact_rows == 0
+    assert len(template.source_file_paths()) == source_file_count
+
+    assert (
+        main(
+            [
+                "validate",
+                "--project-dir",
+                str(project_dir),
+                "--context",
+                demo,
+            ]
+        )
+        == 0
+    )
+    validate_output = capsys.readouterr().out
+    assert "validated_manifests=1" in validate_output
+    assert "parsed_workflow_files=1" in validate_output
+    assert f"parsed_step_files={step_count}" in validate_output
+    assert "source_entities=0" in validate_output
+    assert "published_outputs=0" in validate_output
+    assert "PASS: validate" in validate_output
+
+
+def test_validate_accepts_generic_prepared_project_without_registry_or_source_files(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    project_dir, runtime_dir = _write_generic_prepared_project(tmp_path)
+
+    assert not (runtime_dir / "database/registry.db").exists()
+    assert not (runtime_dir / "data/source/sub_001.txt").exists()
+    _assert_generic_validate_passes(project_dir, capsys)
+
+
+def test_validate_fails_for_missing_project_config(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    project_dir = tmp_path / "project"
+    project_dir.mkdir()
+
+    assert (
+        main(
+            [
+                "validate",
+                "--project-dir",
+                str(project_dir),
+                "--context",
+                "colors",
+            ]
+        )
+        == 1
+    )
+    assert "missing YAML file" in capsys.readouterr().err
+
+
+def test_validate_fails_for_missing_manifest(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    project_dir, _runtime_dir = _init_demo(tmp_path, capsys)
+    (project_dir / "manifests/init.yaml").unlink()
+
+    assert (
+        main(
+            [
+                "validate",
+                "--project-dir",
+                str(project_dir),
+                "--context",
+                "colors",
+            ]
+        )
+        == 1
+    )
+    assert "missing manifest file" in capsys.readouterr().err
+
+
+def test_validate_fails_for_configured_manifest_escape(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    project_dir, _runtime_dir = _init_demo(tmp_path, capsys)
+    config = _read_project_config(project_dir)
+    manifests = config["manifests"]
+    assert isinstance(manifests, dict)
+    manifests["init"] = "../outside.yaml"
+    _write_project_config(project_dir, config)
+
+    _assert_validate_fails(project_dir, capsys, "must stay inside project dir")
+
+
+def test_validate_fails_for_missing_source_data(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    project_dir, runtime_dir = _init_demo(tmp_path, capsys)
+    (runtime_dir / "data/color_source.json").unlink()
+
+    assert (
+        main(
+            [
+                "validate",
+                "--project-dir",
+                str(project_dir),
+                "--context",
+                "colors",
+            ]
+        )
+        == 1
+    )
+    assert "missing JSON file" in capsys.readouterr().err
+
+
+def test_validate_fails_for_changed_source_content(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    project_dir, runtime_dir = _init_demo(tmp_path, capsys)
+    source_path = runtime_dir / "data/color_source.json"
+    source_payload = json.loads(source_path.read_text(encoding="utf-8"))
+    source_payload["records"][0]["value"] = 0.123
+    source_path.write_text(json.dumps(source_payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+    assert (
+        main(
+            [
+                "validate",
+                "--project-dir",
+                str(project_dir),
+                "--context",
+                "colors",
+            ]
+        )
+        == 1
+    )
+    assert "source data content" in capsys.readouterr().err
+
+
+def test_validate_fails_for_malformed_database(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    project_dir, runtime_dir = _init_demo(tmp_path, capsys)
+    (runtime_dir / "database/registry.db").write_text("not sqlite\n", encoding="utf-8")
+
+    assert (
+        main(
+            [
+                "validate",
+                "--project-dir",
+                str(project_dir),
+                "--context",
+                "colors",
+            ]
+        )
+        == 1
+    )
+    assert "registry.db is malformed" in capsys.readouterr().err
+
+
+def test_validate_fails_for_stale_registry_source_row(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    project_dir, runtime_dir = _init_demo(tmp_path, capsys)
+    with sqlite3.connect(runtime_dir / "database/registry.db") as conn:
+        conn.execute(
+            "UPDATE source_artifacts SET source_hash = ? WHERE context = ?",
+            ("bad-source-hash", "colors"),
+        )
+
+    _assert_validate_fails(project_dir, capsys, "registry.db source artifact row")
+
+
+def test_validate_accepts_registered_published_output(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    project_dir, runtime_dir = _init_demo(tmp_path, capsys)
+    _insert_published_output(runtime_dir)
+
+    assert (
+        main(
+            [
+                "validate",
+                "--project-dir",
+                str(project_dir),
+                "--context",
+                "colors",
+            ]
+        )
+        == 0
+    )
+    output = capsys.readouterr().out
+    assert "published_outputs=1" in output
+    assert "PASS: validate" in output
+
+
+@pytest.mark.parametrize(
+    ("output_artifact_path", "expected_error"),
+    [
+        ("../outside.json", "must be under outputs/"),
+        ("/tmp/outside.json", "must be relative to runtime dir"),
+        ("data/outside.json", "must be under outputs/"),
+    ],
+)
+def test_validate_fails_for_published_output_path_escape(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    output_artifact_path: str,
+    expected_error: str,
+) -> None:
+    project_dir, runtime_dir = _init_demo(tmp_path, capsys)
+    _insert_published_output(runtime_dir)
+    with sqlite3.connect(runtime_dir / "database/registry.db") as conn:
+        conn.execute(
+            "UPDATE published_outputs SET path = ? WHERE context = ?",
+            (output_artifact_path, "colors"),
+        )
+
+    _assert_validate_fails(project_dir, capsys, expected_error)

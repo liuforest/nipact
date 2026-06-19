@@ -1,0 +1,140 @@
+# NIPACT
+
+NIPACT is a Python package and CLI tool for orchestrating, executing, and auditing scientific workflows. Currently it is built around Snakemake and uses a SQLite registry for tracking steps and artifacts.
+
+Public documentation lives in a separate repository, `nipact-docs`. See: https://liuforest.github.io/nipact-docs/.
+
+Contents:
+- a `nipact` Python package under `src/`
+- deterministic packaged demo generators used by the tests
+
+Features:
+- Workflow inspection commands (`workflow list`, `workflow steps`, `workflow plan`, `workflow graph`)
+- Workflow execution via Snakemake (`workflow run`)
+- Runtime artifact provenance auditing in a SQLite registry (`trace`)
+- Project-specific GUI viewer for browsing workflow runs, artifacts, and provenance (`gui`)
+- Fully runnable colors demo with synthetic data and no external dependencies
+
+Work in Progress:
+- fMRI and dFC demos
+
+
+## Installation
+
+Initial pre-release is `0.0.1a1`. Install it from PyPI in a clean
+environment:
+
+```bash
+python -m pip install nipact==0.0.1a1
+nipact --version
+```
+
+For development from this repo:
+
+```bash
+python -m pip install -e . pytest
+```
+
+## Local Setup
+
+Install the package and test runner from the repo root:
+
+```bash
+python -m pip install -e . pytest
+```
+
+Run the Python tests:
+
+```bash
+python -m pytest
+```
+
+
+## Colors Demo via CLI
+
+See more details in the documentation at https://liuforest.github.io/nipact-docs/
+
+The current release supports three packaged demos:
+
+```bash
+nipact init \
+  --demo colors \
+  --project-dir demos/colors/project \
+  --runtime-dir demos/colors/runtime
+
+nipact validate --context colors
+```
+
+```bash
+nipact init \
+  --demo fmri \
+  --project-dir demos/fmri/project \
+  --runtime-dir demos/fmri/runtime
+
+nipact validate --context fmri
+```
+
+```bash
+nipact init \
+  --demo dfc \
+  --project-dir demos/dfc/project \
+  --runtime-dir demos/dfc/runtime
+
+nipact validate --context dfc
+```
+
+NOTES:
+`--project-dir` and `--runtime-dir` must be empty and must not contain each other.
+
+`init` creates a generated demo project plus mutable runtime files. The project contains `nipact.yaml`, `sources.yaml`, manifests, step YAML, and workflow YAML.
+
+The runtime contains demo source files under `data/` and `database/registry.db`. It also writes `nipact.contexts.yaml` in the current workspace so later commands can resolve `--context <demo>` to the generated project root. The context index is workspace-local state; this repository ignores the root file so source-checkout testing does not add tutorial state to version control. `validate` is read-only.
+
+Workflow inspection and execution:
+
+```bash
+nipact workflow list \
+  --context colors
+
+nipact workflow steps \
+  --context colors \
+  --workflow base
+
+nipact workflow plan \
+  --context colors \
+  --workflow base \
+  --step color_sector_analysis
+
+nipact workflow graph \
+  --context colors \
+  --workflow base \
+  --step color_sector_analysis
+
+nipact workflow run \
+  --context colors \
+  --workflow base \
+  --step color_sector_analysis \
+  --dry-run
+
+nipact workflow run \
+  --context colors \
+  --workflow base \
+  --step color_sector_analysis \
+  --cores 1
+
+nipact trace \
+  --context colors \
+  --workflow base \
+  --step color_sector_analysis \
+  --output sector_counts \
+  --address init
+
+nipact gui \
+  --context colors \
+  --port 8765
+```
+
+`trace` and `gui` read `runtime/database/registry.db`. The GUI binds to `127.0.0.1` and serves a local browser view for current workflows, manifests, artifacts, workflow topology, and focused artifact lineage.
+
+The gui is for viewing only, not to execute workflows, registry rows, etc.
+

@@ -1,0 +1,9 @@
+export const queryKeys = {
+  summary: ["summary"] as const,
+  workflows: ["workflows"] as const,
+  manifests: ["manifests"] as const,
+  manifest: (manifestName: string) => ["manifest", manifestName] as const,
+  artifacts: ["artifacts"] as const,
+  artifact: (artifactId: number) => ["artifact", artifactId] as const,
+  lineage: (artifactId: number) => ["lineage", artifactId] as const,
+};

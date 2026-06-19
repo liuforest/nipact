@@ -1,0 +1,89 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install --upgrade pip
+      - run: python -m pip install -e . pytest
+      - run: python -m pytest
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: src/nipact/gui/frontend/package-lock.json
+      - run: npm ci
+        working-directory: src/nipact/gui/frontend
+      - run: npm run test
+        working-directory: src/nipact/gui/frontend
+      - run: npm run typecheck
+        working-directory: src/nipact/gui/frontend
+      - run: npm run build
+        working-directory: src/nipact/gui/frontend
+
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install --upgrade pip build twine "packaging>=24.2"
+      - name: Clean stale build artifacts
+        run: rm -rf build dist src/*.egg-info
+      - name: Build sdist and wheel
+        run: python -m build --sdist --wheel
+      - name: Twine metadata check
+        run: python -m twine check dist/*
+      - name: Inspect wheel contents
+        run: |
+          python - <<'PY'
+          import glob, zipfile
+          wheels = glob.glob('dist/*.whl')
+          assert len(wheels) == 1, f"expected one wheel, found {wheels}"
+          names = zipfile.ZipFile(wheels[0]).namelist()
+          banned = [
+              n for n in names
+              if '.local/' in n
+              or 'node_modules/' in n
+              or '__pycache__/' in n
+              or n.endswith('.pyc')
+          ]
+          assert not banned, f"banned entries in wheel: {banned[:20]}"
+          assert any(n.startswith('nipact/gui/static/') for n in names), \
+              "wheel is missing nipact/gui/static assets"
+          print(f"wheel ok: {len(names)} entries")
+          PY
+      - name: Installed-wheel smoke test
+        run: |
+          python -m venv /tmp/wheel-smoke
+          /tmp/wheel-smoke/bin/pip install --upgrade pip
+          /tmp/wheel-smoke/bin/pip install dist/*.whl
+          export PATH="/tmp/wheel-smoke/bin:$PATH"
+          cd /tmp
+          mkdir -p nipact-wheel-smoke/demos/colors/project nipact-wheel-smoke/demos/colors/runtime
+          cd nipact-wheel-smoke
+          nipact --version
+          nipact --help
+          nipact init --demo colors --project-dir demos/colors/project --runtime-dir demos/colors/runtime
+          nipact validate --context colors
+          nipact workflow list --context colors
+          nipact workflow steps --context colors --workflow base
+          nipact workflow plan --context colors --workflow base --step color_sector_analysis
+          nipact workflow graph --context colors --workflow base --step color_sector_analysis
+          nipact workflow run --context colors --workflow base --step color_sector_analysis --dry-run
+          nipact workflow run --context colors --workflow base --step color_sector_analysis --cores 1
+          nipact trace --context colors --workflow base --step color_sector_analysis --output sector_counts --address init
