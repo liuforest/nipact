@@ -6,6 +6,7 @@ import pytest
 
 from nipact._version import __version__
 from nipact.cli import main
+from nipact.execution import RunOutcome
 
 
 def _run_main_from(cwd: Path, argv: list[str]) -> int:
@@ -268,7 +269,7 @@ def test_workflow_run_command_executes_step(
 ) -> None:
     project_dir, _runtime_dir = _init_demo(tmp_path, capsys)
 
-    def publish_stub(*_args: object, **kwargs: object) -> int:
+    def publish_stub(*_args: object, **kwargs: object) -> RunOutcome:
         status_callback = kwargs["status_callback"]
         assert kwargs["cores"] == 2
         assert kwargs["dry_run"] is False
@@ -280,7 +281,11 @@ def test_workflow_run_command_executes_step(
             "registry_updated",
         ):
             status_callback(event)
-        return 1
+        return RunOutcome(
+            published_count=1,
+            failed_jobs=(),
+            all_selected_published=True,
+        )
 
     monkeypatch.setattr("nipact.execution.execute_run_plan", publish_stub)
     clock = iter([10.0, 12.5])
@@ -351,6 +356,46 @@ def test_workflow_run_command_executes_step(
         "elapsed_seconds=2.500",
         "PASS: workflow run",
     ]
+
+
+def test_workflow_run_partial_publish_exits_non_zero(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project_dir, _runtime_dir = _init_demo(tmp_path, capsys)
+
+    def partial_stub(*_args: object, **_kwargs: object) -> RunOutcome:
+        return RunOutcome(
+            published_count=2,
+            failed_jobs=(("color_sector_analysis", "sub_003", "missing staged output"),),
+            all_selected_published=False,
+        )
+
+    monkeypatch.setattr("nipact.execution.execute_run_plan", partial_stub)
+    monkeypatch.setattr("nipact.cli.perf_counter", iter([10.0, 12.5]).__next__)
+    monkeypatch.chdir(tmp_path)
+
+    exit_code = main(
+        [
+            "workflow",
+            "run",
+            *_workflow_context_args(),
+            "--workflow",
+            "base",
+            "--step",
+            "color_sector_analysis",
+        ]
+    )
+    assert exit_code == 1
+
+    output = capsys.readouterr().out.splitlines()
+    assert "published_outputs=2" in output
+    assert (
+        "failed_job=color_sector_analysis sub_003 (missing staged output)" in output
+    )
+    assert "PARTIAL: workflow run" in output
+    assert "PASS: workflow run" not in output
 
 
 def test_workflow_run_rejects_non_positive_cores(

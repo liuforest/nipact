@@ -90,7 +90,7 @@ def _successful_sector_run(
         _write_all_staged_outputs(run_plan)
 
     monkeypatch.setattr("nipact.execution._run_snakemake", write_staged_outputs)
-    assert execute_run_plan(run_plan, cores=1) == len(run_plan.published_outputs)
+    assert execute_run_plan(run_plan, cores=1).published_count == len(run_plan.published_outputs)
     return project_dir, runtime_dir, run_plan
 
 
