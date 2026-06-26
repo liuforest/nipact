@@ -997,11 +997,13 @@ def test_failed_snakemake_run_does_not_update_registry(
         step_name="color_local_transform",
     )
 
-    def fail_snakemake(*_args: object, **_kwargs: object) -> None:
-        raise ValidationError("Snakemake failed")
+    def ran_and_failed(*_args: object, **_kwargs: object) -> int:
+        # A Snakemake subprocess that ran, exited non-zero, and left no staged
+        # outputs: the §3.1 hard-error branch (publish nothing + non-zero exit).
+        return 1
 
-    monkeypatch.setattr("nipact.execution._run_snakemake", fail_snakemake)
-    with pytest.raises(ValidationError, match="Snakemake failed"):
+    monkeypatch.setattr("nipact.execution._run_snakemake", ran_and_failed)
+    with pytest.raises(ValidationError, match="Snakemake failed with exit code 1"):
         execute_run_plan(run_plan, cores=1)
 
     with sqlite3.connect(runtime_dir / "database/registry.db") as conn:
@@ -1027,6 +1029,195 @@ def test_failed_snakemake_run_does_not_update_registry(
         "dependencies": 0,
         "manifest_bindings": 0,
     }
+
+
+def test_partial_publish_records_surviving_jobs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project_dir, runtime_dir = _write_tiny_non_colors_project(tmp_path, monkeypatch)
+    run_plan = build_run_plan(
+        project_dir=project_dir,
+        context="mini",
+        workflow_name="main",
+        step_name="uppercase_text",
+    )
+
+    def run_all_but_sub_002(*_args: object, **_kwargs: object) -> int:
+        run_plan_path = run_plan.run_workspace / "run_plan.json"
+        for job in run_plan.jobs:
+            if job.address == "sub_002":
+                continue  # simulate sub_002 failing under --keep-going
+            run_job(run_plan_path=run_plan_path, job_id=job.job_id)
+        return 1
+
+    monkeypatch.setattr("nipact.execution._run_snakemake", run_all_but_sub_002)
+
+    # sub_001 publishes both of its jobs; sub_002 publishes nothing, and the run
+    # records the survivors instead of rolling everything back.
+    assert execute_run_plan(run_plan, cores=1) == 2
+
+    with sqlite3.connect(runtime_dir / "database/registry.db") as conn:
+        published = conn.execute(
+            "SELECT step_name, output_name, address FROM published_outputs "
+            "ORDER BY step_name, output_name, address"
+        ).fetchall()
+        artifacts = conn.execute(
+            "SELECT step_name, output_name, address FROM artifacts "
+            "WHERE origin = 'workflow_output' ORDER BY step_name, output_name, address"
+        ).fetchall()
+        workflow_runs = conn.execute("SELECT COUNT(*) FROM workflow_runs").fetchone()[0]
+    expected = [
+        ("source_text", "raw_text", "sub_001"),
+        ("uppercase_text", "upper_text", "sub_001"),
+    ]
+    assert published == expected
+    assert artifacts == expected
+    assert workflow_runs == 1
+
+
+def test_multi_output_partial_sibling_prunes_orphan_child(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project_dir, runtime_dir = _write_tiny_multi_output_project(tmp_path, monkeypatch)
+    run_plan = build_run_plan(
+        project_dir=project_dir,
+        context="multi",
+        workflow_name="consume_qc",
+        step_name="qc_echo",
+    )
+
+    def run_then_drop_sub_002_raw_text(*_args: object, **_kwargs: object) -> int:
+        run_plan_path = run_plan.run_workspace / "run_plan.json"
+        for job in run_plan.jobs:
+            run_job(run_plan_path=run_plan_path, job_id=job.job_id)
+        # sub_002's source_text loses one sibling (raw_text); raw_qc stays, and
+        # qc_echo has already consumed it. The parent job is now incomplete.
+        (
+            run_plan.run_workspace / "staging/source_text/raw_text/sub_002.json"
+        ).unlink()
+        return 1
+
+    monkeypatch.setattr(
+        "nipact.execution._run_snakemake", run_then_drop_sub_002_raw_text
+    )
+
+    # sub_001 fully publishes (source_text x2 + qc_echo). For sub_002: source_text
+    # is skipped for the missing sibling, and qc_echo (which consumed raw_qc) is
+    # pruned as an orphan so it cannot trigger record_workflow_run's whole-batch
+    # rollback. The independent survivor sub_001 is still recorded.
+    assert execute_run_plan(run_plan, cores=1) == 3
+
+    with sqlite3.connect(runtime_dir / "database/registry.db") as conn:
+        published = conn.execute(
+            "SELECT step_name, output_name, address FROM published_outputs "
+            "ORDER BY step_name, output_name, address"
+        ).fetchall()
+        artifacts = conn.execute(
+            "SELECT step_name, output_name, address FROM artifacts "
+            "WHERE origin = 'workflow_output' ORDER BY step_name, output_name, address"
+        ).fetchall()
+        workflow_runs = conn.execute("SELECT COUNT(*) FROM workflow_runs").fetchone()[0]
+    expected = [
+        ("qc_echo", "qc_echo", "sub_001"),
+        ("source_text", "raw_qc", "sub_001"),
+        ("source_text", "raw_text", "sub_001"),
+    ]
+    assert published == expected
+    assert artifacts == expected
+    assert workflow_runs == 1
+
+
+def test_rerun_reuses_partial_survivors_without_recompute(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project_dir, runtime_dir = _write_tiny_non_colors_project(tmp_path, monkeypatch)
+
+    plan_one = build_run_plan(
+        project_dir=project_dir,
+        context="mini",
+        workflow_name="main",
+        step_name="uppercase_text",
+    )
+
+    def run_all_but_sub_002(*_args: object, **_kwargs: object) -> int:
+        run_plan_path = plan_one.run_workspace / "run_plan.json"
+        for job in plan_one.jobs:
+            if job.address == "sub_002":
+                continue
+            run_job(run_plan_path=run_plan_path, job_id=job.job_id)
+        return 1
+
+    monkeypatch.setattr("nipact.execution._run_snakemake", run_all_but_sub_002)
+    assert execute_run_plan(plan_one, cores=1) == 2
+
+    # Run 2: sub_001's upstream source_text is now reusable, so it is hydrated
+    # rather than recomputed; only sub_002 and the always-rebuilt selected step
+    # remain as jobs.
+    plan_two = build_run_plan(
+        project_dir=project_dir,
+        context="mini",
+        workflow_name="main",
+        step_name="uppercase_text",
+    )
+    reused_keys = {
+        (ref.step_name, ref.output_name, ref.address)
+        for ref in plan_two.reused_outputs
+    }
+    job_addresses = {(job.step_name, job.address) for job in plan_two.jobs}
+    assert ("source_text", "raw_text", "sub_001") in reused_keys
+    assert ("source_text", "sub_001") not in job_addresses
+    assert ("source_text", "sub_002") in job_addresses
+
+    executed: list[str] = []
+
+    def run_all(*_args: object, **_kwargs: object) -> int:
+        run_plan_path = plan_two.run_workspace / "run_plan.json"
+        for job in plan_two.jobs:
+            executed.append(job.job_id)
+            run_job(run_plan_path=run_plan_path, job_id=job.job_id)
+        return 0
+
+    monkeypatch.setattr("nipact.execution._run_snakemake", run_all)
+    execute_run_plan(plan_two, cores=1)
+
+    # The reused survivor was never re-executed.
+    assert all(
+        "source_text__raw_text__sub_001" not in job_id for job_id in executed
+    )
+    with sqlite3.connect(runtime_dir / "database/registry.db") as conn:
+        addresses = conn.execute(
+            "SELECT DISTINCT address FROM published_outputs "
+            "WHERE step_name = 'uppercase_text' ORDER BY address"
+        ).fetchall()
+    assert [row[0] for row in addresses] == ["sub_001", "sub_002"]
+
+
+def test_launch_failure_raises_without_publishing(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project_dir, runtime_dir = _init_demo(tmp_path, capsys)
+    run_plan = build_run_plan(
+        project_dir=project_dir,
+        context="colors",
+        workflow_name="base",
+        step_name="color_sector_analysis",
+    )
+
+    def raise_file_not_found(*_args: object, **_kwargs: object) -> object:
+        raise FileNotFoundError("python interpreter is missing")
+
+    monkeypatch.setattr("nipact.execution.subprocess.run", raise_file_not_found)
+    with pytest.raises(ValidationError, match="could not execute Python interpreter"):
+        execute_run_plan(run_plan, cores=1)
+
+    with sqlite3.connect(runtime_dir / "database/registry.db") as conn:
+        assert conn.execute("SELECT COUNT(*) FROM published_outputs").fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM workflow_runs").fetchone()[0] == 0
 
 
 def test_dry_run_does_not_publish_outputs(

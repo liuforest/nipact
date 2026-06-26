@@ -276,7 +276,13 @@ def execute_run_plan(
     dry_run: bool = False,
     status_callback: RunStatusCallback | None = None,
 ) -> int:
-    """Run a workflow plan through Snakemake and publish declared outputs."""
+    """Run a workflow plan through Snakemake and publish completed jobs best-effort.
+
+    Snakemake runs with ``--keep-going``, so a single failed job no longer aborts
+    the run: every job whose declared outputs all landed in staging is published
+    and recorded, the failures are skipped, and the survivors stay reusable. A run
+    that published nothing while Snakemake exited non-zero is the one hard error.
+    """
     if cores <= 0:
         raise ValidationError("cores must be a positive integer")
     _emit_status(status_callback, "building_workspace")
@@ -285,14 +291,22 @@ def execute_run_plan(
     if not dry_run:
         _remove_expected_staged_outputs(run_plan)
     _emit_status(status_callback, "starting_snakemake")
-    _run_snakemake(run_plan, cores=cores, dry_run=dry_run)
+    returncode = _run_snakemake(run_plan, cores=cores, dry_run=dry_run)
     _emit_status(status_callback, "snakemake_complete")
     if dry_run:
         return 0
     _emit_status(status_callback, "publishing_outputs")
-    published_results = _publish_run_outputs(run_plan)
+    published_results = _prune_orphan_published_jobs(
+        run_plan,
+        _publish_run_outputs(run_plan),
+    )
     published_rows = tuple(result.row for result in published_results)
     created_rows = tuple(result.row for result in published_results if result.created)
+    if not published_rows and returncode != 0:
+        log_path = run_plan.run_workspace / "logs" / "snakemake.log"
+        raise ValidationError(
+            f"Snakemake failed with exit code {returncode}; see {log_path}"
+        )
     try:
         artifact_rows = _workflow_output_artifact_rows(
             run_plan,
@@ -335,16 +349,41 @@ def publish_run_outputs(run_plan: RunPlan) -> tuple[PublishedOutputRow, ...]:
 
 
 def _publish_run_outputs(run_plan: RunPlan) -> tuple[_PublishedOutputResult, ...]:
-    """Publish declared outputs from reachable non-reused jobs."""
+    """Publish declared outputs from reachable non-reused jobs, best-effort per job.
+
+    The atomic unit is the job (step + address): a job publishes iff all of its
+    declared sibling outputs are present in staging. A job with any missing or
+    invalid sibling is skipped without rolling back the jobs that did publish.
+    Only plan-construction errors still raise.
+    """
     publishable_outputs = _output_refs_by_key(run_plan.jobs)
-    preflight_rows: list[tuple[PublishedOutputSpec, RunJobOutputRef, str, str, str]] = []
+    specs_by_job: dict[tuple[str, str], list[PublishedOutputSpec]] = {}
     for spec in run_plan.published_outputs:
+        specs_by_job.setdefault((spec.step_name, spec.address), []).append(spec)
+    results: list[_PublishedOutputResult] = []
+    for specs in specs_by_job.values():
+        results.extend(_publish_one_job(run_plan, specs, publishable_outputs))
+    return tuple(results)
+
+
+def _publish_one_job(
+    run_plan: RunPlan,
+    specs: list[PublishedOutputSpec],
+    publishable_outputs: dict[tuple[str, str, str], RunJobOutputRef],
+) -> list[_PublishedOutputResult]:
+    """Publish one job's sibling outputs, or none if the job is incomplete."""
+    preflight_rows: list[tuple[PublishedOutputSpec, RunJobOutputRef, str, str, str]] = []
+    for spec in specs:
         key = (spec.step_name, spec.output_name, spec.address)
         try:
             output_ref = publishable_outputs[key]
         except KeyError as exc:
             raise ValidationError("run plan is missing a publishable output") from exc
-        _validate_staged_output_file(output_ref.staging_path)
+        if not output_ref.staging_path.is_file():
+            # A missing or non-file sibling means the producing job is incomplete
+            # (its process did not write every declared output). Skip the whole
+            # job rather than publish a partial set of siblings.
+            return []
         output_digest = sha256_file_digest(output_ref.staging_path)
         output_hash = short_hash(output_digest)
         final_name = output_filename(
@@ -394,12 +433,11 @@ def _publish_run_outputs(run_plan: RunPlan) -> tuple[_PublishedOutputResult, ...
                     created=not final_path_existed,
                 )
             )
-    except Exception:
-        _remove_published_output_files(
-            run_plan.runtime_root,
-            tuple(result.row for result in results if result.created),
-        )
-        raise
+    except ValidationError:
+        # Skip this job only. Any sibling already copied stays as an inert,
+        # content-addressed orphan: it is never reusable without a registry row,
+        # which a skipped job never gets, so no batch rollback is needed.
+        return []
     finally:
         for temp_path in temp_paths:
             if temp_path.is_file() or temp_path.is_symlink():
@@ -408,14 +446,67 @@ def _publish_run_outputs(run_plan: RunPlan) -> tuple[_PublishedOutputResult, ...
                 except OSError:
                     pass
 
-    return tuple(results)
+    return results
 
 
-def _validate_staged_output_file(path: Path) -> None:
-    if path.is_dir():
-        raise ValidationError(f"staged output path is a directory: {path}")
-    if not path.is_file():
-        raise ValidationError(f"missing staged output: {path}")
+def _prune_orphan_published_jobs(
+    run_plan: RunPlan,
+    published_results: tuple[_PublishedOutputResult, ...],
+) -> tuple[_PublishedOutputResult, ...]:
+    """Drop published jobs whose fresh workflow-output parents were not published.
+
+    Best-effort publishing can land a child while skipping a parent (e.g. a
+    multi-output parent missing one sibling). Recording such an orphan would make
+    ``record_workflow_run`` raise on the dangling dependency and roll back the
+    entire partial record, so prune orphans to a fixpoint first (a child dropped
+    this round can orphan its own children the next round). Reused parents are
+    validated separately by ``record_workflow_run`` and need no pruning.
+    """
+    jobs_by_address = {(job.step_name, job.address): job for job in run_plan.jobs}
+    published_keys = {
+        (result.row.step_name, result.row.output_name, result.row.address)
+        for result in published_results
+    }
+    dropped: set[tuple[str, str]] = set()
+    changed = True
+    while changed:
+        changed = False
+        for result in published_results:
+            job_address = (result.row.step_name, result.row.address)
+            if job_address in dropped:
+                continue
+            job = jobs_by_address.get(job_address)
+            if job is None or not _has_unpublished_fresh_parent(job, published_keys):
+                continue
+            dropped.add(job_address)
+            published_keys -= {
+                key for key in published_keys if (key[0], key[2]) == job_address
+            }
+            changed = True
+    if not dropped:
+        return published_results
+    return tuple(
+        result
+        for result in published_results
+        if (result.row.step_name, result.row.address) not in dropped
+    )
+
+
+def _has_unpublished_fresh_parent(
+    job: RunJob,
+    published_keys: set[tuple[str, str, str]],
+) -> bool:
+    for record in job.input_records:
+        if record.origin != "workflow_output" or record.registry_source_artifact_id is not None:
+            continue
+        parent_key = (
+            record.source_step_name,
+            record.source_output_name,
+            record.source_address,
+        )
+        if parent_key not in published_keys:
+            return True
+    return False
 
 
 def _validate_existing_published_file(path: Path, *, expected_digest: str) -> None:
@@ -507,7 +598,7 @@ def _hydrate_reused_outputs(run_plan: RunPlan) -> None:
             raise ValidationError("hydrated artifact digest mismatch")
 
 
-def _run_snakemake(run_plan: RunPlan, *, cores: int, dry_run: bool) -> None:
+def _run_snakemake(run_plan: RunPlan, *, cores: int, dry_run: bool) -> int:
     command = [
         sys.executable,
         "-m",
@@ -557,10 +648,11 @@ def _run_snakemake(run_plan: RunPlan, *, cores: int, dry_run: bool) -> None:
         f"{result.stderr}\n",
         encoding="utf-8",
     )
-    if result.returncode != 0:
-        raise ValidationError(
-            f"Snakemake failed with exit code {result.returncode}; see {log_path}"
-        )
+    # Return the exit code without raising: a non-zero exit means at least one
+    # job failed under --keep-going, but the jobs that finished are still
+    # publishable. execute_run_plan decides success/partial/hard-error from the
+    # filesystem + this code (§3.1). Only a launch failure (above) hard-aborts.
+    return result.returncode
 
 
 def _snakefile_text(run_plan: RunPlan) -> str:
@@ -683,6 +775,7 @@ def _workflow_output_artifact_rows(
         (row.step_name, row.output_name, row.address): row
         for row in published_rows
     }
+    published_jobs = {(row.step_name, row.address) for row in published_rows}
     selected_output_keys = {
         (output_ref.step_name, output_ref.output_name, output_ref.address)
         for output_ref in run_plan.selected_output_refs
@@ -692,42 +785,31 @@ def _workflow_output_artifact_rows(
     for job in run_plan.jobs:
         if job.job_id not in reachable_job_ids:
             continue
-        existing_outputs = [
-            job.output_ref(output_name)
-            for output_name, output in job.outputs.items()
-            if output.staging_path.is_file()
-        ]
-        if not existing_outputs:
+        # Record exactly the jobs §3.2 published: publishing is job-atomic, so a
+        # published job has every sibling in published_by_key, and a skipped job
+        # contributes no rows. This keeps the recorded set identical to the
+        # published set instead of diverging from staging-file presence.
+        if (job.step_name, job.address) not in published_jobs:
             continue
-        if len(existing_outputs) != len(job.outputs):
-            missing_names = sorted(
-                output_name
-                for output_name, output in job.outputs.items()
-                if not output.staging_path.is_file()
-            )
-            raise ValidationError(
-                f"missing staged sibling output(s) for job {job.job_id}: "
-                f"{', '.join(missing_names)}"
-            )
-        for output_ref in existing_outputs:
+        for output_name in job.outputs:
+            output_ref = job.output_ref(output_name)
+            key = (output_ref.step_name, output_ref.output_name, output_ref.address)
+            published_row = published_by_key[key]
             digest = sha256_file_digest(output_ref.staging_path)
             output_hash = short_hash(digest)
-            key = (output_ref.step_name, output_ref.output_name, output_ref.address)
-            published_row = published_by_key.get(key)
             staging_path = _runtime_relative_path(
                 run_plan.runtime_root,
                 output_ref.staging_path,
             )
-            published_path = published_row.path if published_row is not None else None
             rows.append(
                 WorkflowOutputArtifactRow(
                     step_name=output_ref.step_name,
                     output_name=output_ref.output_name,
                     address=output_ref.address,
                     job_id=output_ref.job_id,
-                    path=published_path or staging_path,
+                    path=published_row.path,
                     staging_path=staging_path,
-                    published_path=published_path,
+                    published_path=published_row.path,
                     content_digest=digest,
                     output_hash=output_hash,
                     file_size=output_ref.staging_path.stat().st_size,
@@ -735,7 +817,7 @@ def _workflow_output_artifact_rows(
                     parameters_json=_compact_json(output_ref.params),
                     callable_ref=output_ref.callable_ref,
                     is_selected_output=key in selected_output_keys,
-                    is_published=published_row is not None,
+                    is_published=True,
                     input_records=output_ref.input_records,
                 )
             )
