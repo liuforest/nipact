@@ -516,7 +516,6 @@ def _run_snakemake(run_plan: RunPlan, *, cores: int, dry_run: bool) -> None:
         "Snakefile",
         "--cores",
         str(cores),
-        "--keep-incomplete",
         "--rerun-incomplete",
         "--keep-going",
         "--profile",
