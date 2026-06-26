@@ -599,7 +599,7 @@ def test_multi_output_run_registers_sibling_outputs_and_exact_dependency(
         step_name="qc_echo",
     )
 
-    assert execute_run_plan(run_plan, cores=1) == len(run_plan.published_outputs)
+    assert execute_run_plan(run_plan, cores=1).published_count == len(run_plan.published_outputs)
 
     registry_path = runtime_dir / "database/registry.db"
     with sqlite3.connect(registry_path) as conn:
@@ -700,7 +700,7 @@ def test_execute_run_plan_publishes_selected_outputs_without_real_snakemake(
         run_plan,
         cores=2,
         status_callback=events.append,
-    ) == len(run_plan.published_outputs)
+    ).published_count == len(run_plan.published_outputs)
     assert events == [
         "building_workspace",
         "starting_snakemake",
@@ -840,7 +840,7 @@ def test_tiny_non_colors_run_registers_used_sources_and_trace(
 
     monkeypatch.setattr("nipact.execution._run_snakemake", run_jobs_through_runtime)
 
-    assert execute_run_plan(run_plan, cores=1) == len(run_plan.published_outputs)
+    assert execute_run_plan(run_plan, cores=1).published_count == len(run_plan.published_outputs)
 
     registry_path = runtime_dir / "database/registry.db"
     with sqlite3.connect(registry_path) as conn:
@@ -908,7 +908,7 @@ def test_tiny_non_colors_run_registers_used_sources_and_trace(
     first_digest = source_rows[0][1]
     (runtime_dir / "data/source/sub_001.txt").write_text("changed\n", encoding="utf-8")
 
-    assert execute_run_plan(run_plan, cores=1) == len(run_plan.published_outputs)
+    assert execute_run_plan(run_plan, cores=1).published_count == len(run_plan.published_outputs)
 
     changed_digest = sha256_file_digest(runtime_dir / "data/source/sub_001.txt")
     with sqlite3.connect(registry_path) as conn:
@@ -1055,7 +1055,13 @@ def test_partial_publish_records_surviving_jobs(
 
     # sub_001 publishes both of its jobs; sub_002 publishes nothing, and the run
     # records the survivors instead of rolling everything back.
-    assert execute_run_plan(run_plan, cores=1) == 2
+    outcome = execute_run_plan(run_plan, cores=1)
+    assert outcome.published_count == 2
+    assert outcome.all_selected_published is False
+    assert outcome.failed_jobs == (
+        ("source_text", "sub_002", "missing staged output"),
+        ("uppercase_text", "sub_002", "missing staged output"),
+    )
 
     with sqlite3.connect(runtime_dir / "database/registry.db") as conn:
         published = conn.execute(
@@ -1107,7 +1113,15 @@ def test_multi_output_partial_sibling_prunes_orphan_child(
     # is skipped for the missing sibling, and qc_echo (which consumed raw_qc) is
     # pruned as an orphan so it cannot trigger record_workflow_run's whole-batch
     # rollback. The independent survivor sub_001 is still recorded.
-    assert execute_run_plan(run_plan, cores=1) == 3
+    outcome = execute_run_plan(run_plan, cores=1)
+    assert outcome.published_count == 3
+    assert outcome.all_selected_published is False
+    # source_text/sub_002 skips on the missing sibling; qc_echo/sub_002 published
+    # then prunes because its fresh parent did not.
+    assert outcome.failed_jobs == (
+        ("qc_echo", "sub_002", "upstream not published"),
+        ("source_text", "sub_002", "missing staged output"),
+    )
 
     with sqlite3.connect(runtime_dir / "database/registry.db") as conn:
         published = conn.execute(
@@ -1151,7 +1165,7 @@ def test_rerun_reuses_partial_survivors_without_recompute(
         return 1
 
     monkeypatch.setattr("nipact.execution._run_snakemake", run_all_but_sub_002)
-    assert execute_run_plan(plan_one, cores=1) == 2
+    assert execute_run_plan(plan_one, cores=1).published_count == 2
 
     # Run 2: sub_001's upstream source_text is now reusable, so it is hydrated
     # rather than recomputed; only sub_002 and the always-rebuilt selected step
@@ -1246,7 +1260,7 @@ def test_dry_run_does_not_publish_outputs(
             cores=1,
             dry_run=True,
             status_callback=events.append,
-        )
+        ).published_count
         == 0
     )
 

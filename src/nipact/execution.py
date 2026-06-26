@@ -207,6 +207,15 @@ class RunPlan:
     reuse_workflow_names: tuple[str, ...]
 
 
+@dataclass(frozen=True)
+class RunOutcome:
+    """Result of a best-effort job-atomic run."""
+
+    published_count: int
+    failed_jobs: tuple[tuple[str, str, str], ...]  # (step, address, coarse reason)
+    all_selected_published: bool
+
+
 def build_run_plan(
     *,
     project_dir: Path,
@@ -275,7 +284,7 @@ def execute_run_plan(
     cores: int = 1,
     dry_run: bool = False,
     status_callback: RunStatusCallback | None = None,
-) -> int:
+) -> RunOutcome:
     """Run a workflow plan through Snakemake and publish completed jobs best-effort.
 
     Snakemake runs with ``--keep-going``, so a single failed job no longer aborts
@@ -294,12 +303,18 @@ def execute_run_plan(
     returncode = _run_snakemake(run_plan, cores=cores, dry_run=dry_run)
     _emit_status(status_callback, "snakemake_complete")
     if dry_run:
-        return 0
+        return RunOutcome(
+            published_count=0,
+            failed_jobs=(),
+            all_selected_published=True,
+        )
     _emit_status(status_callback, "publishing_outputs")
-    published_results = _prune_orphan_published_jobs(
+    published_results, publish_failures = _publish_run_outputs(run_plan)
+    published_results, prune_failures = _prune_orphan_published_jobs(
         run_plan,
-        _publish_run_outputs(run_plan),
+        published_results,
     )
+    failed_jobs = tuple(sorted(publish_failures + prune_failures))
     published_rows = tuple(result.row for result in published_results)
     created_rows = tuple(result.row for result in published_results if result.created)
     if not published_rows and returncode != 0:
@@ -332,7 +347,17 @@ def execute_run_plan(
             allowed_reused_workflow_names=run_plan.reuse_workflow_names,
         )
         _emit_status(status_callback, "registry_updated")
-        return published_count
+        selected_addresses = {
+            (job.step_name, job.address) for job in run_plan.selected_jobs
+        }
+        published_addresses = {
+            (result.row.step_name, result.row.address) for result in published_results
+        }
+        return RunOutcome(
+            published_count=published_count,
+            failed_jobs=failed_jobs,
+            all_selected_published=selected_addresses <= published_addresses,
+        )
     except Exception:
         _remove_published_output_files(run_plan.runtime_root, created_rows)
         raise
@@ -345,33 +370,46 @@ def _emit_status(callback: RunStatusCallback | None, event: str) -> None:
 
 def publish_run_outputs(run_plan: RunPlan) -> tuple[PublishedOutputRow, ...]:
     """Publish planned outputs and return registry row facts."""
-    return tuple(result.row for result in _publish_run_outputs(run_plan))
+    results, _failed = _publish_run_outputs(run_plan)
+    return tuple(result.row for result in results)
 
 
-def _publish_run_outputs(run_plan: RunPlan) -> tuple[_PublishedOutputResult, ...]:
+def _publish_run_outputs(
+    run_plan: RunPlan,
+) -> tuple[tuple[_PublishedOutputResult, ...], tuple[tuple[str, str, str], ...]]:
     """Publish declared outputs from reachable non-reused jobs, best-effort per job.
 
     The atomic unit is the job (step + address): a job publishes iff all of its
     declared sibling outputs are present in staging. A job with any missing or
     invalid sibling is skipped without rolling back the jobs that did publish.
-    Only plan-construction errors still raise.
+    Returns the published results and a list of skipped jobs as
+    ``(step, address, reason)``. Only plan-construction errors still raise.
     """
     publishable_outputs = _output_refs_by_key(run_plan.jobs)
     specs_by_job: dict[tuple[str, str], list[PublishedOutputSpec]] = {}
     for spec in run_plan.published_outputs:
         specs_by_job.setdefault((spec.step_name, spec.address), []).append(spec)
     results: list[_PublishedOutputResult] = []
-    for specs in specs_by_job.values():
-        results.extend(_publish_one_job(run_plan, specs, publishable_outputs))
-    return tuple(results)
+    failed: list[tuple[str, str, str]] = []
+    for (step_name, address), specs in specs_by_job.items():
+        rows, reason = _publish_one_job(run_plan, specs, publishable_outputs)
+        if reason is None:
+            results.extend(rows)
+        else:
+            failed.append((step_name, address, reason))
+    return tuple(results), tuple(failed)
 
 
 def _publish_one_job(
     run_plan: RunPlan,
     specs: list[PublishedOutputSpec],
     publishable_outputs: dict[tuple[str, str, str], RunJobOutputRef],
-) -> list[_PublishedOutputResult]:
-    """Publish one job's sibling outputs, or none if the job is incomplete."""
+) -> tuple[list[_PublishedOutputResult], str | None]:
+    """Publish one job's siblings; return ``(rows, reason)``.
+
+    ``reason`` is ``None`` when the whole job published, else a coarse skip
+    category (``"missing staged output"`` or ``"digest mismatch"``).
+    """
     preflight_rows: list[tuple[PublishedOutputSpec, RunJobOutputRef, str, str, str]] = []
     for spec in specs:
         key = (spec.step_name, spec.output_name, spec.address)
@@ -383,7 +421,7 @@ def _publish_one_job(
             # A missing or non-file sibling means the producing job is incomplete
             # (its process did not write every declared output). Skip the whole
             # job rather than publish a partial set of siblings.
-            return []
+            return [], "missing staged output"
         output_digest = sha256_file_digest(output_ref.staging_path)
         output_hash = short_hash(output_digest)
         final_name = output_filename(
@@ -437,7 +475,7 @@ def _publish_one_job(
         # Skip this job only. Any sibling already copied stays as an inert,
         # content-addressed orphan: it is never reusable without a registry row,
         # which a skipped job never gets, so no batch rollback is needed.
-        return []
+        return [], "digest mismatch"
     finally:
         for temp_path in temp_paths:
             if temp_path.is_file() or temp_path.is_symlink():
@@ -446,13 +484,13 @@ def _publish_one_job(
                 except OSError:
                     pass
 
-    return results
+    return results, None
 
 
 def _prune_orphan_published_jobs(
     run_plan: RunPlan,
     published_results: tuple[_PublishedOutputResult, ...],
-) -> tuple[_PublishedOutputResult, ...]:
+) -> tuple[tuple[_PublishedOutputResult, ...], tuple[tuple[str, str, str], ...]]:
     """Drop published jobs whose fresh workflow-output parents were not published.
 
     Best-effort publishing can land a child while skipping a parent (e.g. a
@@ -483,13 +521,16 @@ def _prune_orphan_published_jobs(
                 key for key in published_keys if (key[0], key[2]) == job_address
             }
             changed = True
-    if not dropped:
-        return published_results
-    return tuple(
+    survivors = tuple(
         result
         for result in published_results
         if (result.row.step_name, result.row.address) not in dropped
     )
+    dropped_failures = tuple(
+        (step_name, address, "upstream not published")
+        for step_name, address in dropped
+    )
+    return survivors, dropped_failures
 
 
 def _has_unpublished_fresh_parent(

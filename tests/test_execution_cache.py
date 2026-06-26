@@ -674,7 +674,7 @@ def test_cross_target_run_plan_reuses_upstream_from_registry(
         workflow_name="main",
         step_name="b_transform",
     )
-    assert execute_run_plan(b_plan, cores=1) == len(b_plan.published_outputs)
+    assert execute_run_plan(b_plan, cores=1).published_count == len(b_plan.published_outputs)
     registered_b_path = _latest_registered_path(
         runtime_dir,
         step_name="b_transform",
@@ -707,7 +707,7 @@ def test_cross_target_run_plan_reuses_upstream_from_registry(
         c_plan.run_workspace,
     ).replace(os.sep, "/")
     assert c_job.inputs["b_input"][0] != registered_b_relative_to_c
-    assert execute_run_plan(c_plan, cores=1) == len(c_plan.published_outputs)
+    assert execute_run_plan(c_plan, cores=1).published_count == len(c_plan.published_outputs)
 
     hydrated_b = c_plan.run_workspace / "staging/b_transform/b_out/sub_001.json"
     assert hydrated_b.is_file()
@@ -757,7 +757,7 @@ def test_cross_target_dry_run_hydrates_reused_upstream_without_registry_update(
         workflow_name="main",
         step_name="b_transform",
     )
-    assert execute_run_plan(b_plan, cores=1) == len(b_plan.published_outputs)
+    assert execute_run_plan(b_plan, cores=1).published_count == len(b_plan.published_outputs)
     assert log_path.read_text(encoding="utf-8").splitlines() == ["B sub_001"]
     with sqlite3.connect(runtime_dir / "database/registry.db") as conn:
         counts_before = {
@@ -775,7 +775,7 @@ def test_cross_target_dry_run_hydrates_reused_upstream_without_registry_update(
         workflow_name="main",
         step_name="c_transform",
     )
-    assert execute_run_plan(c_plan, cores=1, dry_run=True) == 0
+    assert execute_run_plan(c_plan, cores=1, dry_run=True).published_count == 0
 
     assert (c_plan.run_workspace / "staging/b_transform/b_out/sub_001.json").is_file()
     assert not (c_plan.run_workspace / "staging/c_transform/c_out/sub_001.json").exists()
@@ -805,7 +805,7 @@ def test_downstream_does_not_reuse_when_direct_upstream_changes(
         workflow_name="main",
         step_name="b_transform",
     )
-    assert execute_run_plan(b_plan, cores=1) == len(b_plan.published_outputs)
+    assert execute_run_plan(b_plan, cores=1).published_count == len(b_plan.published_outputs)
 
     # The old B artifact shares address, source bytes, and output name, but the
     # current step declaration changes the concrete artifact contract (params,
@@ -843,7 +843,7 @@ def test_downstream_does_not_reuse_when_direct_upstream_changes(
         assert c_job.inputs["b_input"] == (
             "staging/b_transform/b_out/sub_001.txt",
         )
-    assert execute_run_plan(c_plan, cores=1) == len(c_plan.published_outputs)
+    assert execute_run_plan(c_plan, cores=1).published_count == len(c_plan.published_outputs)
     assert log_path.read_text(encoding="utf-8").splitlines() == expected_log
     assert _latest_workflow_payload(
         runtime_dir,
@@ -864,7 +864,7 @@ def test_expanded_manifest_reuses_unchanged_entity_and_computes_new_entity(
         workflow_name="main",
         step_name="b_transform",
     )
-    assert execute_run_plan(b_plan, cores=1) == len(b_plan.published_outputs)
+    assert execute_run_plan(b_plan, cores=1).published_count == len(b_plan.published_outputs)
     first_b_sub_001 = _selected_artifact_id(
         runtime_dir,
         step_name="b_transform",
@@ -887,7 +887,7 @@ def test_expanded_manifest_reuses_unchanged_entity_and_computes_new_entity(
 
     assert len(c_plan.reused_outputs) == 1
     assert c_plan.reused_outputs[0].source_artifact_id == first_b_sub_001
-    assert execute_run_plan(c_plan, cores=1) == len(c_plan.published_outputs)
+    assert execute_run_plan(c_plan, cores=1).published_count == len(c_plan.published_outputs)
     assert log_path.read_text(encoding="utf-8").splitlines() == [
         "B sub_001",
         "B sub_002",
@@ -942,7 +942,7 @@ def test_multi_output_selected_step_publishes_siblings_for_reuse(
         workflow_name="main",
         step_name="b_transform",
     )
-    assert execute_run_plan(b_plan, cores=1) == len(b_plan.published_outputs)
+    assert execute_run_plan(b_plan, cores=1).published_count == len(b_plan.published_outputs)
 
     multi_plan = build_run_plan(
         project_dir=project_dir,
@@ -950,7 +950,7 @@ def test_multi_output_selected_step_publishes_siblings_for_reuse(
         workflow_name="main",
         step_name="multi_transform",
     )
-    assert execute_run_plan(multi_plan, cores=1) == len(multi_plan.published_outputs)
+    assert execute_run_plan(multi_plan, cores=1).published_count == len(multi_plan.published_outputs)
     with sqlite3.connect(runtime_dir / "database/registry.db") as conn:
         published = conn.execute(
             """
@@ -971,7 +971,7 @@ def test_multi_output_selected_step_publishes_siblings_for_reuse(
         workflow_name="main",
         step_name="multi_transform",
     )
-    assert execute_run_plan(fresh_multi_plan, cores=1) == len(fresh_multi_plan.published_outputs)
+    assert execute_run_plan(fresh_multi_plan, cores=1).published_count == len(fresh_multi_plan.published_outputs)
     with sqlite3.connect(runtime_dir / "database/registry.db") as conn:
         published_after_rerun = conn.execute(
             """
@@ -1002,7 +1002,7 @@ def test_multi_output_selected_step_publishes_siblings_for_reuse(
         for output_ref in use_plan.reused_outputs
         if output_ref.step_name == "multi_transform"
     ] == ["left_out"]
-    assert execute_run_plan(use_plan, cores=1) == len(use_plan.published_outputs)
+    assert execute_run_plan(use_plan, cores=1).published_count == len(use_plan.published_outputs)
     assert log_path.read_text(encoding="utf-8").splitlines() == ["B sub_001"]
 
 
@@ -1022,7 +1022,7 @@ def test_derivative_reuses_compatible_base_ancestor_artifact(
         workflow_name="main",
         step_name="b_transform",
     )
-    assert execute_run_plan(main_b_plan, cores=1) == len(main_b_plan.published_outputs)
+    assert execute_run_plan(main_b_plan, cores=1).published_count == len(main_b_plan.published_outputs)
     main_b_artifact_id = _selected_artifact_id(
         runtime_dir,
         step_name="b_transform",
@@ -1051,7 +1051,7 @@ def test_derivative_reuses_compatible_base_ancestor_artifact(
     assert derivative_c_plan.reused_outputs[0].source_artifact_id == main_b_artifact_id
     assert derivative_c_plan.reused_outputs[0].source_workflow_name == "main"
     assert "b_transform" not in [job.step_name for job in derivative_c_plan.jobs]
-    assert execute_run_plan(derivative_c_plan, cores=1) == len(
+    assert execute_run_plan(derivative_c_plan, cores=1).published_count == len(
         derivative_c_plan.published_outputs
     )
 
@@ -1128,7 +1128,7 @@ def test_published_artifact_from_another_context_is_not_reused(
         workflow_name="main",
         step_name="b_transform",
     )
-    assert execute_run_plan(b_plan, cores=1) == len(b_plan.published_outputs)
+    assert execute_run_plan(b_plan, cores=1).published_count == len(b_plan.published_outputs)
     request = _reuse_request_for_job(b_plan, step_name="b_transform")
 
     # Runtime roots are separate in normal projects, but the registry resolver
@@ -1169,7 +1169,7 @@ def test_hydration_revalidates_published_file_after_plan_construction(
         workflow_name="main",
         step_name="b_transform",
     )
-    assert execute_run_plan(b_plan, cores=1) == len(b_plan.published_outputs)
+    assert execute_run_plan(b_plan, cores=1).published_count == len(b_plan.published_outputs)
 
     c_plan = build_run_plan(
         project_dir=project_dir,

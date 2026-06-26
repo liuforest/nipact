@@ -286,7 +286,7 @@ def _print_pass(text: str) -> None:
     CliFeedback().pass_line(text)
 
 
-def _run_workflow_command(args: argparse.Namespace) -> None:
+def _run_workflow_command(args: argparse.Namespace) -> int | None:
     from .errors import ValidationError
 
     project_dir = _resolve_project_dir_arg(args)
@@ -370,7 +370,7 @@ def _run_workflow_command(args: argparse.Namespace) -> None:
 
         started_at = perf_counter()
         try:
-            published_outputs = execute_run_plan(
+            outcome = execute_run_plan(
                 run_plan,
                 cores=args.cores,
                 dry_run=args.dry_run,
@@ -386,11 +386,16 @@ def _run_workflow_command(args: argparse.Namespace) -> None:
             feedback.key_value("outputs_published", False)
             feedback.key_value("registry", "not_updated")
         else:
-            feedback.key_value("published_outputs", published_outputs)
+            feedback.key_value("published_outputs", outcome.published_count)
             feedback.key_value("registry", "updated")
+            for step_name, address, reason in outcome.failed_jobs:
+                feedback.key_value("failed_job", f"{step_name} {address} ({reason})")
         feedback.key_value("elapsed_seconds", f"{elapsed_seconds:.3f}")
-        feedback.pass_line("PASS: workflow run")
-        return
+        if outcome.all_selected_published:
+            feedback.pass_line("PASS: workflow run")
+            return 0
+        feedback.line("PARTIAL: workflow run", style="yellow")
+        return 1
 
     from .workflow import (
         compile_workflow_plan,
@@ -690,7 +695,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         elif args.command == "trace":
             _run_trace_command(args)
         elif args.command == "workflow":
-            _run_workflow_command(args)
+            return _run_workflow_command(args) or 0
         else:  # pragma: no cover - argparse enforces the command choices.
             parser.error("missing command")
     except Exception as exc:
