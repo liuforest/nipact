@@ -2,6 +2,7 @@ import json
 import os
 import sqlite3
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import yaml
@@ -11,6 +12,7 @@ from nipact.cli import main
 from nipact.artifacts import output_filename, parse_output_filename
 from nipact.errors import ValidationError
 from nipact.execution import (
+    _run_snakemake,
     build_run_plan,
     execute_run_plan,
 )
@@ -950,6 +952,36 @@ def test_tiny_non_colors_run_registers_used_sources_and_trace(
         == 0
     )
     assert "published_outputs=4" in capsys.readouterr().out
+
+
+def test_run_snakemake_command_omits_keep_incomplete(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project_dir, _runtime_dir = _init_demo(tmp_path, capsys)
+    run_plan = build_run_plan(
+        project_dir=project_dir,
+        context="colors",
+        workflow_name="base",
+        step_name="color_sector_analysis",
+    )
+    captured: dict[str, list[str]] = {}
+
+    def fake_run(command: list[str], **_kwargs: object) -> SimpleNamespace:
+        captured["command"] = list(command)
+        return SimpleNamespace(stdout="", stderr="", returncode=0)
+
+    monkeypatch.setattr("nipact.execution.subprocess.run", fake_run)
+    _run_snakemake(run_plan, cores=1, dry_run=False)
+
+    command = captured["command"]
+    # A failed rule's output must be deleted by Snakemake (its default) so best-effort
+    # publishing never sees a truncated file; --keep-incomplete would defeat that.
+    assert "--keep-incomplete" not in command
+    # Sanity-check we captured the real Snakemake command and the relied-on flags remain.
+    assert "--keep-going" in command
+    assert "--rerun-incomplete" in command
 
 
 def test_failed_snakemake_run_does_not_update_registry(
