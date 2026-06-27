@@ -1198,12 +1198,19 @@ def _reuse_workflow_names(
     loaded: LoadedWorkflowProject,
     workflow_name: str,
 ) -> tuple[str, ...]:
-    names: list[str] = []
+    # Reuse candidates are every workflow in the context, not just the base
+    # chain: identity is content/lineage-addressed (callable_ref + params +
+    # recursive input digests), so a byte-identical artifact from a sibling
+    # workflow is as valid to reuse as one from an ancestor. The base chain
+    # (self + ancestors) stays first so its existing matches and tie-breaks are
+    # preserved exactly; siblings only fill in as a sorted fallback.
+    base_chain: list[str] = []
     current: str | None = workflow_name
     while current is not None:
-        names.append(current)
+        base_chain.append(current)
         current = loaded.workflows[current].base_workflow
-    return tuple(names)
+    siblings = sorted(set(loaded.workflows) - set(base_chain))
+    return (*base_chain, *siblings)
 
 
 def _used_reused_outputs(
