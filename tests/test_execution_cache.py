@@ -1379,9 +1379,12 @@ def test_sibling_does_not_reuse_when_source_data_differs(
     # disagree on source bytes at one instant. A genuine source-data divergence is
     # therefore *temporal*: publish b from bytes A, re-import bytes B (running the
     # source step re-hashes and upserts the single source row), then have a sibling
-    # try to reuse the now-stale b. The recursive source-leaf match
-    # (_source_dependency_matches_current_input) compares the dependency's recorded
-    # digest (A) against the live source row (B) and rejects, so b is recomputed.
+    # try to reuse the now-stale b. b's input is a_source.a_out (a workflow_output,
+    # not a source leaf), so the rejection fires one level up in
+    # _workflow_dependency_source_matches_registry_source: b's recorded a_out lineage
+    # (alpha digest) mismatches the live re-imported a_out (omega digest), so b is
+    # recomputed. (a_source itself reuses cleanly — its source-leaf match against the
+    # re-imported omega row succeeds.)
     # See §7.1 of the PR doc: editing the file alone is a no-op against the registry.
     project_dir, runtime_dir, log_path = _write_cache_project(tmp_path, monkeypatch)
     main_b_plan = build_run_plan(
