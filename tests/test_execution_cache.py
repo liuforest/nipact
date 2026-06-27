@@ -470,6 +470,39 @@ def _write_workflow_variant(
     )
 
 
+_STEP_SELECTED_OUTPUT = {
+    "a_source": "a_out",
+    "b_transform": "b_out",
+    "c_transform": "c_out",
+    "d_transform": "d_out",
+    "fit_transform": "fit_out",
+}
+
+
+def _write_sibling_workflow(
+    project_dir: Path,
+    *,
+    workflow_name: str,
+    step_names: list[str],
+) -> None:
+    # A base-style workflow with no base_workflow pointer: an independent sibling
+    # of `main`/`derivative`, listing a subset of the global step pool.
+    config_path = project_dir / "nipact.yaml"
+    config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    config["workflows"][workflow_name] = f"workflows/{workflow_name}.yaml"
+    _write_yaml(config_path, config)
+    _write_yaml(
+        project_dir / f"workflows/{workflow_name}.yaml",
+        {
+            "workflow_name": workflow_name,
+            "steps": [
+                {"step_name": name, "output_name": _STEP_SELECTED_OUTPUT[name]}
+                for name in step_names
+            ],
+        },
+    )
+
+
 def _workflow_input_job(run_plan: object, *, step_name: str) -> object:
     return next(job for job in run_plan.jobs if job.step_name == step_name)
 
@@ -521,6 +554,34 @@ def _latest_workflow_artifact_id(
             LIMIT 1
             """,
             (step_name, output_name, address),
+        ).fetchone()
+    assert row is not None
+    return int(row[0])
+
+
+def _workflow_artifact_id(
+    runtime_dir: Path,
+    *,
+    workflow_name: str,
+    step_name: str,
+    output_name: str,
+    address: str,
+) -> int:
+    with sqlite3.connect(runtime_dir / "database/registry.db") as conn:
+        row = conn.execute(
+            """
+            SELECT artifact_id
+            FROM artifacts
+            WHERE context = 'cache'
+              AND origin = 'workflow_output'
+              AND workflow_name = ?
+              AND step_name = ?
+              AND output_name = ?
+              AND address = ?
+            ORDER BY artifact_id DESC
+            LIMIT 1
+            """,
+            (workflow_name, step_name, output_name, address),
         ).fetchone()
     assert row is not None
     return int(row[0])
@@ -1197,3 +1258,389 @@ def test_hydration_revalidates_published_file_after_plan_construction(
     with pytest.raises(ValidationError, match=message):
         execute_run_plan(c_plan, cores=1)
     assert _registry_row_counts(runtime_dir) == counts_before
+
+
+# ---------------------------------------------------------------------------
+# Cross-workflow (sibling) reuse — broadening the reuse candidate set from the
+# base chain to every workflow in the context (see
+# .local/docs/DEVELOPMENT/20260627-PR-artifact-reuse.md). `main` and
+# `derivative` are independent base-style workflows (neither is the other's
+# base_workflow), so they exercise the sibling boundary directly.
+# ---------------------------------------------------------------------------
+
+
+def test_sibling_workflow_reuses_upstream_across_base_chain_boundary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project_dir, runtime_dir, log_path = _write_cache_project(tmp_path, monkeypatch)
+    main_b_plan = build_run_plan(
+        project_dir=project_dir,
+        context="cache",
+        workflow_name="main",
+        step_name="b_transform",
+    )
+    assert execute_run_plan(main_b_plan, cores=1).published_count == len(
+        main_b_plan.published_outputs
+    )
+    main_b_artifact_id = _selected_artifact_id(
+        runtime_dir,
+        step_name="b_transform",
+        output_name="b_out",
+        address="sub_001",
+    )
+
+    # `derivative` has no base_workflow, so before this change its reuse set was
+    # just itself and it recomputed b. Reuse now spans the whole context, so it
+    # hydrates main's published b across the sibling boundary.
+    derivative_c_plan = build_run_plan(
+        project_dir=project_dir,
+        context="cache",
+        workflow_name="derivative",
+        step_name="c_transform",
+    )
+    assert [ref.step_name for ref in derivative_c_plan.reused_outputs] == [
+        "b_transform"
+    ]
+    assert derivative_c_plan.reused_outputs[0].source_artifact_id == main_b_artifact_id
+    assert derivative_c_plan.reused_outputs[0].source_workflow_name == "main"
+    assert "b_transform" not in [job.step_name for job in derivative_c_plan.jobs]
+    assert execute_run_plan(derivative_c_plan, cores=1).published_count == len(
+        derivative_c_plan.published_outputs
+    )
+
+    # b was hydrated from main, not recomputed: its runtime side effect (the log
+    # line) fired only once, during main's run.
+    assert log_path.read_text(encoding="utf-8").splitlines() == ["B sub_001"]
+    derivative_c_artifact_id = _selected_artifact_id(
+        runtime_dir,
+        step_name="c_transform",
+        output_name="c_out",
+        address="sub_001",
+    )
+    assert _dependency_source_ids(
+        runtime_dir,
+        dependent_artifact_id=derivative_c_artifact_id,
+    ) == [main_b_artifact_id]
+
+
+@pytest.mark.parametrize("change", ["params", "callable"])
+def test_sibling_does_not_reuse_when_computation_diverges(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    change: str,
+) -> None:
+    project_dir, runtime_dir, log_path = _write_cache_project(tmp_path, monkeypatch)
+    main_b_plan = build_run_plan(
+        project_dir=project_dir,
+        context="cache",
+        workflow_name="main",
+        step_name="b_transform",
+    )
+    assert execute_run_plan(main_b_plan, cores=1).published_count == len(
+        main_b_plan.published_outputs
+    )
+
+    # The global step `b_transform` changes computation after main published. The
+    # sibling now *considers* main's b (the base-chain gate is gone) but the
+    # content match in resolve_reusable_artifact rejects it on the diverging
+    # predicate, so b is recomputed; only the unchanged a_source prefix is reused.
+    b_step_path = project_dir / "steps/b_transform.yaml"
+    b_step = yaml.safe_load(b_step_path.read_text(encoding="utf-8"))
+    if change == "params":
+        b_step["params"]["version"] = "v2"
+        expected_log = ["B sub_001", "B sub_001"]
+    else:
+        b_step["callable"] = "cache_runtime:step_b_alt_file"
+        expected_log = ["B sub_001", "B_ALT sub_001"]
+    _write_yaml(b_step_path, b_step)
+
+    derivative_c_plan = build_run_plan(
+        project_dir=project_dir,
+        context="cache",
+        workflow_name="derivative",
+        step_name="c_transform",
+    )
+    assert [ref.step_name for ref in derivative_c_plan.reused_outputs] == ["a_source"]
+    assert derivative_c_plan.reused_outputs[0].source_workflow_name == "main"
+    assert "b_transform" in [job.step_name for job in derivative_c_plan.jobs]
+    assert execute_run_plan(derivative_c_plan, cores=1).published_count == len(
+        derivative_c_plan.published_outputs
+    )
+    assert log_path.read_text(encoding="utf-8").splitlines() == expected_log
+
+
+def test_sibling_does_not_reuse_when_source_data_differs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Source identity is a registry fact, not a plan-time file read, and there is
+    # exactly one source row per (context, path) — so two siblings can never
+    # disagree on source bytes at one instant. A genuine source-data divergence is
+    # therefore *temporal*: publish b from bytes A, re-import bytes B (running the
+    # source step re-hashes and upserts the single source row), then have a sibling
+    # try to reuse the now-stale b. The recursive source-leaf match
+    # (_source_dependency_matches_current_input) compares the dependency's recorded
+    # digest (A) against the live source row (B) and rejects, so b is recomputed.
+    # See §7.1 of the PR doc: editing the file alone is a no-op against the registry.
+    project_dir, runtime_dir, log_path = _write_cache_project(tmp_path, monkeypatch)
+    main_b_plan = build_run_plan(
+        project_dir=project_dir,
+        context="cache",
+        workflow_name="main",
+        step_name="b_transform",
+    )
+    assert execute_run_plan(main_b_plan, cores=1).published_count == len(
+        main_b_plan.published_outputs
+    )
+
+    # Re-import: new bytes on the same path, then run the source step so the registry
+    # source row is re-hashed to the new digest. main's published b is now stale.
+    (runtime_dir / "data/source/sub_001.txt").write_text("omega\n", encoding="utf-8")
+    main_a_plan = build_run_plan(
+        project_dir=project_dir,
+        context="cache",
+        workflow_name="main",
+        step_name="a_source",
+    )
+    assert execute_run_plan(main_a_plan, cores=1).published_count == len(
+        main_a_plan.published_outputs
+    )
+    main_a_omega_id = _workflow_artifact_id(
+        runtime_dir,
+        workflow_name="main",
+        step_name="a_source",
+        output_name="a_out",
+        address="sub_001",
+    )
+
+    derivative_c_plan = build_run_plan(
+        project_dir=project_dir,
+        context="cache",
+        workflow_name="derivative",
+        step_name="c_transform",
+    )
+    # a_source reuses main's re-imported (omega) artifact; b is rejected because its
+    # recorded lineage descends from the old (alpha) source, so it recomputes.
+    assert [ref.step_name for ref in derivative_c_plan.reused_outputs] == ["a_source"]
+    assert derivative_c_plan.reused_outputs[0].source_workflow_name == "main"
+    assert derivative_c_plan.reused_outputs[0].source_artifact_id == main_a_omega_id
+    job_steps = {job.step_name for job in derivative_c_plan.jobs}
+    assert "b_transform" in job_steps
+    assert "a_source" not in job_steps
+    assert execute_run_plan(derivative_c_plan, cores=1).published_count == len(
+        derivative_c_plan.published_outputs
+    )
+    assert log_path.read_text(encoding="utf-8").splitlines() == [
+        "B sub_001",
+        "B sub_001",
+    ]
+    assert _latest_workflow_payload(
+        runtime_dir,
+        step_name="c_transform",
+        output_name="c_out",
+        address="sub_001",
+    )["value"] == "omega-b-c"
+
+
+def test_sibling_does_not_reuse_downstream_when_midchain_lineage_differs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The soundness core of broadening the candidate set: a step whose own
+    # callable+params are byte-identical across the sibling boundary must still be
+    # rejected when a *mid-chain* upstream differs in content. Selecting d makes c
+    # a non-selected upstream so its reuse is actually attempted.
+    project_dir, runtime_dir, log_path = _write_cache_project(tmp_path, monkeypatch)
+    _write_sibling_workflow(
+        project_dir,
+        workflow_name="sib_full",
+        step_names=["a_source", "b_transform", "c_transform", "d_transform"],
+    )
+    main_c_plan = build_run_plan(
+        project_dir=project_dir,
+        context="cache",
+        workflow_name="main",
+        step_name="c_transform",
+    )
+    assert execute_run_plan(main_c_plan, cores=1).published_count == len(
+        main_c_plan.published_outputs
+    )
+    main_a_artifact_id = _workflow_artifact_id(
+        runtime_dir,
+        workflow_name="main",
+        step_name="a_source",
+        output_name="a_out",
+        address="sub_001",
+    )
+
+    # b diverges in content (new param), but c's own step declaration is
+    # untouched. c therefore matches main's c at the top SELECT yet must be
+    # rejected by the recursive _workflow_dependency_matches_input check.
+    b_step_path = project_dir / "steps/b_transform.yaml"
+    b_step = yaml.safe_load(b_step_path.read_text(encoding="utf-8"))
+    b_step["params"]["version"] = "v2"
+    _write_yaml(b_step_path, b_step)
+
+    sib_d_plan = build_run_plan(
+        project_dir=project_dir,
+        context="cache",
+        workflow_name="sib_full",
+        step_name="d_transform",
+    )
+    reused_steps = [ref.step_name for ref in sib_d_plan.reused_outputs]
+    assert reused_steps == ["a_source"]
+    assert sib_d_plan.reused_outputs[0].source_artifact_id == main_a_artifact_id
+    assert sib_d_plan.reused_outputs[0].source_workflow_name == "main"
+    assert {"b_transform", "c_transform", "d_transform"} <= {
+        job.step_name for job in sib_d_plan.jobs
+    }
+    assert execute_run_plan(sib_d_plan, cores=1).published_count == len(
+        sib_d_plan.published_outputs
+    )
+
+
+def test_base_chain_ancestor_wins_tie_break_over_sibling(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Base-chain regression + tie-break: when both an ancestor and a sibling hold
+    # a byte-identical artifact, the ancestor wins. This locks the §5 "strictly
+    # additive" ordering — base chain first, then sorted siblings.
+    project_dir, runtime_dir, log_path = _write_cache_project(tmp_path, monkeypatch)
+    _write_workflow_variant(project_dir, workflow_name="child", base_workflow="main")
+    _write_sibling_workflow(
+        project_dir,
+        workflow_name="sib",
+        step_names=["a_source", "b_transform", "c_transform"],
+    )
+
+    for workflow_name in ("main", "sib"):
+        b_plan = build_run_plan(
+            project_dir=project_dir,
+            context="cache",
+            workflow_name=workflow_name,
+            step_name="b_transform",
+        )
+        assert execute_run_plan(b_plan, cores=1).published_count == len(
+            b_plan.published_outputs
+        )
+    main_b_artifact_id = _workflow_artifact_id(
+        runtime_dir,
+        workflow_name="main",
+        step_name="b_transform",
+        output_name="b_out",
+        address="sub_001",
+    )
+
+    # child's chain is (child, main); sib is a sorted-fallback sibling. main's b
+    # matches before sib's, so the ancestor wins even though sib published last.
+    child_c_plan = build_run_plan(
+        project_dir=project_dir,
+        context="cache",
+        workflow_name="child",
+        step_name="c_transform",
+    )
+    assert [ref.step_name for ref in child_c_plan.reused_outputs] == ["b_transform"]
+    assert child_c_plan.reused_outputs[0].source_workflow_name == "main"
+    assert child_c_plan.reused_outputs[0].source_artifact_id == main_b_artifact_id
+    assert execute_run_plan(child_c_plan, cores=1).published_count == len(
+        child_c_plan.published_outputs
+    )
+
+
+def test_sibling_cohort_collection_mixes_sources(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # §6.1: a manifest-bound (cohort) step collects one upstream job per entity,
+    # and each entity resolves its reuse source independently. Under whole-context
+    # reuse, sub_001's b can come from one workflow and sub_002's from another in
+    # the *same* fit run; each entity artifact is content+lineage validated on its
+    # own, so the mixed collection is sound. (Scope, per §7.1: cohort fit_out
+    # *output* reuse is not exercised here — fit_transform is terminal in this
+    # fixture and a selected step never reuses, so fit_out can never be a
+    # non-selected upstream. The manifest_digest/edge_cardinality gate is covered
+    # at entity granularity by
+    # test_expanded_manifest_reuses_unchanged_entity_and_computes_new_entity.)
+    project_dir, runtime_dir, log_path = _write_cache_project(tmp_path, monkeypatch)
+    _write_sibling_workflow(
+        project_dir,
+        workflow_name="cohort_sib",
+        step_names=["a_source", "b_transform", "fit_transform"],
+    )
+
+    # main publishes b for sub_001 only (manifest is {sub_001}).
+    main_b_plan = build_run_plan(
+        project_dir=project_dir,
+        context="cache",
+        workflow_name="main",
+        step_name="b_transform",
+    )
+    assert execute_run_plan(main_b_plan, cores=1).published_count == len(
+        main_b_plan.published_outputs
+    )
+    main_b_001 = _workflow_artifact_id(
+        runtime_dir,
+        workflow_name="main",
+        step_name="b_transform",
+        output_name="b_out",
+        address="sub_001",
+    )
+
+    # Add sub_002 and let the sibling compute b for both entities (b is its
+    # selected step, so both are recomputed and published under cohort_sib).
+    _add_cache_entity(project_dir, runtime_dir, address="sub_002", seed="beta")
+    cohort_sib_b_plan = build_run_plan(
+        project_dir=project_dir,
+        context="cache",
+        workflow_name="cohort_sib",
+        step_name="b_transform",
+    )
+    assert execute_run_plan(cohort_sib_b_plan, cores=1).published_count == len(
+        cohort_sib_b_plan.published_outputs
+    )
+    sib_b_002 = _workflow_artifact_id(
+        runtime_dir,
+        workflow_name="cohort_sib",
+        step_name="b_transform",
+        output_name="b_out",
+        address="sub_002",
+    )
+
+    # main's fit over {sub_001, sub_002} collects a mixed-source cohort:
+    # sub_001's b from main (base chain wins), sub_002's b from the sibling (the
+    # only holder). fit itself recomputes since no single workflow published it.
+    main_fit_plan = build_run_plan(
+        project_dir=project_dir,
+        context="cache",
+        workflow_name="main",
+        step_name="fit_transform",
+    )
+    reused_b_source = {
+        ref.address: ref.source_workflow_name
+        for ref in main_fit_plan.reused_outputs
+        if ref.step_name == "b_transform"
+    }
+    reused_b_id = {
+        ref.address: ref.source_artifact_id
+        for ref in main_fit_plan.reused_outputs
+        if ref.step_name == "b_transform"
+    }
+    assert reused_b_source == {"sub_001": "main", "sub_002": "cohort_sib"}
+    assert reused_b_id == {"sub_001": main_b_001, "sub_002": sib_b_002}
+    assert "fit_transform" in [job.step_name for job in main_fit_plan.jobs]
+    assert execute_run_plan(main_fit_plan, cores=1).published_count == len(
+        main_fit_plan.published_outputs
+    )
+
+    # The recomputed cohort output reflects both entities, drawn from the mixed but
+    # content-validated inputs (cohort address is the manifest name, "subjects").
+    fit_payload = _latest_workflow_payload(
+        runtime_dir,
+        step_name="fit_transform",
+        output_name="fit_out",
+        address="subjects",
+    )
+    assert fit_payload["count"] == 2
+    assert fit_payload["values"] == ["alpha-b", "beta-b"]
