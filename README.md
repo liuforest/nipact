@@ -122,6 +122,13 @@ nipact workflow run \
   --step color_sector_analysis \
   --cores 1
 
+nipact workflow run \
+  --context colors \
+  --workflow base \
+  --step color_local_transform \
+  --address color_007 \
+  --cores 1
+
 nipact trace \
   --context colors \
   --workflow base \
@@ -133,6 +140,14 @@ nipact gui \
   --context colors \
   --port 8765
 ```
+
+`workflow run --address ENTITY_ID` targets one entity of an entity-addressed step:
+
+- The address must be a member of the step's source-population manifest; cohort-addressed steps reject the option. Omitting `--address` keeps the full-population default.
+- The selected step is rebuilt for that entity; valid ancestors remain reuse-eligible. Descendant steps are not automatically rerun.
+- Plan construction stays population-wide; hydration, execution, and publication are scoped to the target's reachable closure. Computing a fresh cohort-fit ancestor can therefore execute and publish other entities' upstream jobs, and `planned_jobs` counts compiled fresh jobs in the generated Snakefile, not jobs guaranteed to execute.
+- A targeted run becomes the latest run for its step/output scope while keeping the original full source-population manifest binding; the published-output table remains a composite of coordinates from multiple runs, not proof of a complete cohort sweep.
+- Concurrent invocations for the same workflow, step, output, and address are unsupported.
 
 `trace` and `gui` read `runtime/database/registry.db`. The GUI binds to `127.0.0.1` and serves a local browser view for current workflows, manifests, artifacts, workflow topology, and focused artifact lineage.
 
