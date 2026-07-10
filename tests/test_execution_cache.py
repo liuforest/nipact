@@ -1,6 +1,7 @@
 import json
 import os
 import sqlite3
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -585,6 +586,29 @@ def _latest_registered_path(
         ).fetchone()
     assert row is not None
     return str(row[0])
+
+
+def _published_output_row(
+    runtime_dir: Path,
+    *,
+    step_name: str,
+    output_name: str,
+    address: str,
+) -> tuple[int, str]:
+    with sqlite3.connect(runtime_dir / "database/registry.db") as conn:
+        row = conn.execute(
+            """
+            SELECT artifact_id, path
+            FROM published_outputs
+            WHERE context = 'cache'
+              AND step_name = ?
+              AND output_name = ?
+              AND address = ?
+            """,
+            (step_name, output_name, address),
+        ).fetchone()
+    assert row is not None
+    return int(row[0]), str(row[1])
 
 
 def _latest_workflow_artifact_id(
@@ -2081,3 +2105,364 @@ def test_targeted_apply_executes_fresh_cohort_ancestor_with_population_fan_in(
     )
     assert fit_payload["count"] == 2
     assert fit_payload["values"] == ["alpha-b", "beta-b"]
+
+
+def test_real_snakemake_targeted_command_receives_one_selected_target(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project_dir, runtime_dir, log_path = _write_cache_project(
+        tmp_path,
+        monkeypatch,
+        entities=("sub_001", "sub_002"),
+    )
+    commands: list[list[str]] = []
+    real_run = subprocess.run
+
+    def spy_run(command: list[str], **kwargs: object) -> object:
+        commands.append(list(command))
+        return real_run(command, **kwargs)
+
+    monkeypatch.setattr("nipact.execution.subprocess.run", spy_run)
+
+    run_plan = build_run_plan(
+        project_dir=project_dir,
+        context="cache",
+        workflow_name="main",
+        step_name="b_transform",
+        address="sub_001",
+    )
+    assert execute_run_plan(run_plan, cores=1).all_selected_published
+
+    # The real Snakemake command names exactly one selected target path.
+    (command,) = commands
+    targets = [arg for arg in command if arg.startswith("staging/")]
+    assert targets == ["staging/b_transform/b_out/sub_001.json"]
+    # Snakemake resolved that target's reachable closure and nothing else.
+    assert log_path.read_text(encoding="utf-8").splitlines() == ["B sub_001"]
+    staging = run_plan.run_workspace / "staging"
+    assert (staging / "b_transform/b_out/sub_001.json").is_file()
+    assert not (staging / "a_source/a_out/sub_002.json").exists()
+    assert not (staging / "b_transform/b_out/sub_002.json").exists()
+    with sqlite3.connect(runtime_dir / "database/registry.db") as conn:
+        published = conn.execute(
+            "SELECT step_name, output_name, address FROM published_outputs "
+            "ORDER BY step_name, output_name, address"
+        ).fetchall()
+    assert published == [
+        ("a_source", "a_out", "sub_001"),
+        ("b_transform", "b_out", "sub_001"),
+    ]
+
+
+def test_targeted_rerun_replaces_only_selected_coordinates_and_keeps_history(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project_dir, runtime_dir, _log_path = _write_cache_project(
+        tmp_path,
+        monkeypatch,
+        entities=("sub_001", "sub_002"),
+    )
+    full_plan = build_run_plan(
+        project_dir=project_dir,
+        context="cache",
+        workflow_name="main",
+        step_name="b_transform",
+    )
+    assert execute_run_plan(full_plan, cores=1).published_count == len(
+        full_plan.published_outputs
+    )
+    selected_before = _published_output_row(
+        runtime_dir,
+        step_name="b_transform",
+        output_name="b_out",
+        address="sub_001",
+    )
+    sibling_before = _published_output_row(
+        runtime_dir,
+        step_name="b_transform",
+        output_name="b_out",
+        address="sub_002",
+    )
+
+    # A changed step parameter is identity-bearing and changes the output
+    # bytes, so the targeted rerun publishes a new sub_001 artifact. (A source
+    # data change would not do this: plan-time reuse never hashes content, so
+    # the upstream import would be reused with its registered old bytes.)
+    step_path = project_dir / "steps/b_transform.yaml"
+    step_payload = yaml.safe_load(step_path.read_text(encoding="utf-8"))
+    step_payload["params"]["version"] = "v2"
+    _write_yaml(step_path, step_payload)
+    targeted_plan = build_run_plan(
+        project_dir=project_dir,
+        context="cache",
+        workflow_name="main",
+        step_name="b_transform",
+        address="sub_001",
+    )
+    assert execute_run_plan(targeted_plan, cores=1).all_selected_published
+
+    selected_after = _published_output_row(
+        runtime_dir,
+        step_name="b_transform",
+        output_name="b_out",
+        address="sub_001",
+    )
+    assert selected_after[0] != selected_before[0]
+    assert selected_after[1] != selected_before[1]
+    # The sibling coordinate outside the reachable closure is untouched.
+    assert (
+        _published_output_row(
+            runtime_dir,
+            step_name="b_transform",
+            output_name="b_out",
+            address="sub_002",
+        )
+        == sibling_before
+    )
+    # The former artifact row and file remain as historical provenance.
+    with sqlite3.connect(runtime_dir / "database/registry.db") as conn:
+        historical = conn.execute(
+            "SELECT path FROM artifacts WHERE artifact_id = ?",
+            (selected_before[0],),
+        ).fetchone()
+    assert historical == (selected_before[1],)
+    assert (runtime_dir / selected_before[1]).is_file()
+
+
+def test_targeted_rerun_with_identical_bytes_revalidates_published_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project_dir, runtime_dir, _log_path = _write_cache_project(
+        tmp_path,
+        monkeypatch,
+        entities=("sub_001", "sub_002"),
+    )
+    full_plan = build_run_plan(
+        project_dir=project_dir,
+        context="cache",
+        workflow_name="main",
+        step_name="b_transform",
+    )
+    assert execute_run_plan(full_plan, cores=1).published_count == len(
+        full_plan.published_outputs
+    )
+    output_dir = runtime_dir / "outputs/cache/main/b_transform/b_out"
+    files_before = sorted(path.name for path in output_dir.glob("*.json"))
+    row_before = _published_output_row(
+        runtime_dir,
+        step_name="b_transform",
+        output_name="b_out",
+        address="sub_001",
+    )
+    digest_before = sha256_file_digest(runtime_dir / row_before[1])
+
+    # Unchanged inputs: the forced-fresh selected job recomputes identical
+    # bytes, so publication validates the existing content-addressed file.
+    targeted_plan = build_run_plan(
+        project_dir=project_dir,
+        context="cache",
+        workflow_name="main",
+        step_name="b_transform",
+        address="sub_001",
+    )
+    assert execute_run_plan(targeted_plan, cores=1).all_selected_published
+
+    row_after = _published_output_row(
+        runtime_dir,
+        step_name="b_transform",
+        output_name="b_out",
+        address="sub_001",
+    )
+    assert row_after[1] == row_before[1]
+    assert row_after[0] != row_before[0]
+    assert sorted(path.name for path in output_dir.glob("*.json")) == files_before
+    assert sha256_file_digest(runtime_dir / row_after[1]) == digest_before
+    with sqlite3.connect(runtime_dir / "database/registry.db") as conn:
+        assert conn.execute("SELECT COUNT(*) FROM workflow_runs").fetchone()[0] == 2
+
+
+def test_failed_targeted_rerun_preserves_prior_published_coordinate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project_dir, runtime_dir, _log_path = _write_cache_project(
+        tmp_path,
+        monkeypatch,
+        entities=("sub_001", "sub_002"),
+    )
+    plan_one = build_run_plan(
+        project_dir=project_dir,
+        context="cache",
+        workflow_name="main",
+        step_name="b_transform",
+        address="sub_001",
+    )
+    assert execute_run_plan(plan_one, cores=1).all_selected_published
+    row_before = _published_output_row(
+        runtime_dir,
+        step_name="b_transform",
+        output_name="b_out",
+        address="sub_001",
+    )
+    digest_before = sha256_file_digest(runtime_dir / row_before[1])
+    staged_output = plan_one.run_workspace / "staging/b_transform/b_out/sub_001.json"
+    assert staged_output.is_file()
+
+    plan_two = build_run_plan(
+        project_dir=project_dir,
+        context="cache",
+        workflow_name="main",
+        step_name="b_transform",
+        address="sub_001",
+    )
+    assert plan_two.run_workspace == plan_one.run_workspace
+    stale_staging_seen: list[bool] = []
+
+    def fail_without_writing(
+        _run_plan: object,
+        *,
+        cores: int,
+        dry_run: bool,
+    ) -> int:
+        stale_staging_seen.append(staged_output.exists())
+        return 1
+
+    monkeypatch.setattr("nipact.execution._run_snakemake", fail_without_writing)
+    with pytest.raises(ValidationError, match="Snakemake failed with exit code 1"):
+        execute_run_plan(plan_two, cores=1)
+
+    # Run one's stale staged output was removed before the second execution,
+    # so it could not be republished as the failed run's result.
+    assert stale_staging_seen == [False]
+    assert (
+        _published_output_row(
+            runtime_dir,
+            step_name="b_transform",
+            output_name="b_out",
+            address="sub_001",
+        )
+        == row_before
+    )
+    assert sha256_file_digest(runtime_dir / row_before[1]) == digest_before
+    with sqlite3.connect(runtime_dir / "database/registry.db") as conn:
+        assert conn.execute("SELECT COUNT(*) FROM workflow_runs").fetchone()[0] == 1
+
+
+def test_targeted_dry_run_writes_no_outputs_and_no_registry_rows(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project_dir, runtime_dir, log_path = _write_cache_project(
+        tmp_path,
+        monkeypatch,
+        entities=("sub_001", "sub_002"),
+    )
+
+    run_plan = build_run_plan(
+        project_dir=project_dir,
+        context="cache",
+        workflow_name="main",
+        step_name="b_transform",
+        address="sub_001",
+    )
+    outcome = execute_run_plan(run_plan, cores=1, dry_run=True)
+
+    assert outcome.published_count == 0
+    # The targeted workspace itself may be written (run plan, Snakefile).
+    assert run_plan.run_workspace == (
+        runtime_dir / "runs/cache/main/b_transform/addresses/sub_001"
+    )
+    assert (run_plan.run_workspace / "run_plan.json").is_file()
+    assert not log_path.exists()
+    assert list((runtime_dir / "outputs").rglob("*")) == []
+    assert _registry_row_counts(runtime_dir) == {
+        "workflow_runs": 0,
+        "workflow_outputs": 0,
+        "dependencies": 0,
+    }
+    with sqlite3.connect(runtime_dir / "database/registry.db") as conn:
+        assert (
+            conn.execute("SELECT COUNT(*) FROM published_outputs").fetchone()[0] == 0
+        )
+
+
+def test_targeted_run_becomes_current_and_keeps_full_manifest_binding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project_dir, runtime_dir, _log_path = _write_cache_project(
+        tmp_path,
+        monkeypatch,
+        entities=("sub_001", "sub_002"),
+    )
+    full_plan = build_run_plan(
+        project_dir=project_dir,
+        context="cache",
+        workflow_name="main",
+        step_name="b_transform",
+    )
+    assert execute_run_plan(full_plan, cores=1).published_count == len(
+        full_plan.published_outputs
+    )
+
+    targeted_plan = build_run_plan(
+        project_dir=project_dir,
+        context="cache",
+        workflow_name="main",
+        step_name="b_transform",
+        address="sub_001",
+    )
+    assert execute_run_plan(targeted_plan, cores=1).all_selected_published
+
+    with sqlite3.connect(runtime_dir / "database/registry.db") as conn:
+        runs = conn.execute(
+            """
+            SELECT run_id, run_workspace, is_current
+            FROM workflow_runs
+            WHERE context = 'cache'
+              AND workflow_name = 'main'
+              AND selected_step_name = 'b_transform'
+              AND selected_output_name = 'b_out'
+            ORDER BY run_id
+            """
+        ).fetchall()
+        binding_rows_by_run = {
+            run_id: conn.execute(
+                """
+                SELECT step_name, role, manifest_name, manifest_digest, entity_count
+                FROM run_manifest_bindings
+                WHERE run_id = ?
+                ORDER BY step_name, role, manifest_name
+                """,
+                (run_id,),
+            ).fetchall()
+            for run_id, _workspace, _is_current in runs
+        }
+
+    # is_current is scoped without address: the targeted run is the sole
+    # current run for the step/output scope even though it selected one entity.
+    assert len(runs) == 2
+    full_run, targeted_run = runs
+    assert full_run[2] == 0
+    assert targeted_run[2] == 1
+    assert targeted_run[1].endswith("addresses/sub_001")
+    # The sibling coordinate still refers to its full-run artifact.
+    sibling_row = _published_output_row(
+        runtime_dir,
+        step_name="b_transform",
+        output_name="b_out",
+        address="sub_002",
+    )
+    assert _artifact_run_id(runtime_dir, artifact_id=sibling_row[0]) == full_run[0]
+    # The targeted run records the original two-entity source-population
+    # binding, not a synthetic one-entity manifest.
+    targeted_bindings = binding_rows_by_run[targeted_run[0]]
+    assert targeted_bindings == binding_rows_by_run[full_run[0]]
+    assert ("a_source", "source_population", "subjects") in {
+        (step, role, manifest)
+        for step, role, manifest, _digest, _count in targeted_bindings
+    }
+    assert all(count == 2 for *_rest, count in targeted_bindings)
