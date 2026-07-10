@@ -358,6 +358,109 @@ def test_workflow_run_command_executes_step(
     ]
 
 
+def test_workflow_run_accepts_address_and_reports_targeted_summary(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project_dir, _runtime_dir = _init_demo(tmp_path, capsys)
+    captured_plans = []
+
+    def publish_stub(run_plan: object, **_kwargs: object) -> RunOutcome:
+        captured_plans.append(run_plan)
+        return RunOutcome(
+            published_count=1,
+            failed_jobs=(),
+            all_selected_published=True,
+        )
+
+    monkeypatch.setattr("nipact.execution.execute_run_plan", publish_stub)
+
+    assert (
+        main(
+            [
+                "workflow",
+                "run",
+                *_workflow_base_args(project_dir),
+                "--workflow",
+                "base",
+                "--step",
+                "color_local_transform",
+                "--address",
+                "color_007",
+            ]
+        )
+        == 0
+    )
+
+    (run_plan,) = captured_plans
+    assert run_plan.requested_address == "color_007"
+    output = capsys.readouterr().out.splitlines()
+    assert "address=color_007" in output
+    assert "selected_outputs=1" in output
+    workspace_line = next(
+        line for line in output if line.startswith("run_workspace=")
+    )
+    assert workspace_line.endswith(
+        "/runs/colors/base/color_local_transform/addresses/color_007"
+    )
+    assert "PASS: workflow run" in output
+
+
+def test_workflow_run_targeted_summary_keeps_population_job_count(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project_dir, _runtime_dir = _init_demo(tmp_path, capsys)
+
+    def publish_stub(*_args: object, **_kwargs: object) -> RunOutcome:
+        return RunOutcome(
+            published_count=1,
+            failed_jobs=(),
+            all_selected_published=True,
+        )
+
+    monkeypatch.setattr("nipact.execution.execute_run_plan", publish_stub)
+
+    def run_and_read_summary(argv_tail: list[str]) -> dict[str, str]:
+        assert (
+            main(
+                [
+                    "workflow",
+                    "run",
+                    *_workflow_base_args(project_dir),
+                    "--workflow",
+                    "base",
+                    "--step",
+                    "color_local_transform",
+                    *argv_tail,
+                ]
+            )
+            == 0
+        )
+        return dict(
+            line.split("=", maxsplit=1)
+            for line in capsys.readouterr().out.splitlines()
+            if "=" in line
+        )
+
+    full_summary = run_and_read_summary([])
+    targeted_summary = run_and_read_summary(["--address", "color_007"])
+
+    assert "address" not in full_summary
+    assert targeted_summary["address"] == "color_007"
+    assert int(full_summary["selected_outputs"]) == 200
+    assert int(targeted_summary["selected_outputs"]) == 1
+    # planned_jobs keeps its compiled-fresh-job meaning: the plan stays
+    # population-wide under --address, and only reuse hydration is
+    # closure-scoped (exercised in test_execution_cache.py).
+    assert int(full_summary["planned_jobs"]) > 1
+    assert targeted_summary["planned_jobs"] == full_summary["planned_jobs"]
+    assert targeted_summary["planned_reused_registered_artifacts"] == "0"
+    assert targeted_summary["planned_hydrated_inputs"] == "0"
+
+
 def test_workflow_run_partial_publish_exits_non_zero(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
