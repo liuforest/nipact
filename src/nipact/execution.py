@@ -197,6 +197,7 @@ class RunPlan:
     base_workflow_name: str | None
     selected_step_name: str
     selected_output_name: str
+    requested_address: str | None
     run_workspace: Path
     manifest_bindings: tuple[WorkflowPlanManifestBinding, ...]
     published_outputs: tuple[PublishedOutputSpec, ...]
@@ -222,6 +223,7 @@ def build_run_plan(
     context: str,
     workflow_name: str,
     step_name: str,
+    address: str | None = None,
 ) -> RunPlan:
     """Build the internal execution plan without running anything."""
     loaded = load_workflow_project(project_dir=project_dir, context=context)
@@ -236,7 +238,7 @@ def build_run_plan(
     run_workspace = loaded.runtime_root / "runs" / context / plan.workflow_name / plan.selected_step_name
     if len(selected_step.outputs) > 1:
         run_workspace = run_workspace / selected_output.name
-    addresses = _selected_addresses(loaded, plan, selected_step)
+    addresses = _selected_addresses(loaded, plan, selected_step, requested_address=address)
     jobs, reused_outputs = _build_jobs(
         loaded=loaded,
         plan=plan,
@@ -267,6 +269,7 @@ def build_run_plan(
         base_workflow_name=loaded.workflows[plan.workflow_name].base_workflow,
         selected_step_name=selected_step.step_name,
         selected_output_name=selected_output.name,
+        requested_address=address,
         run_workspace=run_workspace,
         manifest_bindings=plan.manifest_bindings,
         published_outputs=published_outputs,
@@ -743,6 +746,7 @@ def _run_plan_payload(run_plan: RunPlan) -> dict[str, Any]:
         "base_workflow": run_plan.base_workflow_name,
         "selected_step": run_plan.selected_step_name,
         "selected_output": run_plan.selected_output_name,
+        "requested_address": run_plan.requested_address,
         "runtime_root": str(run_plan.runtime_root),
         "jobs": {
             job.job_id: {
@@ -1512,9 +1516,17 @@ def _selected_addresses(
     loaded: LoadedWorkflowProject,
     plan: WorkflowPlan,
     selected_step: WorkflowPlanStep,
+    *,
+    requested_address: str | None = None,
 ) -> tuple[str, ...]:
     output = selected_step.outputs[plan.selected_output_name]
     if output.address_scope == "cohort":
+        if requested_address is not None:
+            raise ValidationError(
+                f"selected output {plan.selected_output_name!r} of step "
+                f"{selected_step.step_name!r} is cohort-addressed and cannot be "
+                "targeted by entity address"
+            )
         if selected_step.manifest_binding is None:
             raise ValidationError(
                 "cohort workflow steps must have a selected-step manifest binding"
@@ -1526,6 +1538,14 @@ def _selected_addresses(
             manifest = loaded.manifests[manifest_name]
         except KeyError as exc:
             raise ValidationError(f"unknown manifest for entity step: {manifest_name}") from exc
+        if requested_address is not None:
+            address = validate_path_token(requested_address, label="address")
+            if address not in manifest.entity_ids:
+                raise ValidationError(
+                    f"address {address!r} is not a member of source-population "
+                    f"manifest {manifest_name!r}"
+                )
+            return (address,)
         return tuple(
             validate_path_token(entity_id, label="entity_id")
             for entity_id in manifest.entity_ids
