@@ -239,6 +239,12 @@ def build_run_plan(
     if len(selected_step.outputs) > 1:
         run_workspace = run_workspace / selected_output.name
     addresses = _selected_addresses(loaded, plan, selected_step, requested_address=address)
+    if address is not None:
+        # Targeted runs get an address-partitioned workspace so runs for
+        # different addresses cannot overwrite each other's plan, staging,
+        # or logs. The full-population path is unchanged. The address has
+        # already been validated as a safe path token above.
+        run_workspace = run_workspace / "addresses" / address
     jobs, reused_outputs_by_artifact = _build_jobs(
         loaded=loaded,
         plan=plan,
