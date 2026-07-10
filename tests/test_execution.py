@@ -685,6 +685,56 @@ def test_build_run_plan_rejects_address_for_cohort_step(
     assert not (runtime_dir / "runs/colors/base/color_sector_analysis").exists()
 
 
+def test_targeted_runs_for_different_addresses_get_distinct_workspaces(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project_dir, runtime_dir = _write_tiny_non_colors_project(tmp_path, monkeypatch)
+    step_workspace = runtime_dir / "runs" / "mini" / "main" / "uppercase_text"
+
+    plans = {
+        address: build_run_plan(
+            project_dir=project_dir,
+            context="mini",
+            workflow_name="main",
+            step_name="uppercase_text",
+            address=address,
+        )
+        for address in ("sub_001", "sub_002")
+    }
+
+    for address, run_plan in plans.items():
+        assert run_plan.run_workspace == step_workspace / "addresses" / address
+    assert plans["sub_001"].run_workspace != plans["sub_002"].run_workspace
+    # Staging paths derive from run_workspace, so partitioned runs cannot
+    # overwrite each other's staged files.
+    for address, run_plan in plans.items():
+        for job in run_plan.selected_jobs:
+            for output in job.outputs.values():
+                assert output.staging_path.is_relative_to(
+                    step_workspace / "addresses" / address
+                )
+
+
+def test_full_population_run_keeps_existing_workspace_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project_dir, runtime_dir = _write_tiny_non_colors_project(tmp_path, monkeypatch)
+
+    run_plan = build_run_plan(
+        project_dir=project_dir,
+        context="mini",
+        workflow_name="main",
+        step_name="uppercase_text",
+    )
+
+    assert run_plan.run_workspace == (
+        runtime_dir / "runs" / "mini" / "main" / "uppercase_text"
+    )
+    assert "addresses" not in run_plan.run_workspace.parts
+
+
 def test_multi_output_run_registers_sibling_outputs_and_exact_dependency(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
