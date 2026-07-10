@@ -125,6 +125,23 @@ def step_fit_file(*, inputs, outputs, params, address):
             "values": sorted(payload["value"] for payload in payloads),
         },
     )
+
+
+def step_apply_file(*, inputs, outputs, params, address):
+    payload = json.loads(inputs["b_input"][0].read_text(encoding="utf-8"))
+    fit = json.loads(inputs["fit_input"][0].read_text(encoding="utf-8"))
+    log_path = Path(params["log_path"])
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with log_path.open("a", encoding="utf-8") as stream:
+        stream.write(f"APPLY {address}\\n")
+    _write_json(
+        outputs["apply_out"],
+        {
+            "address": address,
+            "fit_count": fit["count"],
+            "value": payload["value"] + "-apply",
+        },
+    )
 """.lstrip(),
         encoding="utf-8",
     )
@@ -303,6 +320,35 @@ def step_fit_file(*, inputs, outputs, params, address):
         },
     )
     _write_yaml(
+        project_dir / "steps/apply_transform.yaml",
+        {
+            "step_name": "apply_transform",
+            "pattern_kind": "pattern_b",
+            "execution_role": "b_apply",
+            "address_scope": "entity",
+            "callable": "cache_runtime:step_apply_file",
+            "inputs": {
+                "b_input": {
+                    "artifact": "b_transform.b_out",
+                    "dependency_role": "apply_input",
+                },
+                "fit_input": {
+                    "artifact": "fit_transform.fit_out",
+                    "dependency_role": "collective_fit",
+                },
+            },
+            "params": {
+                "log_path": str(log_path),
+            },
+            "outputs": {
+                "apply_out": {
+                    "extension": ".json",
+                    "address_scope": "entity",
+                },
+            },
+        },
+    )
+    _write_yaml(
         project_dir / "steps/multi_transform.yaml",
         {
             "step_name": "multi_transform",
@@ -476,6 +522,7 @@ _STEP_SELECTED_OUTPUT = {
     "c_transform": "c_out",
     "d_transform": "d_out",
     "fit_transform": "fit_out",
+    "apply_transform": "apply_out",
 }
 
 
@@ -505,6 +552,13 @@ def _write_sibling_workflow(
 
 def _workflow_input_job(run_plan: object, *, step_name: str) -> object:
     return next(job for job in run_plan.jobs if job.step_name == step_name)
+
+
+def _reused_keys(run_plan: object) -> set[tuple[str, str, str]]:
+    return {
+        (ref.step_name, ref.output_name, ref.address)
+        for ref in run_plan.reused_outputs
+    }
 
 
 def _latest_registered_path(
@@ -1639,6 +1693,386 @@ def test_sibling_cohort_collection_mixes_sources(
 
     # The recomputed cohort output reflects both entities, drawn from the mixed but
     # content-validated inputs (cohort address is the manifest name, "subjects").
+    fit_payload = _latest_workflow_payload(
+        runtime_dir,
+        step_name="fit_transform",
+        output_name="fit_out",
+        address="subjects",
+    )
+    assert fit_payload["count"] == 2
+    assert fit_payload["values"] == ["alpha-b", "beta-b"]
+
+
+def test_targeted_selected_job_executes_despite_registered_equivalent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project_dir, runtime_dir, log_path = _write_cache_project(
+        tmp_path,
+        monkeypatch,
+        entities=("sub_001", "sub_002"),
+    )
+    full_plan = build_run_plan(
+        project_dir=project_dir,
+        context="cache",
+        workflow_name="main",
+        step_name="b_transform",
+    )
+    assert execute_run_plan(full_plan, cores=1).published_count == len(
+        full_plan.published_outputs
+    )
+    lines = log_path.read_text(encoding="utf-8").splitlines()
+    assert sorted(lines) == ["B sub_001", "B sub_002"]
+
+    targeted_plan = build_run_plan(
+        project_dir=project_dir,
+        context="cache",
+        workflow_name="main",
+        step_name="b_transform",
+        address="sub_001",
+    )
+    # The selected key skips reuse resolution: sub_001's job stays fresh even
+    # though an equivalent registered output exists, while sub_002's job is
+    # resolved as reusable and dropped from the compiled job set.
+    job_keys = [(job.step_name, job.address) for job in targeted_plan.jobs]
+    assert ("b_transform", "sub_001") in job_keys
+    assert ("b_transform", "sub_002") not in job_keys
+    assert execute_run_plan(targeted_plan, cores=1).all_selected_published
+    lines = log_path.read_text(encoding="utf-8").splitlines()
+    assert lines.count("B sub_001") == 2
+    assert lines.count("B sub_002") == 1
+
+
+def test_targeted_run_reuses_valid_upstream_for_selected_entity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project_dir, runtime_dir, log_path = _write_cache_project(
+        tmp_path,
+        monkeypatch,
+        entities=("sub_001", "sub_002"),
+    )
+    b_plan = build_run_plan(
+        project_dir=project_dir,
+        context="cache",
+        workflow_name="main",
+        step_name="b_transform",
+    )
+    assert execute_run_plan(b_plan, cores=1).published_count == len(
+        b_plan.published_outputs
+    )
+
+    c_plan = build_run_plan(
+        project_dir=project_dir,
+        context="cache",
+        workflow_name="main",
+        step_name="c_transform",
+        address="sub_001",
+    )
+    assert ("b_transform", "b_out", "sub_001") in _reused_keys(c_plan)
+    reused_b = next(
+        ref for ref in c_plan.reused_outputs if ref.address == "sub_001"
+    )
+    assert reused_b.source_artifact_id == _latest_workflow_artifact_id(
+        runtime_dir,
+        step_name="b_transform",
+        output_name="b_out",
+        address="sub_001",
+    )
+    assert execute_run_plan(c_plan, cores=1).all_selected_published
+    # b was hydrated from the registry, not recomputed.
+    lines = log_path.read_text(encoding="utf-8").splitlines()
+    assert lines.count("B sub_001") == 1
+    assert (c_plan.run_workspace / "staging/b_transform/b_out/sub_001.json").is_file()
+    c_payload = _latest_workflow_payload(
+        runtime_dir,
+        step_name="c_transform",
+        output_name="c_out",
+        address="sub_001",
+    )
+    assert c_payload == {"address": "sub_001", "value": "alpha-b-c"}
+
+
+def test_targeted_run_excludes_reuse_needed_only_by_unreachable_jobs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project_dir, runtime_dir, log_path = _write_cache_project(
+        tmp_path,
+        monkeypatch,
+        entities=("sub_001", "sub_002"),
+    )
+    b_plan = build_run_plan(
+        project_dir=project_dir,
+        context="cache",
+        workflow_name="main",
+        step_name="b_transform",
+    )
+    assert execute_run_plan(b_plan, cores=1).published_count == len(
+        b_plan.published_outputs
+    )
+
+    # sub_002's registered b is consumed only by fresh jobs outside the
+    # selected target's reachable closure (its own c, the fit fan-in, multi),
+    # so it must not be hydrated by a targeted sub_001 run.
+    c_plan = build_run_plan(
+        project_dir=project_dir,
+        context="cache",
+        workflow_name="main",
+        step_name="c_transform",
+        address="sub_001",
+    )
+    assert _reused_keys(c_plan) == {("b_transform", "b_out", "sub_001")}
+    assert execute_run_plan(c_plan, cores=1).all_selected_published
+    payload = json.loads(
+        (c_plan.run_workspace / "run_plan.json").read_text(encoding="utf-8")
+    )
+    assert [entry["address"] for entry in payload["reused_outputs"]] == ["sub_001"]
+    staging = c_plan.run_workspace / "staging"
+    assert (staging / "b_transform/b_out/sub_001.json").is_file()
+    assert not (staging / "b_transform/b_out/sub_002.json").exists()
+    assert not (staging / "c_transform/c_out/sub_002.json").exists()
+
+
+def test_targeted_run_unaffected_by_same_size_corruption_outside_closure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project_dir, runtime_dir, log_path = _write_cache_project(
+        tmp_path,
+        monkeypatch,
+        entities=("sub_001", "sub_002"),
+    )
+    b_plan = build_run_plan(
+        project_dir=project_dir,
+        context="cache",
+        workflow_name="main",
+        step_name="b_transform",
+    )
+    assert execute_run_plan(b_plan, cores=1).published_count == len(
+        b_plan.published_outputs
+    )
+
+    # Same-size corruption passes the plan-time existence+size check, so this
+    # artifact remains a resolvable reuse candidate; only closure-scoped
+    # hydration keeps it from failing the targeted run at digest validation.
+    corrupt_path = runtime_dir / _latest_registered_path(
+        runtime_dir,
+        step_name="b_transform",
+        output_name="b_out",
+        address="sub_002",
+    )
+    original = corrupt_path.read_bytes()
+    corrupt_path.write_bytes(b"#" + original[1:])
+
+    c_plan = build_run_plan(
+        project_dir=project_dir,
+        context="cache",
+        workflow_name="main",
+        step_name="c_transform",
+        address="sub_001",
+    )
+    assert ("b_transform", "b_out", "sub_002") not in _reused_keys(c_plan)
+    assert execute_run_plan(c_plan, cores=1).all_selected_published
+    c_payload = _latest_workflow_payload(
+        runtime_dir,
+        step_name="c_transform",
+        output_name="c_out",
+        address="sub_001",
+    )
+    assert c_payload == {"address": "sub_001", "value": "alpha-b-c"}
+
+
+def test_targeted_plan_construction_still_fails_on_unrelated_missing_source(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project_dir, runtime_dir, _log_path = _write_cache_project(
+        tmp_path,
+        monkeypatch,
+        entities=("sub_001", "sub_002"),
+    )
+    # Accepted plan-time coupling: job construction stays population-wide, so a
+    # missing source for unselected sub_002 aborts a targeted sub_001 plan.
+    (runtime_dir / "data/source/sub_002.txt").unlink()
+    with pytest.raises(ValidationError, match="missing source artifact"):
+        build_run_plan(
+            project_dir=project_dir,
+            context="cache",
+            workflow_name="main",
+            step_name="b_transform",
+            address="sub_001",
+        )
+
+
+def test_targeted_run_does_not_execute_or_republish_sibling_entity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project_dir, runtime_dir, log_path = _write_cache_project(
+        tmp_path,
+        monkeypatch,
+        entities=("sub_001", "sub_002"),
+    )
+    full_plan = build_run_plan(
+        project_dir=project_dir,
+        context="cache",
+        workflow_name="main",
+        step_name="b_transform",
+    )
+    assert execute_run_plan(full_plan, cores=1).published_count == len(
+        full_plan.published_outputs
+    )
+    sibling_artifact_id = _latest_workflow_artifact_id(
+        runtime_dir,
+        step_name="b_transform",
+        output_name="b_out",
+        address="sub_002",
+    )
+    sibling_path = runtime_dir / _latest_registered_path(
+        runtime_dir,
+        step_name="b_transform",
+        output_name="b_out",
+        address="sub_002",
+    )
+    sibling_digest = sha256_file_digest(sibling_path)
+
+    targeted_plan = build_run_plan(
+        project_dir=project_dir,
+        context="cache",
+        workflow_name="main",
+        step_name="b_transform",
+        address="sub_001",
+    )
+    assert {
+        (spec.step_name, spec.output_name, spec.address)
+        for spec in targeted_plan.published_outputs
+    } == {("b_transform", "b_out", "sub_001")}
+    assert execute_run_plan(targeted_plan, cores=1).all_selected_published
+    lines = log_path.read_text(encoding="utf-8").splitlines()
+    assert lines.count("B sub_002") == 1
+    assert (
+        _latest_workflow_artifact_id(
+            runtime_dir,
+            step_name="b_transform",
+            output_name="b_out",
+            address="sub_002",
+        )
+        == sibling_artifact_id
+    )
+    assert sha256_file_digest(sibling_path) == sibling_digest
+
+
+def test_targeted_apply_reuses_registered_cohort_fit_without_executing_sibling(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project_dir, runtime_dir, log_path = _write_cache_project(
+        tmp_path,
+        monkeypatch,
+        entities=("sub_001", "sub_002"),
+    )
+    _write_sibling_workflow(
+        project_dir,
+        workflow_name="apply_flow",
+        step_names=["a_source", "b_transform", "fit_transform", "apply_transform"],
+    )
+    fit_plan = build_run_plan(
+        project_dir=project_dir,
+        context="cache",
+        workflow_name="apply_flow",
+        step_name="fit_transform",
+    )
+    assert execute_run_plan(fit_plan, cores=1).published_count == len(
+        fit_plan.published_outputs
+    )
+    assert log_path.read_text(encoding="utf-8").count("FIT subjects 2") == 1
+
+    apply_plan = build_run_plan(
+        project_dir=project_dir,
+        context="cache",
+        workflow_name="apply_flow",
+        step_name="apply_transform",
+        address="sub_001",
+    )
+    # The registered cohort fit is reused, so the closure stops at the selected
+    # apply job: only its direct inputs hydrate, and sub_002 never executes.
+    assert _reused_keys(apply_plan) == {
+        ("b_transform", "b_out", "sub_001"),
+        ("fit_transform", "fit_out", "subjects"),
+    }
+    assert execute_run_plan(apply_plan, cores=1).all_selected_published
+    lines = log_path.read_text(encoding="utf-8").splitlines()
+    assert lines.count("B sub_001") == 1
+    assert lines.count("B sub_002") == 1
+    assert lines.count("FIT subjects 2") == 1
+    assert lines.count("APPLY sub_001") == 1
+    assert "APPLY sub_002" not in lines
+    apply_payload = _latest_workflow_payload(
+        runtime_dir,
+        step_name="apply_transform",
+        output_name="apply_out",
+        address="sub_001",
+    )
+    assert apply_payload == {
+        "address": "sub_001",
+        "fit_count": 2,
+        "value": "alpha-b-apply",
+    }
+
+
+def test_targeted_apply_executes_fresh_cohort_ancestor_with_population_fan_in(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project_dir, runtime_dir, log_path = _write_cache_project(
+        tmp_path,
+        monkeypatch,
+        entities=("sub_001", "sub_002"),
+    )
+    _write_sibling_workflow(
+        project_dir,
+        workflow_name="apply_flow",
+        step_names=["a_source", "b_transform", "fit_transform", "apply_transform"],
+    )
+    b_plan = build_run_plan(
+        project_dir=project_dir,
+        context="cache",
+        workflow_name="apply_flow",
+        step_name="b_transform",
+    )
+    assert execute_run_plan(b_plan, cores=1).published_count == len(
+        b_plan.published_outputs
+    )
+
+    apply_plan = build_run_plan(
+        project_dir=project_dir,
+        context="cache",
+        workflow_name="apply_flow",
+        step_name="apply_transform",
+        address="sub_001",
+    )
+    # No reusable fit exists, so the fresh cohort ancestor joins the reachable
+    # closure and its population fan-in pulls sub_002's registered b back into
+    # the hydration set (reachability follows dependency records, not address).
+    assert _reused_keys(apply_plan) == {
+        ("b_transform", "b_out", "sub_001"),
+        ("b_transform", "b_out", "sub_002"),
+    }
+    assert {
+        (spec.step_name, spec.output_name, spec.address)
+        for spec in apply_plan.published_outputs
+    } == {
+        ("apply_transform", "apply_out", "sub_001"),
+        ("fit_transform", "fit_out", "subjects"),
+    }
+    assert execute_run_plan(apply_plan, cores=1).all_selected_published
+    lines = log_path.read_text(encoding="utf-8").splitlines()
+    assert lines.count("B sub_001") == 1
+    assert lines.count("B sub_002") == 1
+    assert lines.count("FIT subjects 2") == 1
+    assert lines.count("APPLY sub_001") == 1
+    assert "APPLY sub_002" not in lines
     fit_payload = _latest_workflow_payload(
         runtime_dir,
         step_name="fit_transform",
