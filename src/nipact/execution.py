@@ -239,7 +239,7 @@ def build_run_plan(
     if len(selected_step.outputs) > 1:
         run_workspace = run_workspace / selected_output.name
     addresses = _selected_addresses(loaded, plan, selected_step, requested_address=address)
-    jobs, reused_outputs = _build_jobs(
+    jobs, reused_outputs_by_artifact = _build_jobs(
         loaded=loaded,
         plan=plan,
         run_workspace=run_workspace,
@@ -255,11 +255,23 @@ def build_run_plan(
     selected_jobs = tuple(
         output_ref.job for output_ref in selected_output_refs
     )
+    # Hydration is scoped to the selected targets' reachable closure: a reused
+    # registry artifact is retained only when a reachable fresh job consumes it.
+    # Reachability follows dependency records rather than address, so a fresh
+    # cohort ancestor can pull sibling-entity reuse back into scope.
+    reachable_job_ids = _reachable_job_ids_for_outputs(
+        jobs=jobs,
+        selected_output_refs=selected_output_refs,
+    )
+    reused_outputs = _used_reused_outputs(
+        jobs=tuple(job for job in jobs if job.job_id in reachable_job_ids),
+        reused_outputs_by_artifact=reused_outputs_by_artifact,
+    )
     published_outputs = _published_output_specs(
         loaded=loaded,
         plan=plan,
         jobs=jobs,
-        selected_output_refs=selected_output_refs,
+        reachable_job_ids=reachable_job_ids,
     )
     return RunPlan(
         project_root=loaded.project_root,
@@ -926,12 +938,8 @@ def _published_output_specs(
     loaded: LoadedWorkflowProject,
     plan: WorkflowPlan,
     jobs: tuple[RunJob, ...],
-    selected_output_refs: tuple[RunJobOutputRef, ...],
+    reachable_job_ids: set[str],
 ) -> tuple[PublishedOutputSpec, ...]:
-    reachable_job_ids = _reachable_job_ids_for_outputs(
-        jobs=jobs,
-        selected_output_refs=selected_output_refs,
-    )
     specs: list[PublishedOutputSpec] = []
     for job in jobs:
         if job.job_id not in reachable_job_ids:
@@ -1017,7 +1025,7 @@ def _build_jobs(
     selected_step_name: str,
     selected_output_name: str,
     selected_addresses: tuple[str, ...],
-) -> tuple[tuple[RunJob, ...], tuple[ReusedRunJobOutputRef, ...]]:
+) -> tuple[tuple[RunJob, ...], dict[tuple[str, str, str], ReusedRunJobOutputRef]]:
     jobs: list[RunJob] = []
     outputs_by_artifact: dict[
         tuple[str, str, str],
@@ -1084,11 +1092,7 @@ def _build_jobs(
     missing_selected = sorted(selected_keys - set(outputs_by_artifact))
     if missing_selected:
         raise ValidationError("run plan is missing selected job(s)")
-    used_reused_outputs = _used_reused_outputs(
-        jobs=tuple(jobs),
-        reused_outputs_by_artifact=reused_outputs_by_artifact,
-    )
-    return tuple(jobs), used_reused_outputs
+    return tuple(jobs), reused_outputs_by_artifact
 
 
 def _run_job_outputs(
