@@ -12,6 +12,7 @@ from nipact.cli import main
 from nipact.artifacts import output_filename, parse_output_filename
 from nipact.errors import ValidationError
 from nipact.execution import (
+    _run_plan_payload,
     _run_snakemake,
     build_run_plan,
     execute_run_plan,
@@ -585,6 +586,103 @@ def test_build_run_plan_rejects_missing_source_binding(
             workflow_name="base",
             step_name="color_local_transform",
         )
+
+
+def test_build_run_plan_with_address_selects_one_entity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project_dir, runtime_dir = _write_tiny_non_colors_project(tmp_path, monkeypatch)
+
+    run_plan = build_run_plan(
+        project_dir=project_dir,
+        context="mini",
+        workflow_name="main",
+        step_name="uppercase_text",
+        address="sub_001",
+    )
+
+    assert run_plan.requested_address == "sub_001"
+    assert len(run_plan.selected_output_refs) == 1
+    assert run_plan.selected_output_refs[0].address == "sub_001"
+    assert len(run_plan.selected_jobs) == 1
+    # Plan construction stays population-wide; selection narrows targets, not jobs.
+    assert {job.address for job in run_plan.jobs} == {"sub_001", "sub_002"}
+    assert {spec.address for spec in run_plan.published_outputs} == {"sub_001"}
+    assert _run_plan_payload(run_plan)["requested_address"] == "sub_001"
+
+
+def test_build_run_plan_without_address_selects_all_entities(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project_dir, _runtime_dir = _write_tiny_non_colors_project(tmp_path, monkeypatch)
+
+    run_plan = build_run_plan(
+        project_dir=project_dir,
+        context="mini",
+        workflow_name="main",
+        step_name="uppercase_text",
+    )
+
+    assert run_plan.requested_address is None
+    assert [ref.address for ref in run_plan.selected_output_refs] == ["sub_001", "sub_002"]
+    assert {spec.address for spec in run_plan.published_outputs} == {"sub_001", "sub_002"}
+    assert _run_plan_payload(run_plan)["requested_address"] is None
+
+
+def test_build_run_plan_rejects_invalid_address_token(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project_dir, runtime_dir = _write_tiny_non_colors_project(tmp_path, monkeypatch)
+
+    with pytest.raises(ValidationError, match="address cannot contain path separators"):
+        build_run_plan(
+            project_dir=project_dir,
+            context="mini",
+            workflow_name="main",
+            step_name="uppercase_text",
+            address="../sub_001",
+        )
+    assert not (runtime_dir / "runs").exists()
+
+
+def test_build_run_plan_rejects_address_not_in_manifest(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project_dir, runtime_dir = _write_tiny_non_colors_project(tmp_path, monkeypatch)
+
+    with pytest.raises(
+        ValidationError,
+        match="not a member of source-population manifest 'subjects'",
+    ):
+        build_run_plan(
+            project_dir=project_dir,
+            context="mini",
+            workflow_name="main",
+            step_name="uppercase_text",
+            address="sub_unused",
+        )
+    assert not (runtime_dir / "runs").exists()
+
+
+def test_build_run_plan_rejects_address_for_cohort_step(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    project_dir, runtime_dir = _init_demo(tmp_path, capsys)
+
+    with pytest.raises(ValidationError, match="cohort-addressed"):
+        build_run_plan(
+            project_dir=project_dir,
+            context="colors",
+            workflow_name="base",
+            step_name="color_sector_analysis",
+            address="color_000",
+        )
+    assert not (runtime_dir / "runs/colors/base/color_sector_analysis").exists()
 
 
 def test_multi_output_run_registers_sibling_outputs_and_exact_dependency(
