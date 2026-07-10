@@ -216,6 +216,14 @@ def build_parser() -> argparse.ArgumentParser:
     _add_project_context_args(workflow_run_parser)
     _add_workflow_step_args(workflow_run_parser)
     workflow_run_parser.add_argument(
+        "--address",
+        default=None,
+        help=(
+            "Source-population entity address to run. Selects only that "
+            "entity's output; planning still validates the full population."
+        ),
+    )
+    workflow_run_parser.add_argument(
         "--cores",
         type=_positive_int,
         default=1,
@@ -301,6 +309,7 @@ def _run_workflow_command(args: argparse.Namespace) -> int | None:
             context=args.context,
             workflow_name=args.workflow,
             step_name=args.step,
+            address=args.address,
         )
         feedback = CliFeedback()
         feedback.heading("NIPACT workflow run")
@@ -309,9 +318,13 @@ def _run_workflow_command(args: argparse.Namespace) -> int | None:
         feedback.key_value("workflow", run_plan.workflow_name)
         feedback.key_value("step", run_plan.selected_step_name)
         feedback.key_value("selected_output", run_plan.selected_output_name)
+        if run_plan.requested_address is not None:
+            feedback.key_value("address", run_plan.requested_address)
         feedback.key_value("cores", args.cores)
         feedback.key_value("dry_run", args.dry_run)
         feedback.key_value("selected_outputs", len(run_plan.selected_output_refs))
+        # planned_jobs counts compiled fresh jobs population-wide even for a
+        # targeted run; only the reuse counters below are closure-scoped.
         feedback.key_value("planned_jobs", len(run_plan.jobs))
         feedback.key_value(
             "planned_reused_registered_artifacts",
