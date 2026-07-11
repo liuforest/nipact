@@ -219,8 +219,9 @@ def build_parser() -> argparse.ArgumentParser:
         "--address",
         default=None,
         help=(
-            "Source-population entity address to run. Selects only that "
-            "entity's output; planning still validates the full population."
+            "Source-population entity address to target. Planning still "
+            "validates the full population, and a fresh cohort ancestor can "
+            "still execute other entities' upstream jobs."
         ),
     )
     workflow_run_parser.add_argument(
@@ -318,8 +319,10 @@ def _run_workflow_command(args: argparse.Namespace) -> int | None:
         feedback.key_value("workflow", run_plan.workflow_name)
         feedback.key_value("step", run_plan.selected_step_name)
         feedback.key_value("selected_output", run_plan.selected_output_name)
-        if run_plan.requested_address is not None:
-            feedback.key_value("address", run_plan.requested_address)
+        feedback.key_value(
+            "address",
+            "all" if run_plan.requested_address is None else run_plan.requested_address,
+        )
         feedback.key_value("cores", args.cores)
         feedback.key_value("dry_run", args.dry_run)
         feedback.key_value("selected_outputs", len(run_plan.selected_output_refs))

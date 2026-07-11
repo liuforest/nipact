@@ -314,13 +314,14 @@ def test_workflow_run_command_executes_step(
     assert captured.err == ""
     assert "\r" not in captured.out
     assert "\r" not in captured.err
-    assert output[:9] == [
+    assert output[:10] == [
         "NIPACT workflow run",
         "",
         "context=colors",
         "workflow=base",
         "step=color_sector_analysis",
         "selected_output=sector_counts",
+        "address=all",
         "cores=2",
         "dry_run=false",
         "selected_outputs=1",
@@ -328,22 +329,22 @@ def test_workflow_run_command_executes_step(
     # These three values describe planner decisions before Snakemake runs. In
     # the fresh demo path nothing is hydrated, but the scheduled job count still
     # matters because it tells the user how much work the concrete DAG contains.
-    assert output[9].startswith("planned_jobs=")
-    assert int(output[9].split("=", maxsplit=1)[1]) > 0
-    assert output[10] == "planned_reused_registered_artifacts=0"
-    assert output[11] == "planned_hydrated_inputs=0"
-    assert output[12] == "existing_staged_outputs=0"
-    assert output[13].endswith("/runs/colors/base/color_sector_analysis")
-    assert output[13].startswith("run_workspace=")
-    assert output[14].endswith(
+    assert output[10].startswith("planned_jobs=")
+    assert int(output[10].split("=", maxsplit=1)[1]) > 0
+    assert output[11] == "planned_reused_registered_artifacts=0"
+    assert output[12] == "planned_hydrated_inputs=0"
+    assert output[13] == "existing_staged_outputs=0"
+    assert output[14].endswith("/runs/colors/base/color_sector_analysis")
+    assert output[14].startswith("run_workspace=")
+    assert output[15].endswith(
         "/runs/colors/base/color_sector_analysis/logs/snakemake.log"
     )
-    assert output[14].startswith("snakemake_log=")
-    assert output[15] == (
+    assert output[15].startswith("snakemake_log=")
+    assert output[16] == (
         "note=Registered upstream artifacts can be hydrated into the current "
         "run when their identity and digest checks pass."
     )
-    assert output[16:] == [
+    assert output[17:] == [
         "",
         "Preparing run workspace...",
         "Starting Snakemake...",
@@ -448,7 +449,7 @@ def test_workflow_run_targeted_summary_keeps_population_job_count(
     full_summary = run_and_read_summary([])
     targeted_summary = run_and_read_summary(["--address", "color_007"])
 
-    assert "address" not in full_summary
+    assert full_summary["address"] == "all"
     assert targeted_summary["address"] == "color_007"
     assert int(full_summary["selected_outputs"]) == 200
     assert int(targeted_summary["selected_outputs"]) == 1
