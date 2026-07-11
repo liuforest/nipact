@@ -1145,6 +1145,49 @@ def test_multi_output_selected_step_publishes_siblings_for_reuse(
     assert log_path.read_text(encoding="utf-8").splitlines() == ["B sub_001"]
 
 
+def test_targeted_multi_output_run_publishes_both_siblings_for_one_entity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project_dir, runtime_dir, log_path = _write_cache_project(
+        tmp_path,
+        monkeypatch,
+        entities=("sub_001", "sub_002"),
+    )
+    multi_plan = build_run_plan(
+        project_dir=project_dir,
+        context="cache",
+        workflow_name="main",
+        step_name="multi_transform",
+        address="sub_001",
+    )
+    assert len(multi_plan.selected_output_refs) == 1
+    assert multi_plan.run_workspace == (
+        runtime_dir / "runs/cache/main/multi_transform/left_out/addresses/sub_001"
+    )
+    assert execute_run_plan(multi_plan, cores=1).all_selected_published
+    # The workflow target names left_out for one entity, but the selected job
+    # writes both siblings; both publish so the downstream all-or-nothing
+    # producer reuse check stays satisfiable, and nothing publishes or
+    # executes for sub_002.
+    with sqlite3.connect(runtime_dir / "database/registry.db") as conn:
+        published = conn.execute(
+            """
+            SELECT step_name, output_name, address
+            FROM published_outputs
+            WHERE context = 'cache'
+            ORDER BY step_name, output_name, address
+            """
+        ).fetchall()
+    assert [(str(row[0]), str(row[1]), str(row[2])) for row in published] == [
+        ("a_source", "a_out", "sub_001"),
+        ("b_transform", "b_out", "sub_001"),
+        ("multi_transform", "left_out", "sub_001"),
+        ("multi_transform", "right_out", "sub_001"),
+    ]
+    assert log_path.read_text(encoding="utf-8").splitlines() == ["B sub_001"]
+
+
 def test_derivative_reuses_compatible_base_ancestor_artifact(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2097,6 +2140,75 @@ def test_targeted_apply_executes_fresh_cohort_ancestor_with_population_fan_in(
     assert lines.count("FIT subjects 2") == 1
     assert lines.count("APPLY sub_001") == 1
     assert "APPLY sub_002" not in lines
+    fit_payload = _latest_workflow_payload(
+        runtime_dir,
+        step_name="fit_transform",
+        output_name="fit_out",
+        address="subjects",
+    )
+    assert fit_payload["count"] == 2
+    assert fit_payload["values"] == ["alpha-b", "beta-b"]
+
+
+def test_targeted_apply_with_empty_registry_executes_fresh_population_fan_in(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project_dir, runtime_dir, log_path = _write_cache_project(
+        tmp_path,
+        monkeypatch,
+        entities=("sub_001", "sub_002"),
+    )
+    _write_sibling_workflow(
+        project_dir,
+        workflow_name="apply_flow",
+        step_names=["a_source", "b_transform", "fit_transform", "apply_transform"],
+    )
+
+    apply_plan = build_run_plan(
+        project_dir=project_dir,
+        context="cache",
+        workflow_name="apply_flow",
+        step_name="apply_transform",
+        address="sub_001",
+    )
+    # Nothing is registered, so nothing is reusable: the fresh cohort fit joins
+    # the reachable closure and pulls sub_002's fresh upstream jobs with it —
+    # unlike the hydrated variant above, sub_002's chain must actually execute.
+    assert _reused_keys(apply_plan) == set()
+    expected_coordinates = {
+        ("a_source", "a_out", "sub_001"),
+        ("a_source", "a_out", "sub_002"),
+        ("b_transform", "b_out", "sub_001"),
+        ("b_transform", "b_out", "sub_002"),
+        ("fit_transform", "fit_out", "subjects"),
+        ("apply_transform", "apply_out", "sub_001"),
+    }
+    assert {
+        (spec.step_name, spec.output_name, spec.address)
+        for spec in apply_plan.published_outputs
+    } == expected_coordinates
+
+    outcome = execute_run_plan(apply_plan, cores=1)
+    assert outcome.all_selected_published
+    assert outcome.published_count == len(expected_coordinates)
+    lines = log_path.read_text(encoding="utf-8").splitlines()
+    assert lines.count("B sub_001") == 1
+    assert lines.count("B sub_002") == 1
+    assert lines.count("FIT subjects 2") == 1
+    assert lines.count("APPLY sub_001") == 1
+    assert "APPLY sub_002" not in lines
+    with sqlite3.connect(runtime_dir / "database/registry.db") as conn:
+        published = conn.execute(
+            """
+            SELECT step_name, output_name, address
+            FROM published_outputs
+            WHERE context = 'cache'
+            """
+        ).fetchall()
+    assert {
+        (str(row[0]), str(row[1]), str(row[2])) for row in published
+    } == expected_coordinates
     fit_payload = _latest_workflow_payload(
         runtime_dir,
         step_name="fit_transform",
