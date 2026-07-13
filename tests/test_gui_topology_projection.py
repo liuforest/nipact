@@ -209,6 +209,51 @@ def test_repeated_topology_same_coordinates_different_metrics():
     assert medium["summary"]["distinct_artifact_count"] == 8
 
 
+def test_same_local_names_in_different_workflows_stay_distinct():
+    trace = _trace(
+        artifacts=[
+            _artifact(
+                100,
+                "workflow_output",
+                workflow_name="first",
+                step_name="finish",
+                output_name="result",
+            ),
+            _artifact(
+                200,
+                "workflow_output",
+                workflow_name="second",
+                step_name="finish",
+                output_name="result",
+            ),
+        ],
+        dependencies=[
+            _dependency(
+                100,
+                200,
+                binding_name="upstream",
+                dependency_role="analysis_input",
+            )
+        ],
+        selected_artifact_id=200,
+    )
+
+    topology = build_observed_topology(trace)
+
+    assert {
+        (node["workflow_name"], node["step_name"])
+        for node in _node_of_kind(topology, "step")
+    } == {("first", "finish"), ("second", "finish")}
+    assert {
+        (node["workflow_name"], node["step_name"], node["output_name"])
+        for node in _node_of_kind(topology, "artifact_slot")
+    } == {
+        ("first", "finish", "result"),
+        ("second", "finish", "result"),
+    }
+    ObservedTopologyResponse.model_validate(topology)
+
+
 # --- root identity -----------------------------------------------------------
 
 

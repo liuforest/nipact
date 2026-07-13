@@ -16,7 +16,11 @@ export function traceGraphElementCount(graph: TraceGraphResponse): number {
 export function topologyElementCount(
   topology: ObservedTopologyResponse,
 ): number {
-  return topology.nodes.length + topology.edges.length;
+  return (
+    topology.nodes.length +
+    topology.edges.length +
+    topology.manifest_bindings.length
+  );
 }
 
 export function exceedsRenderLimit(

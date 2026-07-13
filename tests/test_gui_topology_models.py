@@ -241,6 +241,13 @@ def test_manifest_summary_allows_null_disagreeing_fields():
     assert binding.entity_count is None
 
 
+def test_manifest_summary_rejects_negative_entity_count():
+    with pytest.raises(ValidationError):
+        TopologyManifestBindingSummary.model_validate(
+            {**_manifest_binding(), "entity_count": -1}
+        )
+
+
 def test_manifest_summary_rejects_extra_field():
     with pytest.raises(ValidationError):
         TopologyManifestBindingSummary.model_validate(

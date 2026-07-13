@@ -290,7 +290,7 @@ class TopologyManifestBindingSummary(Dto):
     # carried through only when the grouped rows agree; otherwise null
     manifest_digest: str | None
     manifest_hash: str | None
-    entity_count: int | None
+    entity_count: NonNegativeInt | None
 
 
 class TopologyWarningSummary(Dto):
