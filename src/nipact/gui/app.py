@@ -19,6 +19,7 @@ from .models import (
     ArtifactsResponse,
     ManifestDetail,
     ManifestsResponse,
+    ObservedTopologyResponse,
     SummaryResponse,
     TraceGraphResponse,
     WorkflowsResponse,
@@ -112,6 +113,13 @@ def _install_api_routes(app: FastAPI, service: GuiService) -> None:
     @app.get("/api/artifacts/{artifact_id}/lineage", response_model=TraceGraphResponse)
     def artifact_lineage(artifact_id: int) -> TraceGraphResponse:
         return service.lineage(artifact_id)
+
+    @app.get(
+        "/api/artifacts/{artifact_id}/topology",
+        response_model=ObservedTopologyResponse,
+    )
+    def artifact_topology(artifact_id: int) -> ObservedTopologyResponse:
+        return service.topology(artifact_id)
 
 
 def _install_error_handlers(app: FastAPI) -> None:
