@@ -4,6 +4,7 @@ import type {
   ArtifactsResponse,
   ManifestDetail,
   ManifestsResponse,
+  ObservedTopologyResponse,
   SummaryResponse,
   TraceGraphResponse,
   WorkflowsResponse,
@@ -80,4 +81,12 @@ export function fetchArtifactLineage(
   artifactId: number,
 ): Promise<TraceGraphResponse> {
   return getJson<TraceGraphResponse>(`/api/artifacts/${artifactId}/lineage`);
+}
+
+export function fetchArtifactTopology(
+  artifactId: number,
+): Promise<ObservedTopologyResponse> {
+  return getJson<ObservedTopologyResponse>(
+    `/api/artifacts/${artifactId}/topology`,
+  );
 }

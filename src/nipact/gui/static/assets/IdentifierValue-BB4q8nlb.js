@@ -1,0 +1,1 @@
+import{j as i}from"./index-DmlBrVlJ.js";function r({value:e}){return e==null||e===""?i.jsx("span",{className:"muted-value",children:"none"}):i.jsx("code",{className:"inline-code identifier-value",title:String(e),children:e})}export{r as I};
