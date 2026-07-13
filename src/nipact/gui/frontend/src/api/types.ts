@@ -172,3 +172,109 @@ export interface TraceGraphResponse {
   manifest_bindings: TraceManifestBinding[];
   warnings: TraceWarning[];
 }
+
+// --- Observed topology (PR 2) -----------------------------------------------
+// Mirrors gui/models.py::ObservedTopologyResponse: the aggregated projection of
+// a backward provenance closure. node_id/edge_id are graph-local display keys;
+// the structured coordinate fields carry drill-down identity.
+
+export interface TopologyStepNode {
+  kind: "step";
+  node_id: string;
+  workflow_name: string;
+  step_name: string;
+  produced_registry_artifact_count: number;
+}
+
+export interface TopologyArtifactSlotNode {
+  kind: "artifact_slot";
+  node_id: string;
+  workflow_name: string;
+  step_name: string;
+  output_name: string;
+  registry_artifact_count: number;
+  distinct_address_count: number;
+}
+
+export interface TopologySourceInputNode {
+  kind: "source_input";
+  node_id: string;
+  workflow_name: string;
+  step_name: string;
+  binding_name: string;
+  dependency_role: string;
+  registry_artifact_count: number;
+}
+
+export interface TopologySourceRootNode {
+  kind: "source_root";
+  node_id: string;
+  display_path: string;
+  registry_artifact_count: number;
+}
+
+export type TopologyNode =
+  | TopologyStepNode
+  | TopologyArtifactSlotNode
+  | TopologySourceInputNode
+  | TopologySourceRootNode;
+
+export interface TopologyConsumesEdge {
+  kind: "consumes";
+  edge_id: string;
+  source_node_id: string;
+  target_node_id: string;
+  workflow_name: string;
+  step_name: string;
+  binding_name: string;
+  dependency_role: string;
+  registry_dependency_count: number;
+}
+
+export interface TopologyProducesEdge {
+  kind: "produces";
+  edge_id: string;
+  source_node_id: string;
+  target_node_id: string;
+}
+
+export type TopologyEdge = TopologyConsumesEdge | TopologyProducesEdge;
+
+export interface TopologyManifestBindingSummary {
+  workflow_name: string;
+  step_name: string;
+  role: string;
+  manifest_name: string;
+  distinct_run_count: number;
+  distinct_manifest_digest_count: number;
+  manifest_digest: string | null;
+  manifest_hash: string | null;
+  entity_count: number | null;
+}
+
+export interface TopologyWarningSummary {
+  warning_type: string;
+  occurrence_count: number;
+}
+
+export interface TopologySummary {
+  distinct_artifact_count: number;
+  registry_dependency_count: number;
+  node_count: number;
+  edge_count: number;
+}
+
+export interface ObservedTopologyResponse {
+  schema_version: number;
+  perspective: "observed";
+  scope: "ancestor_closure";
+  context: string;
+  root_artifact_id: number;
+  root_node_id: string;
+  provenance_status: "complete" | "degraded";
+  summary: TopologySummary;
+  nodes: TopologyNode[];
+  edges: TopologyEdge[];
+  manifest_bindings: TopologyManifestBindingSummary[];
+  warnings: TopologyWarningSummary[];
+}

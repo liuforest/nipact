@@ -6,4 +6,5 @@ export const queryKeys = {
   artifacts: ["artifacts"] as const,
   artifact: (artifactId: number) => ["artifact", artifactId] as const,
   lineage: (artifactId: number) => ["lineage", artifactId] as const,
+  topology: (artifactId: number) => ["topology", artifactId] as const,
 };
