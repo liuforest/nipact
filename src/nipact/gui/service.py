@@ -20,6 +20,7 @@ from nipact.trace import build_trace_graph
 
 from . import models
 from .project import GuiProject
+from .topology import build_observed_topology
 
 
 @dataclass(frozen=True)
@@ -153,6 +154,17 @@ class GuiService:
             active_context=self.project.context,
         )
         return models.TraceGraphResponse.model_validate(graph)
+
+    def topology(self, artifact_id: int) -> models.ObservedTopologyResponse:
+        artifact = self._artifact_for_context(artifact_id)
+        graph = build_trace_graph(
+            self.project.registry_path,
+            selected_artifact=artifact,
+            active_context=self.project.context,
+        )
+        return models.ObservedTopologyResponse.model_validate(
+            build_observed_topology(graph)
+        )
 
     def _artifact_for_context(self, artifact_id: int) -> RegistryArtifact:
         try:
