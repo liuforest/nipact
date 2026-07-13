@@ -1,15 +1,18 @@
 import json
 import os
 import sqlite3
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
 
+import nipact.registry as registry
 from nipact.cli import main
 from nipact.errors import ValidationError
 from nipact.execution import build_run_plan, execute_run_plan
 from nipact.registry import (
     REGISTRY_DB_PATH,
+    _open_registry_read_session,
     list_artifacts,
     list_manifests,
     list_run_manifest_bindings,
@@ -396,3 +399,180 @@ def test_registry_reads_reject_unknown_ids_runs_and_schema(
             step_name="step",
             output_name="out",
         )
+
+
+def test_registry_reads_translate_schema_read_failure(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _project_dir, runtime_dir = _init_demo(tmp_path, capsys)
+    registry_path = runtime_dir / REGISTRY_DB_PATH
+
+    def raise_schema_read_error(conn: sqlite3.Connection) -> None:
+        raise sqlite3.DatabaseError("database disk image is malformed")
+
+    monkeypatch.setattr(registry, "_validate_schema_version", raise_schema_read_error)
+
+    with pytest.raises(ValidationError, match="registry.db is malformed"):
+        read_artifact_by_id(registry_path, 1)
+    with pytest.raises(ValidationError, match="registry.db is malformed"):
+        list_upstream_dependencies(registry_path, artifact_id=1)
+    with pytest.raises(ValidationError, match="registry.db is malformed"):
+        list_run_manifest_bindings(registry_path, run_id=1)
+    with pytest.raises(ValidationError, match="registry.db is malformed"):
+        with _open_registry_read_session(registry_path):
+            pass
+
+
+def test_read_session_reads_match_public_helpers(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _project_dir, runtime_dir, _run_plan = _successful_sector_run(
+        tmp_path,
+        capsys,
+        monkeypatch,
+    )
+    registry_path = runtime_dir / REGISTRY_DB_PATH
+    selected = read_current_published_artifact(
+        registry_path,
+        context="colors",
+        workflow_name="base",
+        step_name="color_sector_analysis",
+        output_name="sector_counts",
+        address="init",
+    )
+
+    with _open_registry_read_session(registry_path) as session:
+        assert session.read_artifact_by_id(
+            selected.artifact_id
+        ) == read_artifact_by_id(registry_path, selected.artifact_id)
+        assert session.list_upstream_dependencies(
+            artifact_id=selected.artifact_id
+        ) == list_upstream_dependencies(
+            registry_path,
+            artifact_id=selected.artifact_id,
+        )
+        assert session.list_run_manifest_bindings(
+            run_id=selected.run_id,
+            context="colors",
+        ) == list_run_manifest_bindings(
+            registry_path,
+            run_id=selected.run_id,
+            context="colors",
+        )
+
+
+def test_read_session_opens_one_connection_and_validates_once(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _project_dir, runtime_dir, _run_plan = _successful_sector_run(
+        tmp_path,
+        capsys,
+        monkeypatch,
+    )
+    registry_path = runtime_dir / REGISTRY_DB_PATH
+    selected = read_current_published_artifact(
+        registry_path,
+        context="colors",
+        workflow_name="base",
+        step_name="color_sector_analysis",
+        output_name="sector_counts",
+        address="init",
+    )
+    upstream = list_upstream_dependencies(
+        registry_path,
+        artifact_id=selected.artifact_id,
+    )
+    assert len(upstream) > 1
+
+    connect_calls: list[Path] = []
+    validate_in_transaction: list[bool] = []
+    real_connect = registry._connect_readonly_rows
+    real_validate = registry._validate_schema_version
+
+    @contextmanager
+    def counting_connect(path: Path):
+        connect_calls.append(path)
+        with real_connect(path) as conn:
+            yield conn
+
+    def counting_validate(conn: sqlite3.Connection) -> None:
+        validate_in_transaction.append(conn.in_transaction)
+        real_validate(conn)
+
+    monkeypatch.setattr(registry, "_connect_readonly_rows", counting_connect)
+    monkeypatch.setattr(registry, "_validate_schema_version", counting_validate)
+
+    with _open_registry_read_session(registry_path) as session:
+        opened_conn = session._conn
+        assert opened_conn.in_transaction is True
+        session.read_artifact_by_id(selected.artifact_id)
+        for edge in upstream:
+            session.read_artifact_by_id(edge.source_artifact_id)
+            session.list_upstream_dependencies(artifact_id=edge.source_artifact_id)
+        session.list_run_manifest_bindings(run_id=selected.run_id, context="colors")
+
+    # One connection and one schema validation regardless of how many hops ran.
+    assert connect_calls == [registry_path]
+    assert validate_in_transaction == [True]
+    with pytest.raises(sqlite3.ProgrammingError):
+        opened_conn.execute("SELECT 1")
+
+
+def test_read_session_reports_unknown_ids_within_session(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _project_dir, runtime_dir = _init_demo(tmp_path, capsys)
+    registry_path = runtime_dir / REGISTRY_DB_PATH
+
+    with _open_registry_read_session(registry_path) as session:
+        with pytest.raises(ValidationError, match="positive integer"):
+            session.read_artifact_by_id(0)
+        with pytest.raises(ValidationError, match="unknown registry artifact id"):
+            session.read_artifact_by_id(999)
+        with pytest.raises(ValidationError, match="unknown registry artifact id"):
+            session.list_upstream_dependencies(artifact_id=999)
+        with pytest.raises(ValidationError, match="unknown workflow run id"):
+            session.list_run_manifest_bindings(run_id=999)
+
+
+def test_read_session_closes_connection_after_failure(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _project_dir, runtime_dir = _init_demo(tmp_path, capsys)
+    registry_path = runtime_dir / REGISTRY_DB_PATH
+    captured: dict[str, sqlite3.Connection] = {}
+
+    with pytest.raises(RuntimeError, match="boom"):
+        with _open_registry_read_session(registry_path) as session:
+            captured["conn"] = session._conn
+            raise RuntimeError("boom")
+
+    conn = captured["conn"]
+    with pytest.raises(sqlite3.ProgrammingError):
+        conn.execute("SELECT 1")
+
+
+def test_read_session_rejects_missing_database(tmp_path: Path) -> None:
+    with pytest.raises(ValidationError, match="missing database"):
+        with _open_registry_read_session(tmp_path / "absent.db"):
+            pass
+
+
+def test_read_session_rejects_incompatible_schema(tmp_path: Path) -> None:
+    incompatible_runtime = tmp_path / "incompatible"
+    (incompatible_runtime / "database").mkdir(parents=True)
+    incompatible_path = incompatible_runtime / REGISTRY_DB_PATH
+    with sqlite3.connect(incompatible_path) as conn:
+        conn.execute("PRAGMA user_version = 1")
+
+    with pytest.raises(ValidationError, match="schema version is incompatible"):
+        with _open_registry_read_session(incompatible_path):
+            pass

@@ -637,26 +637,37 @@ def read_published_outputs(
     ]
 
 
+def _read_artifact_by_id_conn(
+    conn: sqlite3.Connection,
+    artifact_id: int,
+) -> RegistryArtifact:
+    """Read one artifact by id on an already-open read connection."""
+    try:
+        row = conn.execute(
+            f"""
+            SELECT {_ARTIFACT_SELECT_COLUMNS}
+            FROM artifacts a
+            LEFT JOIN parameters p ON a.parameter_id = p.parameter_id
+            WHERE a.artifact_id = ?
+            """,
+            (artifact_id,),
+        ).fetchone()
+    except sqlite3.Error as exc:
+        raise ValidationError(f"registry.db is malformed: {exc}") from exc
+    if row is None:
+        raise ValidationError(f"unknown registry artifact id: {artifact_id}")
+    return _registry_artifact_from_row(row)
+
+
 def read_artifact_by_id(path: Path, artifact_id: int) -> RegistryArtifact:
     """Read one registered artifact by database id."""
     _validate_positive_id(artifact_id, label="artifact id")
     try:
         with _connect_readonly_rows(path) as conn:
             _validate_schema_version(conn)
-            row = conn.execute(
-                f"""
-                SELECT {_ARTIFACT_SELECT_COLUMNS}
-                FROM artifacts a
-                LEFT JOIN parameters p ON a.parameter_id = p.parameter_id
-                WHERE a.artifact_id = ?
-                """,
-                (artifact_id,),
-            ).fetchone()
+            return _read_artifact_by_id_conn(conn, artifact_id)
     except sqlite3.Error as exc:
         raise ValidationError(f"registry.db is malformed: {exc}") from exc
-    if row is None:
-        raise ValidationError(f"unknown registry artifact id: {artifact_id}")
-    return _registry_artifact_from_row(row)
 
 
 def read_artifact_by_id_for_context(
@@ -1293,6 +1304,32 @@ def read_current_published_artifact(
     return _registry_artifact_from_row(row)
 
 
+def _list_upstream_dependencies_conn(
+    conn: sqlite3.Connection,
+    *,
+    artifact_id: int,
+) -> list[RegistryDependency]:
+    """List one-hop dependency edges into an artifact on an open read connection."""
+    try:
+        _require_artifact_id(conn, artifact_id)
+        rows = conn.execute(
+            """
+            SELECT dependent_artifact_id, source_artifact_id,
+                   source_content_digest, source_file_size, source_extension, input_path,
+                   binding_name, dependency_role, source_step_name,
+                   source_output_name, source_address, dependency_set_id,
+                   manifest_digest, edge_cardinality
+            FROM artifact_dependencies
+            WHERE dependent_artifact_id = ?
+            ORDER BY binding_name, input_path, source_artifact_id
+            """,
+            (artifact_id,),
+        ).fetchall()
+    except sqlite3.Error as exc:
+        raise ValidationError(f"registry.db is malformed: {exc}") from exc
+    return [_registry_dependency_from_row(row) for row in rows]
+
+
 def list_upstream_dependencies(
     path: Path,
     *,
@@ -1303,23 +1340,38 @@ def list_upstream_dependencies(
     try:
         with _connect_readonly_rows(path) as conn:
             _validate_schema_version(conn)
-            _require_artifact_id(conn, artifact_id)
-            rows = conn.execute(
-                """
-                SELECT dependent_artifact_id, source_artifact_id,
-                       source_content_digest, source_file_size, source_extension, input_path,
-                       binding_name, dependency_role, source_step_name,
-                       source_output_name, source_address, dependency_set_id,
-                       manifest_digest, edge_cardinality
-                FROM artifact_dependencies
-                WHERE dependent_artifact_id = ?
-                ORDER BY binding_name, input_path, source_artifact_id
-                """,
-                (artifact_id,),
-            ).fetchall()
+            return _list_upstream_dependencies_conn(conn, artifact_id=artifact_id)
     except sqlite3.Error as exc:
         raise ValidationError(f"registry.db is malformed: {exc}") from exc
-    return [_registry_dependency_from_row(row) for row in rows]
+
+
+def _list_run_manifest_bindings_conn(
+    conn: sqlite3.Connection,
+    *,
+    run_id: int,
+    context: str | None = None,
+) -> list[RegistryManifestBinding]:
+    """List manifest bindings for a run on an already-open read connection."""
+    where_sql = "WHERE run_id = ?"
+    values: tuple[object, ...] = (run_id,)
+    if context is not None:
+        where_sql += " AND context = ?"
+        values = (run_id, context)
+    try:
+        _require_run_id(conn, run_id)
+        rows = conn.execute(
+            """
+            SELECT run_id, context, workflow_name, step_name, role,
+                   manifest_name, manifest_digest, manifest_hash, entity_count
+            FROM run_manifest_bindings
+            {where_sql}
+            ORDER BY step_name, role, manifest_name
+            """.format(where_sql=where_sql),
+            values,
+        ).fetchall()
+    except sqlite3.Error as exc:
+        raise ValidationError(f"registry.db is malformed: {exc}") from exc
+    return [_registry_manifest_binding_from_row(row) for row in rows]
 
 
 def list_run_manifest_bindings(
@@ -1330,28 +1382,72 @@ def list_run_manifest_bindings(
 ) -> list[RegistryManifestBinding]:
     """List manifest bindings recorded for a workflow run."""
     _validate_positive_id(run_id, label="run id")
-    where_sql = "WHERE run_id = ?"
-    values: tuple[object, ...] = (run_id,)
-    if context is not None:
-        where_sql += " AND context = ?"
-        values = (run_id, context)
     try:
         with _connect_readonly_rows(path) as conn:
             _validate_schema_version(conn)
-            _require_run_id(conn, run_id)
-            rows = conn.execute(
-                """
-                SELECT run_id, context, workflow_name, step_name, role,
-                       manifest_name, manifest_digest, manifest_hash, entity_count
-                FROM run_manifest_bindings
-                {where_sql}
-                ORDER BY step_name, role, manifest_name
-                """.format(where_sql=where_sql),
-                values,
-            ).fetchall()
+            return _list_run_manifest_bindings_conn(
+                conn,
+                run_id=run_id,
+                context=context,
+            )
     except sqlite3.Error as exc:
         raise ValidationError(f"registry.db is malformed: {exc}") from exc
-    return [_registry_manifest_binding_from_row(row) for row in rows]
+
+
+class _RegistryReadSession:
+    """One read-only snapshot session for a single provenance trace traversal.
+
+    Wraps one open read connection so a traversal can perform many artifact,
+    upstream-dependency, and manifest-binding reads without reopening a
+    connection or revalidating the schema per hop. Kept private and limited to
+    the three trace reads; it does not expose the underlying connection.
+    """
+
+    def __init__(self, conn: sqlite3.Connection) -> None:
+        self._conn = conn
+
+    def read_artifact_by_id(self, artifact_id: int) -> RegistryArtifact:
+        _validate_positive_id(artifact_id, label="artifact id")
+        return _read_artifact_by_id_conn(self._conn, artifact_id)
+
+    def list_upstream_dependencies(
+        self,
+        *,
+        artifact_id: int,
+    ) -> list[RegistryDependency]:
+        _validate_positive_id(artifact_id, label="artifact id")
+        return _list_upstream_dependencies_conn(self._conn, artifact_id=artifact_id)
+
+    def list_run_manifest_bindings(
+        self,
+        *,
+        run_id: int,
+        context: str | None = None,
+    ) -> list[RegistryManifestBinding]:
+        _validate_positive_id(run_id, label="run id")
+        return _list_run_manifest_bindings_conn(
+            self._conn,
+            run_id=run_id,
+            context=context,
+        )
+
+
+@contextmanager
+def _open_registry_read_session(path: Path) -> Iterator[_RegistryReadSession]:
+    """Open one read-only snapshot session for a provenance trace traversal.
+
+    Opens a single read-only connection, starts one explicit read transaction so
+    the traversal observes a consistent snapshot, and validates the schema once
+    inside that transaction. The connection and transaction are released through
+    context-manager cleanup on both success and failure.
+    """
+    with _connect_readonly_rows(path) as conn:
+        try:
+            conn.execute("BEGIN")
+            _validate_schema_version(conn)
+        except sqlite3.Error as exc:
+            raise ValidationError(f"registry.db is malformed: {exc}") from exc
+        yield _RegistryReadSession(conn)
 
 
 def list_manifests(path: Path, *, context: str) -> list[RegistryManifest]:
