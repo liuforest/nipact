@@ -1,15 +1,18 @@
 import json
 import os
 import sqlite3
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
 
+import nipact.registry as registry
 from nipact.cli import main
 from nipact.errors import ValidationError
 from nipact.execution import build_run_plan, execute_run_plan
 from nipact.registry import REGISTRY_DB_PATH, list_artifacts
 from nipact.trace import (
+    build_trace_graph,
     build_trace_graph_for_artifact_id,
     build_trace_graph_for_path,
     build_trace_graph_for_workflow_coordinate,
@@ -429,3 +432,220 @@ def test_trace_graph_marks_damaged_dependency_as_degraded(
         dependency["source_artifact_id"] == 999999
         for dependency in graph["dependencies"]
     )
+
+
+def _selected_sector_counts(registry_path: Path) -> object:
+    return list_artifacts(
+        registry_path,
+        context="colors",
+        origin="workflow_output",
+        workflow_name="base",
+        step_name="color_sector_analysis",
+        output_name="sector_counts",
+        is_published=True,
+    )[0]
+
+
+def _a_feature_artifact(registry_path: Path) -> object:
+    return list_artifacts(
+        registry_path,
+        context="colors",
+        origin="workflow_output",
+        workflow_name="base",
+        step_name="color_features",
+        output_name="features",
+    )[0]
+
+
+def test_trace_traversal_shares_one_read_session_regardless_of_closure(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _project_dir, runtime_dir, _run_plan = _successful_sector_run(
+        tmp_path,
+        capsys,
+        monkeypatch,
+    )
+    registry_path = runtime_dir / REGISTRY_DB_PATH
+    large_root = _selected_sector_counts(registry_path)
+    small_root = _a_feature_artifact(registry_path)
+
+    real_connect = registry._connect_readonly_rows
+    real_validate = registry._validate_schema_version
+
+    def run_counted(
+        selected_artifact: object,
+    ) -> tuple[dict[str, object], list[Path], list[bool], list[sqlite3.Connection]]:
+        connect_calls: list[Path] = []
+        validate_in_transaction: list[bool] = []
+        conns: list[sqlite3.Connection] = []
+
+        @contextmanager
+        def counting_connect(path: Path):
+            connect_calls.append(path)
+            with real_connect(path) as conn:
+                conns.append(conn)
+                yield conn
+
+        def counting_validate(conn: sqlite3.Connection) -> None:
+            validate_in_transaction.append(conn.in_transaction)
+            real_validate(conn)
+
+        monkeypatch.setattr(registry, "_connect_readonly_rows", counting_connect)
+        monkeypatch.setattr(registry, "_validate_schema_version", counting_validate)
+        graph = build_trace_graph(
+            registry_path,
+            selected_artifact=selected_artifact,
+            active_context="colors",
+        )
+        return graph, connect_calls, validate_in_transaction, conns
+
+    large_graph, large_connects, large_validate, large_conns = run_counted(large_root)
+    small_graph, small_connects, small_validate, small_conns = run_counted(small_root)
+
+    # One traversal connection and one schema validation, no matter the closure.
+    assert large_connects == [registry_path]
+    assert small_connects == [registry_path]
+    assert large_validate == [True]
+    assert small_validate == [True]
+    # The two closures genuinely differ, so a constant connection count is meaningful.
+    assert len(large_graph["artifacts"]) > len(small_graph["artifacts"])
+    # Each traversal session is closed once its graph is built.
+    for conn in (*large_conns, *small_conns):
+        with pytest.raises(sqlite3.ProgrammingError):
+            conn.execute("SELECT 1")
+
+
+def test_trace_selector_wrapper_opens_separate_selector_lookup(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _project_dir, runtime_dir, _run_plan = _successful_sector_run(
+        tmp_path,
+        capsys,
+        monkeypatch,
+    )
+    registry_path = runtime_dir / REGISTRY_DB_PATH
+    selected = _selected_sector_counts(registry_path)
+
+    connect_calls: list[Path] = []
+    real_connect = registry._connect_readonly_rows
+
+    @contextmanager
+    def counting_connect(path: Path):
+        connect_calls.append(path)
+        with real_connect(path) as conn:
+            yield conn
+
+    monkeypatch.setattr(registry, "_connect_readonly_rows", counting_connect)
+    graph = build_trace_graph_for_artifact_id(
+        registry_path,
+        artifact_id=selected.artifact_id,
+    )
+
+    assert graph["selected_artifact_id"] == selected.artifact_id
+    # One connection for the selector root lookup, one for the traversal session.
+    assert connect_calls == [registry_path, registry_path]
+
+
+def test_trace_terminates_on_dependency_cycle(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _project_dir, runtime_dir, _run_plan = _successful_sector_run(
+        tmp_path,
+        capsys,
+        monkeypatch,
+    )
+    registry_path = runtime_dir / REGISTRY_DB_PATH
+    selected = _selected_sector_counts(registry_path)
+    feature = _a_feature_artifact(registry_path)
+
+    with sqlite3.connect(registry_path) as conn:
+        conn.execute("PRAGMA foreign_keys = OFF")
+        conn.execute(
+            """
+            INSERT INTO artifact_dependencies (
+                dependent_artifact_id, source_artifact_id,
+                source_content_digest, source_file_size, source_extension,
+                input_path, binding_name, dependency_role
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                feature.artifact_id,
+                selected.artifact_id,
+                "0" * 64,
+                0,
+                ".json",
+                "runs/colors/base/cycle.json",
+                "cycle_input",
+                "input",
+            ),
+        )
+
+    graph = build_trace_graph_for_artifact_id(
+        registry_path,
+        artifact_id=selected.artifact_id,
+        context="colors",
+    )
+
+    artifact_ids = {artifact["artifact_id"] for artifact in graph["artifacts"]}
+    assert selected.artifact_id in artifact_ids
+    assert feature.artifact_id in artifact_ids
+    assert any(
+        dependency["source_artifact_id"] == selected.artifact_id
+        and dependency["dependent_artifact_id"] == feature.artifact_id
+        for dependency in graph["dependencies"]
+    )
+
+
+def test_trace_raw_decoder_error_escapes_and_closes_session(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _project_dir, runtime_dir, _run_plan = _successful_sector_run(
+        tmp_path,
+        capsys,
+        monkeypatch,
+    )
+    registry_path = runtime_dir / REGISTRY_DB_PATH
+    selected = _selected_sector_counts(registry_path)
+    feature = _a_feature_artifact(registry_path)
+
+    with sqlite3.connect(registry_path) as conn:
+        conn.execute(
+            "UPDATE artifacts SET file_size = ? WHERE artifact_id = ?",
+            ("not-a-number", feature.artifact_id),
+        )
+
+    conns: list[sqlite3.Connection] = []
+    real_connect = registry._connect_readonly_rows
+
+    @contextmanager
+    def counting_connect(path: Path):
+        with real_connect(path) as conn:
+            conns.append(conn)
+            yield conn
+
+    monkeypatch.setattr(registry, "_connect_readonly_rows", counting_connect)
+    with pytest.raises(ValueError) as excinfo:
+        build_trace_graph(
+            registry_path,
+            selected_artifact=selected,
+            active_context="colors",
+        )
+
+    # A raw conversion failure keeps its original type (decoders run outside the
+    # sqlite3.Error -> ValidationError translation).
+    assert not isinstance(excinfo.value, ValidationError)
+    assert "invalid literal for int()" in str(excinfo.value)
+    # The traversal session is still closed despite the raw failure.
+    assert conns
+    for conn in conns:
+        with pytest.raises(sqlite3.ProgrammingError):
+            conn.execute("SELECT 1")

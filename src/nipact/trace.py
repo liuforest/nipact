@@ -11,8 +11,8 @@ from .registry import (
     RegistryArtifact,
     RegistryDependency,
     RegistryManifestBinding,
-    list_run_manifest_bindings,
-    list_upstream_dependencies,
+    _open_registry_read_session,
+    _RegistryReadSession,
     read_artifact_by_id,
     read_artifact_by_id_for_context,
     read_artifact_by_path,
@@ -106,64 +106,67 @@ def build_trace_graph(
         selected_artifact.artifact_id: selected_artifact
     }
 
-    while pending_artifact_ids:
-        artifact_id = pending_artifact_ids.pop()
-        if artifact_id in artifacts:
-            continue
-        artifact = loaded_artifacts.get(artifact_id)
-        if artifact is None:
-            artifact = _read_trace_artifact(
-                registry_path,
-                artifact_id=artifact_id,
-                selected_artifact=selected_artifact,
-                pending_dependency=pending_dependency_context.get(artifact_id),
-                active_context=active_context,
-                warnings=warnings,
-            )
-        if artifact is None:
-            continue
-
-        artifacts[artifact.artifact_id] = _artifact_payload(
-            artifact,
-            is_selected=artifact.artifact_id == selected_artifact.artifact_id,
-        )
-        for dependency in _read_upstream_dependencies(
-            registry_path,
-            artifact=artifact,
-            warnings=warnings,
-        ):
-            missing_source = False
-            if active_context is not None:
-                source_artifact = _read_trace_artifact(
-                    registry_path,
-                    artifact_id=dependency.source_artifact_id,
+    with _open_registry_read_session(registry_path) as session:
+        while pending_artifact_ids:
+            artifact_id = pending_artifact_ids.pop()
+            if artifact_id in artifacts:
+                continue
+            artifact = loaded_artifacts.get(artifact_id)
+            if artifact is None:
+                artifact = _read_trace_artifact(
+                    session,
+                    artifact_id=artifact_id,
                     selected_artifact=selected_artifact,
-                    pending_dependency=dependency,
+                    pending_dependency=pending_dependency_context.get(artifact_id),
                     active_context=active_context,
                     warnings=warnings,
                 )
-                if source_artifact is None:
-                    if _last_warning_is_cross_context(warnings, dependency):
-                        continue
-                    missing_source = True
-                else:
-                    loaded_artifacts[source_artifact.artifact_id] = source_artifact
-            dependency_key = _dependency_key(dependency)
-            dependencies[dependency_key] = dependency
-            if (
-                not missing_source
-                and dependency.source_artifact_id not in queued_artifact_ids
-            ):
-                queued_artifact_ids.add(dependency.source_artifact_id)
-                pending_dependency_context[dependency.source_artifact_id] = dependency
-                pending_artifact_ids.append(dependency.source_artifact_id)
+            if artifact is None:
+                continue
 
-    manifest_bindings = _manifest_binding_payloads(
-        registry_path,
-        context=selected_artifact.context,
-        artifacts=artifacts.values(),
-        warnings=warnings,
-    )
+            artifacts[artifact.artifact_id] = _artifact_payload(
+                artifact,
+                is_selected=artifact.artifact_id == selected_artifact.artifact_id,
+            )
+            for dependency in _read_upstream_dependencies(
+                session,
+                artifact=artifact,
+                warnings=warnings,
+            ):
+                missing_source = False
+                if active_context is not None:
+                    source_artifact = _read_trace_artifact(
+                        session,
+                        artifact_id=dependency.source_artifact_id,
+                        selected_artifact=selected_artifact,
+                        pending_dependency=dependency,
+                        active_context=active_context,
+                        warnings=warnings,
+                    )
+                    if source_artifact is None:
+                        if _last_warning_is_cross_context(warnings, dependency):
+                            continue
+                        missing_source = True
+                    else:
+                        loaded_artifacts[source_artifact.artifact_id] = source_artifact
+                dependency_key = _dependency_key(dependency)
+                dependencies[dependency_key] = dependency
+                if (
+                    not missing_source
+                    and dependency.source_artifact_id not in queued_artifact_ids
+                ):
+                    queued_artifact_ids.add(dependency.source_artifact_id)
+                    pending_dependency_context[dependency.source_artifact_id] = (
+                        dependency
+                    )
+                    pending_artifact_ids.append(dependency.source_artifact_id)
+
+        manifest_bindings = _manifest_binding_payloads(
+            session,
+            context=selected_artifact.context,
+            artifacts=artifacts.values(),
+            warnings=warnings,
+        )
     return {
         "schema_version": TRACE_SCHEMA_VERSION,
         "context": selected_artifact.context,
@@ -186,7 +189,7 @@ def build_trace_graph(
 
 
 def _read_trace_artifact(
-    registry_path: Path,
+    session: _RegistryReadSession,
     *,
     artifact_id: int,
     selected_artifact: RegistryArtifact,
@@ -197,7 +200,7 @@ def _read_trace_artifact(
     if artifact_id == selected_artifact.artifact_id:
         return selected_artifact
     try:
-        artifact = read_artifact_by_id(registry_path, artifact_id)
+        artifact = session.read_artifact_by_id(artifact_id)
     except ValidationError as exc:
         warnings.append(
             {
@@ -240,14 +243,13 @@ def _last_warning_is_cross_context(
 
 
 def _read_upstream_dependencies(
-    registry_path: Path,
+    session: _RegistryReadSession,
     *,
     artifact: RegistryArtifact,
     warnings: list[dict[str, Any]],
 ) -> list[RegistryDependency]:
     try:
-        return list_upstream_dependencies(
-            registry_path,
+        return session.list_upstream_dependencies(
             artifact_id=artifact.artifact_id,
         )
     except ValidationError as exc:
@@ -263,7 +265,7 @@ def _read_upstream_dependencies(
 
 
 def _manifest_binding_payloads(
-    registry_path: Path,
+    session: _RegistryReadSession,
     *,
     context: str,
     artifacts: Iterable[dict[str, Any]],
@@ -279,8 +281,7 @@ def _manifest_binding_payloads(
     bindings: dict[tuple[int, str, str, str], dict[str, Any]] = {}
     for run_id in run_ids:
         try:
-            run_bindings = list_run_manifest_bindings(
-                registry_path,
+            run_bindings = session.list_run_manifest_bindings(
                 run_id=run_id,
                 context=context,
             )
