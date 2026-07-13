@@ -3,10 +3,23 @@ import { fireEvent, render, screen } from "@testing-library/react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { describe, expect, it, vi } from "vitest";
 import type { ObservedTopologyResponse, TraceGraphResponse } from "../api/types";
+import type { TopologyGraphSelection } from "../lineage/TopologyGraphCanvas";
 import { LineagePage } from "./LineagePage";
 
 vi.mock("../lineage/TopologyGraphCanvas", () => ({
-  TopologyGraphCanvas: () => <div data-testid="topology-canvas" />,
+  TopologyGraphCanvas: ({
+    onSelectionChange,
+  }: {
+    onSelectionChange?: (selection: TopologyGraphSelection | null) => void;
+  }) => (
+    <button
+      type="button"
+      data-testid="topology-canvas"
+      onClick={() => onSelectionChange?.({ kind: "node", node_id: "n2" })}
+    >
+      Select topology node
+    </button>
+  ),
 }));
 
 vi.mock("../lineage/LineageGraphCanvas", () => ({
@@ -20,7 +33,7 @@ const topology: ObservedTopologyResponse = {
   context: "colors",
   root_artifact_id: 2,
   root_node_id: "n2",
-  provenance_status: "complete",
+  provenance_status: "degraded",
   summary: {
     distinct_artifact_count: 2,
     registry_dependency_count: 1,
@@ -134,14 +147,53 @@ const graph: TraceGraphResponse = {
   warnings: [],
 };
 
-function stubFetch() {
+const multiWorkflowTopology: ObservedTopologyResponse = {
+  ...topology,
+  summary: { ...topology.summary, node_count: 5, edge_count: 3 },
+  nodes: [
+    ...topology.nodes,
+    {
+      kind: "step",
+      node_id: "n3",
+      workflow_name: "alternate",
+      step_name: "finish",
+      produced_registry_artifact_count: 1,
+    },
+    {
+      kind: "artifact_slot",
+      node_id: "n4",
+      workflow_name: "alternate",
+      step_name: "finish",
+      output_name: "result",
+      registry_artifact_count: 1,
+      distinct_address_count: 0,
+    },
+  ],
+  edges: [
+    ...topology.edges,
+    {
+      kind: "produces",
+      edge_id: "e2",
+      source_node_id: "n3",
+      target_node_id: "n4",
+    },
+  ],
+};
+
+function stubFetch({
+  topologyResponse = topology,
+  graphResponse = graph,
+}: {
+  topologyResponse?: ObservedTopologyResponse;
+  graphResponse?: TraceGraphResponse;
+} = {}) {
   const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
     const url = String(input);
     if (url.includes("/topology")) {
-      return new Response(JSON.stringify(topology), { status: 200 });
+      return new Response(JSON.stringify(topologyResponse), { status: 200 });
     }
     if (url.includes("/lineage")) {
-      return new Response(JSON.stringify(graph), { status: 200 });
+      return new Response(JSON.stringify(graphResponse), { status: 200 });
     }
     return new Response("not found", { status: 404 });
   });
@@ -182,6 +234,12 @@ describe("LineagePage", () => {
     ).toBeInTheDocument();
     expect(screen.getByRole("heading", { name: "Manifest Bindings" })).toBeInTheDocument();
     expect(screen.getByText("missing_artifact × 2")).toBeInTheDocument();
+    expect(
+      screen.getByText(
+        "Provenance is degraded. Review the warnings below; unresolved records may be absent from the rendered topology.",
+      ),
+    ).toBeInTheDocument();
+    expect(screen.getByTitle("digest")).toBeInTheDocument();
     expect(requestedLineage(fetchMock)).toBe(false);
   });
 
@@ -191,10 +249,59 @@ describe("LineagePage", () => {
     renderPage();
 
     await screen.findByRole("heading", { name: /Observed Topology/ });
-    fireEvent.click(screen.getByRole("button", { name: "output: finish.result" }));
+    fireEvent.click(
+      screen.getByRole("button", { name: "output: base.finish.result" }),
+    );
 
     expect(screen.getByRole("heading", { name: "Selected Node" })).toBeInTheDocument();
     expect(screen.getByText("artifact_slot")).toBeInTheDocument();
+  });
+
+  it("drives the same selection details from the topology canvas", async () => {
+    stubFetch();
+
+    renderPage();
+
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Select topology node" }),
+    );
+
+    expect(screen.getByRole("heading", { name: "Selected Node" })).toBeInTheDocument();
+    expect(screen.getByText("artifact_slot")).toBeInTheDocument();
+  });
+
+  it("keeps repeated local names distinguishable in the accessible list", async () => {
+    stubFetch({ topologyResponse: multiWorkflowTopology });
+
+    renderPage();
+
+    expect(
+      await screen.findByRole("button", { name: "output: base.finish.result" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "step: base.finish" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "step: alternate.finish" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "output: alternate.finish.result" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", {
+        name: "input: base.finish.raw (source_input)",
+      }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", {
+        name: "consumes: base.finish.raw (source_input)",
+      }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", {
+        name: "produces: alternate.finish → alternate.finish.result",
+      }),
+    ).toBeInTheDocument();
   });
 
   it("fetches raw lineage only after an explicit opt-in", async () => {
@@ -225,5 +332,46 @@ describe("LineagePage", () => {
     ).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Show raw lineage" })).toBeNull();
     expect(screen.queryByTestId("topology-canvas")).toBeNull();
+  });
+
+  it("counts manifest rows toward the topology render limit", async () => {
+    stubFetch();
+
+    renderPage(5);
+
+    expect(
+      await screen.findByRole("heading", {
+        name: "Observed topology too large to render",
+      }),
+    ).toBeInTheDocument();
+  });
+
+  it("refuses oversized raw lineage after it is downloaded", async () => {
+    const oversizedGraph: TraceGraphResponse = {
+      ...graph,
+      manifest_bindings: Array.from({ length: 6 }, (_, index) => ({
+        run_id: index + 1,
+        workflow_name: "base",
+        step_name: "finish",
+        role: "analysis",
+        manifest_name: "colors",
+        manifest_digest: `digest-${index}`,
+        manifest_hash: `hash-${index}`,
+        entity_count: 2,
+      })),
+    };
+    stubFetch({ graphResponse: oversizedGraph });
+
+    renderPage(6);
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Show raw lineage" }),
+    );
+
+    expect(
+      await screen.findByRole("heading", {
+        name: "Raw lineage too large to render",
+      }),
+    ).toBeInTheDocument();
+    expect(screen.queryByTestId("lineage-canvas")).toBeNull();
   });
 });

@@ -91,7 +91,7 @@ export function LineageGraphExplorer({ graph }: { graph: TraceGraphResponse }) {
         <h2>Manifest Bindings</h2>
         <DataTable<TraceManifestBinding>
           rows={graph.manifest_bindings}
-          getRowKey={(row) => `${row.workflow_name}:${row.step_name}:${row.role}:${row.manifest_name}`}
+          getRowKey={(row) => `${row.run_id}:${row.workflow_name}:${row.step_name}:${row.role}:${row.manifest_name}`}
           columns={[
             { key: "workflow", label: "workflow", render: (row) => row.workflow_name },
             { key: "step", label: "step", render: (row) => row.step_name },

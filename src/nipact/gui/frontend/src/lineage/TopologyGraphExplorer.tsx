@@ -57,8 +57,8 @@ export function TopologyGraphExplorer({
         <h1>Observed Topology · Artifact {topology.root_artifact_id}</h1>
         {topology.provenance_status === "degraded" ? (
           <p className="status-line" role="status">
-            Provenance is degraded: some consumption edges are omitted because a
-            source artifact is missing. Dependency counts still include them.
+            Provenance is degraded. Review the warnings below; unresolved records
+            may be absent from the rendered topology.
           </p>
         ) : null}
         {onShowRawLineage ? (
@@ -109,6 +109,16 @@ export function TopologyGraphExplorer({
               key: "digests",
               label: "digests",
               render: (row) => row.distinct_manifest_digest_count,
+            },
+            {
+              key: "digest",
+              label: "digest",
+              render: (row) =>
+                row.manifest_digest === null ? (
+                  "varies"
+                ) : (
+                  <IdentifierValue value={row.manifest_digest} />
+                ),
             },
             {
               key: "entities",
@@ -172,6 +182,11 @@ function TopologyElementList({
   selection: TopologyGraphSelection | null;
   onSelect: (selection: TopologyGraphSelection) => void;
 }) {
+  const nodesById = useMemo(
+    () => new Map(topology.nodes.map((node) => [node.node_id, node])),
+    [topology.nodes],
+  );
+
   return (
     <div className="neighborhood-grid">
       <div>
@@ -204,7 +219,7 @@ function TopologyElementList({
                 }
                 onClick={() => onSelect({ kind: "edge", edge_id: edge.edge_id })}
               >
-                {topologyEdgeListLabel(edge)}
+                {topologyEdgeListLabel(edge, nodesById)}
               </button>
             </li>
           ))}
@@ -345,19 +360,37 @@ function DetailItem({
 function topologyNodeListLabel(node: TopologyNode): string {
   switch (node.kind) {
     case "step":
-      return `step: ${node.step_name}`;
+      return `step: ${node.workflow_name}.${node.step_name}`;
     case "artifact_slot":
-      return `output: ${node.step_name}.${node.output_name}`;
+      return `output: ${node.workflow_name}.${node.step_name}.${node.output_name}`;
     case "source_input":
-      return `input: ${node.step_name}.${node.binding_name}`;
+      return `input: ${node.workflow_name}.${node.step_name}.${node.binding_name} (${node.dependency_role})`;
     case "source_root":
       return `source: ${node.display_path}`;
   }
 }
 
-function topologyEdgeListLabel(edge: TopologyEdge): string {
+function topologyEdgeListLabel(
+  edge: TopologyEdge,
+  nodesById: Map<string, TopologyNode>,
+): string {
   if (edge.kind === "consumes") {
-    return `consumes: ${edge.step_name}.${edge.binding_name}`;
+    return `consumes: ${edge.workflow_name}.${edge.step_name}.${edge.binding_name} (${edge.dependency_role})`;
   }
-  return `produces: ${edge.source_node_id} → ${edge.target_node_id}`;
+  const source = nodesById.get(edge.source_node_id);
+  const target = nodesById.get(edge.target_node_id);
+  return `produces: ${source ? topologyNodeCoordinate(source) : edge.source_node_id} → ${target ? topologyNodeCoordinate(target) : edge.target_node_id}`;
+}
+
+function topologyNodeCoordinate(node: TopologyNode): string {
+  switch (node.kind) {
+    case "step":
+      return `${node.workflow_name}.${node.step_name}`;
+    case "artifact_slot":
+      return `${node.workflow_name}.${node.step_name}.${node.output_name}`;
+    case "source_input":
+      return `${node.workflow_name}.${node.step_name}.${node.binding_name} (${node.dependency_role})`;
+    case "source_root":
+      return node.display_path;
+  }
 }
