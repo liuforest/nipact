@@ -51,6 +51,21 @@ def test_artifacts_route_list_profile_omits_detail_only_fields(
     assert "lineage_url" not in detail
 
 
+def test_artifact_resolve_route_returns_detail_profile(
+    colors_registry: ColorsRegistry,
+) -> None:
+    # /resolve serves the full detail profile (source_metadata), like /{id} and
+    # unlike the slim list rows — guards the ArtifactDetail response so a revert
+    # to the summary payload cannot pass CI silently.
+    client = _client(colors_registry)
+    row = client.get("/api/artifacts").json()["artifacts"][0]
+    response = client.get("/api/artifacts/resolve", params={"path": row["path"]})
+    assert response.status_code == 200
+    resolved = response.json()
+    assert resolved["artifact_id"] == row["artifact_id"]
+    assert "source_metadata" in resolved
+
+
 def test_artifacts_route_step_filter_narrows_population(
     colors_registry: ColorsRegistry,
 ) -> None:
