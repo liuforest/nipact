@@ -38,6 +38,13 @@ dependencies = [
     "uvicorn>=0.30",
 ]
 
+[project.optional-dependencies]
+# httpx backs fastapi.testclient.TestClient, used by the GUI route tests.
+test = [
+    "pytest",
+    "httpx",
+]
+
 [project.urls]
 Homepage = "https://liuforest.github.io/nipact-docs/"
 Documentation = "https://liuforest.github.io/nipact-docs/"
