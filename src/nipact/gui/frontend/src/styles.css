@@ -336,6 +336,32 @@ td {
   justify-content: space-between;
 }
 
+.active-filters {
+  align-items: center;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+  margin-top: 0.6rem;
+}
+
+.active-filters-label {
+  color: #475569;
+  font-size: 0.82rem;
+}
+
+.active-filter {
+  background: #f1f5f9;
+  border: 1px solid #cbd5e1;
+  border-radius: 999px;
+  color: #334155;
+  font-size: 0.78rem;
+  padding: 0.05rem 0.5rem;
+}
+
+.clear-filters {
+  font-size: 0.82rem;
+}
+
 .artifact-browser {
   display: grid;
   gap: 0.55rem;

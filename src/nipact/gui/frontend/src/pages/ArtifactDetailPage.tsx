@@ -90,7 +90,12 @@ function DetailSection({
 function identityItems(artifact: Artifact): KeyValueItem[] {
   return [
     { label: "artifact id", value: <IdentifierValue value={artifact.artifact_id} /> },
-    { label: "origin", value: artifact.origin },
+    {
+      label: "origin",
+      value: (
+        <Link to={filterPath({ origin: artifact.origin })}>{artifact.origin}</Link>
+      ),
+    },
     { label: "published", value: artifact.is_published ? "yes" : "no" },
     { label: "selected output", value: artifact.is_selected_output ? "yes" : "no" },
     { label: "extension", value: artifact.extension },
@@ -109,10 +114,34 @@ function pathItems(artifact: Artifact): KeyValueItem[] {
 }
 
 function workflowItems(artifact: Artifact): KeyValueItem[] {
+  const { workflow_name: workflow, step_name: step, output_name: output } = artifact;
   return [
-    { label: "workflow", value: artifact.workflow_name },
-    { label: "step", value: artifact.step_name },
-    { label: "output", value: artifact.output_name },
+    {
+      label: "workflow",
+      value: workflow ? (
+        <Link to={filterPath({ workflow })}>{workflow}</Link>
+      ) : (
+        workflow
+      ),
+    },
+    {
+      label: "step",
+      value:
+        workflow && step ? (
+          <Link to={filterPath({ workflow, step })}>{step}</Link>
+        ) : (
+          step
+        ),
+    },
+    {
+      label: "output",
+      value:
+        workflow && step && output ? (
+          <Link to={filterPath({ workflow, step, output })}>{output}</Link>
+        ) : (
+          output
+        ),
+    },
     { label: "address", value: artifact.address },
     { label: "run id", value: <IdentifierValue value={artifact.run_id} /> },
     { label: "job id", value: <IdentifierValue value={artifact.job_id} /> },
@@ -130,6 +159,13 @@ function hashItems(artifact: Artifact): KeyValueItem[] {
     { label: "parameter hash", value: <IdentifierValue value={artifact.parameter_hash} /> },
     { label: "parameter digest", value: <IdentifierValue value={artifact.parameter_digest} /> },
   ];
+}
+
+// Build a link to the filtered artifacts list. Coordinate links use cumulative
+// prefixes (workflow → workflow+step → workflow+step+output) so a step/output
+// name can't collide across workflows.
+function filterPath(filters: Record<string, string>): string {
+  return `/artifacts?${new URLSearchParams(filters).toString()}`;
 }
 
 function entityItems(artifact: Artifact): KeyValueItem[] {

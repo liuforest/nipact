@@ -1,6 +1,7 @@
 import type {
   ApiErrorBody,
   Artifact,
+  ArtifactFilters,
   ArtifactsResponse,
   ManifestDetail,
   ManifestsResponse,
@@ -69,8 +70,20 @@ export function fetchManifest(manifestName: string): Promise<ManifestDetail> {
   return getJson<ManifestDetail>(`/api/manifests/${encodeURIComponent(manifestName)}`);
 }
 
-export function fetchArtifacts(): Promise<ArtifactsResponse> {
-  return getJson<ArtifactsResponse>("/api/artifacts");
+export function fetchArtifacts(
+  filters: ArtifactFilters = {},
+): Promise<ArtifactsResponse> {
+  const params = new URLSearchParams();
+  for (const [key, value] of Object.entries(filters)) {
+    if (value === undefined) {
+      continue;
+    }
+    params.set(key, typeof value === "boolean" ? String(value) : value);
+  }
+  const query = params.toString();
+  return getJson<ArtifactsResponse>(
+    query ? `/api/artifacts?${query}` : "/api/artifacts",
+  );
 }
 
 export function fetchArtifact(artifactId: number): Promise<Artifact> {

@@ -1,8 +1,9 @@
 import { useQuery } from "@tanstack/react-query";
 import { useMemo, useState, type ReactNode } from "react";
-import { Link } from "react-router-dom";
+import { Link, useSearchParams } from "react-router-dom";
 import { fetchArtifacts } from "../api/client";
 import { queryKeys } from "../api/queryKeys";
+import type { ArtifactFilters } from "../api/types";
 import type { Artifact } from "../api/types";
 import { groupArtifacts, searchArtifacts } from "../artifacts/artifactGrouping";
 import type {
@@ -19,9 +20,15 @@ import { PathValue } from "../components/ui/PathValue";
 
 export function ArtifactsPage() {
   const [searchText, setSearchText] = useState("");
+  const [searchParams] = useSearchParams();
+  const filters = useMemo(
+    () => readArtifactFilters(searchParams),
+    [searchParams],
+  );
+  const activeFilters = useMemo(() => artifactFilterEntries(filters), [filters]);
   const query = useQuery({
-    queryKey: queryKeys.artifacts,
-    queryFn: fetchArtifacts,
+    queryKey: queryKeys.artifacts(filters),
+    queryFn: () => fetchArtifacts(filters),
   });
   const artifacts = query.data?.artifacts ?? [];
   const filteredArtifacts = useMemo(
@@ -43,9 +50,8 @@ export function ArtifactsPage() {
   if (!query.data) {
     return <LoadingPanel label="Loading artifacts" />;
   }
-  if (query.data.artifacts.length === 0) {
-    return <EmptyPanel title="No artifacts" />;
-  }
+
+  const hasActiveFilters = activeFilters.length > 0;
 
   return (
     <div className="page-stack">
@@ -66,8 +72,27 @@ export function ArtifactsPage() {
             Showing {filteredArtifacts.length} of {artifacts.length} artifacts
           </p>
         </div>
+        {hasActiveFilters ? (
+          <div className="active-filters">
+            <span className="active-filters-label">Filters:</span>
+            {activeFilters.map((entry) => (
+              <span className="active-filter" key={entry.key}>
+                {`${entry.key} = ${entry.value}`}
+              </span>
+            ))}
+            <Link className="clear-filters" to="/artifacts">
+              Clear filters
+            </Link>
+          </div>
+        ) : null}
       </section>
-      {filteredArtifacts.length === 0 ? (
+      {artifacts.length === 0 ? (
+        <EmptyPanel
+          title={
+            hasActiveFilters ? "No artifacts match the active filters" : "No artifacts"
+          }
+        />
+      ) : filteredArtifacts.length === 0 ? (
         <EmptyPanel title="No matching artifacts" />
       ) : (
         <section className="panel artifact-browser">
@@ -82,6 +107,56 @@ export function ArtifactsPage() {
       )}
     </div>
   );
+}
+
+const STRING_FILTER_KEYS = [
+  "origin",
+  "workflow",
+  "step",
+  "output",
+  "address",
+] as const;
+const BOOLEAN_FILTER_KEYS = ["is_selected_output", "is_published"] as const;
+
+// Read the supported artifact filters out of the URL query string. Unsupported
+// params are ignored here (the backend rejects them with a 422); empty values
+// are dropped so a stray `?workflow=` doesn't send an empty filter.
+function readArtifactFilters(params: URLSearchParams): ArtifactFilters {
+  const filters: ArtifactFilters = {};
+  for (const key of STRING_FILTER_KEYS) {
+    const value = params.get(key);
+    if (value !== null && value !== "") {
+      filters[key] = value;
+    }
+  }
+  for (const key of BOOLEAN_FILTER_KEYS) {
+    const value = params.get(key);
+    if (value === "true") {
+      filters[key] = true;
+    } else if (value === "false") {
+      filters[key] = false;
+    }
+  }
+  return filters;
+}
+
+function artifactFilterEntries(
+  filters: ArtifactFilters,
+): { key: string; value: string }[] {
+  const entries: { key: string; value: string }[] = [];
+  for (const key of STRING_FILTER_KEYS) {
+    const value = filters[key];
+    if (value !== undefined) {
+      entries.push({ key, value });
+    }
+  }
+  for (const key of BOOLEAN_FILTER_KEYS) {
+    const value = filters[key];
+    if (value !== undefined) {
+      entries.push({ key, value: String(value) });
+    }
+  }
+  return entries;
 }
 
 function ArtifactOriginSection({
