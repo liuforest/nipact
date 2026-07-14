@@ -1,7 +1,7 @@
 import type { LayoutOptions } from "cytoscape";
 import type { TraceGraphResponse } from "../api/types";
 import { GraphCanvasFrame } from "../graph/GraphCanvasFrame";
-import { buildLineageElements } from "./cytoscapeAdapter";
+import { artifactNodeId, buildLineageElements } from "./cytoscapeAdapter";
 import { lineageGraphStyle } from "./cytoscapeStyle";
 
 export type LineageGraphSelection =
@@ -23,12 +23,14 @@ const lineageLayout = {
 
 export function LineageGraphCanvas({
   graph,
+  focusRequest = null,
   onSelectionChange,
   searchArtifactIds = [],
   selectedArtifactId = null,
   selectedDependencyEdgeId = null,
 }: {
   graph: TraceGraphResponse;
+  focusRequest?: { elementId: string; token: number } | null;
   onSelectionChange?: (selection: LineageGraphSelection | null) => void;
   searchArtifactIds?: readonly number[];
   selectedArtifactId?: number | null;
@@ -42,6 +44,7 @@ export function LineageGraphCanvas({
         selectedDependencyEdgeId,
         searchArtifactIds,
       })}
+      focusRequest={focusRequest}
       layout={lineageLayout}
       onElementSelect={
         onSelectionChange
@@ -51,6 +54,12 @@ export function LineageGraphCanvas({
       stylesheet={lineageGraphStyle}
     />
   );
+}
+
+export function lineageSelectionElementId(selection: LineageGraphSelection): string {
+  return selection.kind === "artifact"
+    ? artifactNodeId(selection.artifact_id)
+    : selection.edge_id;
 }
 
 export function toLineageSelection(data: Record<string, unknown> | null): LineageGraphSelection | null {

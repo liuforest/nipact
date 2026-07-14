@@ -9,6 +9,10 @@ import type {
   StylesheetJson,
 } from "cytoscape";
 import { GraphControls } from "./GraphControls";
+import { boundedFocusZoom } from "./focusZoom";
+
+// Minimum zoom to treat a focused element as legible; tuned against real graphs (Loop A).
+const MIN_LEGIBLE_ZOOM = 1;
 
 let dagreRegistered = false;
 
@@ -83,12 +87,14 @@ function isInteractiveElement(element: SingularElementReturnValue): boolean {
 export function GraphCanvasFrame({
   ariaLabel,
   elements,
+  focusRequest,
   layout,
   onElementSelect,
   stylesheet,
 }: {
   ariaLabel: string;
   elements: ElementDefinition[];
+  focusRequest?: { elementId: string; token: number } | null;
   layout: LayoutOptions;
   onElementSelect?: (data: Record<string, unknown> | null) => void;
   stylesheet: StylesheetJson;
@@ -144,6 +150,27 @@ export function GraphCanvasFrame({
       cyRef.current = null;
     };
   }, [stylesheet, topologyKey]);
+
+  useEffect(() => {
+    if (!focusRequest) {
+      return;
+    }
+    const cy = cyRef.current;
+    if (!cy) {
+      return;
+    }
+    const target = cy.getElementById(focusRequest.elementId);
+    if (target.empty()) {
+      return;
+    }
+    cy.animate(
+      {
+        center: { eles: target },
+        zoom: boundedFocusZoom(cy.zoom(), MIN_LEGIBLE_ZOOM, cy.maxZoom()),
+      },
+      { duration: 200 },
+    );
+  }, [focusRequest]);
 
   const withGraph = (action: (cy: Core) => void) => {
     if (cyRef.current) {
