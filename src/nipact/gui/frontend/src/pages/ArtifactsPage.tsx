@@ -520,7 +520,7 @@ function ArtifactRows({ artifacts }: { artifacts: readonly Artifact[] }) {
           render: (row) => <Link to={`/artifacts/${row.artifact_id}`}>{row.artifact_id}</Link>,
         },
         { key: "address", label: "address", render: (row) => row.address ?? "none" },
-        { key: "path", label: "path", render: (row) => <PathValue value={row.display_path} /> },
+        { key: "path", label: "path", render: (row) => <PathValue value={row.display_path} compact /> },
         {
           key: "flags",
           label: "flags",

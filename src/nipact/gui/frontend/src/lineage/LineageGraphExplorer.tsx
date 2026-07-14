@@ -100,7 +100,7 @@ export function LineageGraphExplorer({ graph }: { graph: TraceGraphResponse }) {
             {
               key: "digest",
               label: "digest",
-              render: (row) => <IdentifierValue value={row.manifest_digest} />,
+              render: (row) => <IdentifierValue value={row.manifest_digest} compact />,
             },
             { key: "entities", label: "entities", render: (row) => row.entity_count },
           ]}
@@ -112,12 +112,12 @@ export function LineageGraphExplorer({ graph }: { graph: TraceGraphResponse }) {
           rows={graph.artifacts}
           getRowKey={(row) => row.artifact_id}
           columns={[
-            { key: "id", label: "id", render: (row) => <IdentifierValue value={row.artifact_id} /> },
+            { key: "id", label: "id", render: (row) => <IdentifierValue value={row.artifact_id} compact /> },
             { key: "origin", label: "origin", render: (row) => row.origin },
             { key: "step", label: "step", render: (row) => row.step_name ?? "source" },
             { key: "output", label: "output", render: (row) => row.output_name ?? "source" },
             { key: "address", label: "address", render: (row) => row.address ?? "none" },
-            { key: "path", label: "path", render: (row) => <PathValue value={row.display_path} /> },
+            { key: "path", label: "path", render: (row) => <PathValue value={row.display_path} compact /> },
           ]}
         />
       </section>
@@ -127,14 +127,14 @@ export function LineageGraphExplorer({ graph }: { graph: TraceGraphResponse }) {
           rows={graph.dependencies}
           getRowKey={(row) => row.edge_id}
           columns={[
-            { key: "source", label: "source", render: (row) => <IdentifierValue value={row.source_artifact_id} /> },
-            { key: "dependent", label: "dependent", render: (row) => <IdentifierValue value={row.dependent_artifact_id} /> },
+            { key: "source", label: "source", render: (row) => <IdentifierValue value={row.source_artifact_id} compact /> },
+            { key: "dependent", label: "dependent", render: (row) => <IdentifierValue value={row.dependent_artifact_id} compact /> },
             { key: "reuse", label: "reuse", render: (row) => dependencyReuseLabel(row) },
             { key: "binding", label: "binding", render: (row) => row.binding_name },
             { key: "role", label: "role", render: (row) => row.dependency_role },
-            { key: "set", label: "set", render: (row) => <IdentifierValue value={row.dependency_set_id} /> },
+            { key: "set", label: "set", render: (row) => <IdentifierValue value={row.dependency_set_id} compact /> },
             { key: "cardinality", label: "cardinality", render: (row) => row.edge_cardinality ?? "none" },
-            { key: "input", label: "input", render: (row) => <PathValue value={row.input_path} /> },
+            { key: "input", label: "input", render: (row) => <PathValue value={row.input_path} compact /> },
           ]}
         />
       </section>

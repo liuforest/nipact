@@ -140,7 +140,7 @@ export function TopologyGraphExplorer({
                 row.manifest_digest === null ? (
                   "varies"
                 ) : (
-                  <IdentifierValue value={row.manifest_digest} />
+                  <IdentifierValue value={row.manifest_digest} compact />
                 ),
             },
             {

@@ -295,10 +295,34 @@ a:hover {
 a:focus-visible,
 .button:focus-visible,
 .topology-select:focus-visible,
+.copy-button:focus-visible,
 input:focus-visible,
 summary:focus-visible {
   outline: 2px solid var(--focus-ring);
   outline-offset: 2px;
+}
+
+/* Compacted (middle-ellipsized) value + its copy recovery control, used only at
+   dense table call sites; detail pages render full values and never see this. */
+.compact-value {
+  align-items: baseline;
+  display: inline-flex;
+  gap: var(--space-1);
+}
+
+.copy-button {
+  background: transparent;
+  border: 0;
+  color: var(--text-muted);
+  cursor: pointer;
+  font: inherit;
+  font-size: 0.75rem;
+  padding: 0;
+  text-decoration: underline;
+}
+
+.copy-button:hover {
+  color: var(--accent);
 }
 
 .button-row {
