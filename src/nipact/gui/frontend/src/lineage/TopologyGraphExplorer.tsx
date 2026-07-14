@@ -219,7 +219,7 @@ function TopologyElementList({
             <li key={node.node_id}>
               <button
                 type="button"
-                className="topology-select"
+                className="graph-element-select"
                 aria-pressed={
                   selection?.kind === "node" && selection.node_id === node.node_id
                 }
@@ -238,7 +238,7 @@ function TopologyElementList({
             <li key={edge.edge_id}>
               <button
                 type="button"
-                className="topology-select"
+                className="graph-element-select"
                 aria-pressed={
                   selection?.kind === "edge" && selection.edge_id === edge.edge_id
                 }
