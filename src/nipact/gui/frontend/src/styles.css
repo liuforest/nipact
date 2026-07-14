@@ -264,9 +264,9 @@ a:hover {
   background: var(--surface);
 }
 
-/* Node/edge selector rows — left-aligned, compact, with a visible pressed
+/* Graph element selector rows — left-aligned, compact, with a visible pressed
    state. Deliberately NOT .button (its centered layout would box each row). */
-.topology-select {
+.graph-element-select {
   background: transparent;
   border: 1px solid transparent;
   border-radius: 4px;
@@ -279,11 +279,11 @@ a:hover {
   width: 100%;
 }
 
-.topology-select:hover {
+.graph-element-select:hover {
   background: var(--surface-muted);
 }
 
-.topology-select[aria-pressed="true"] {
+.graph-element-select[aria-pressed="true"] {
   background: var(--surface-muted);
   border-color: var(--accent);
   color: var(--text-strong);
@@ -294,7 +294,7 @@ a:hover {
    links and buttons. */
 a:focus-visible,
 .button:focus-visible,
-.topology-select:focus-visible,
+.graph-element-select:focus-visible,
 .copy-button:focus-visible,
 input:focus-visible,
 summary:focus-visible {

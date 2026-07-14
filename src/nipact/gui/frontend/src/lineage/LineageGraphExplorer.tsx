@@ -32,6 +32,10 @@ export function LineageGraphExplorer({ graph }: { graph: TraceGraphResponse }) {
     () => searchLineageArtifacts(graph, searchText),
     [graph, searchText],
   );
+  const artifactsById = useMemo(
+    () => new Map(graph.artifacts.map((artifact) => [artifact.artifact_id, artifact])),
+    [graph.artifacts],
+  );
   const selectedArtifact =
     selection?.kind === "artifact"
       ? findTraceArtifact(graph, selection.artifact_id)
@@ -64,12 +68,34 @@ export function LineageGraphExplorer({ graph }: { graph: TraceGraphResponse }) {
               placeholder="Artifact id, step, output, path, hash..."
             />
           </label>
-          <span className="status-line">
+          <span className="status-line" role="status">
             {hasSearch
-              ? `${searchArtifactIds.length} artifact${searchArtifactIds.length === 1 ? "" : "s"} highlighted`
-              : "Search highlights matching artifacts."}
+              ? `${searchArtifactIds.length} artifact${searchArtifactIds.length === 1 ? "" : "s"} match`
+              : "Search highlights matching artifacts on the canvas."}
           </span>
         </div>
+        {hasSearch ? (
+          <ul className="compact-list" aria-label="Search matches">
+            {searchArtifactIds.map((id) => {
+              const artifact = artifactsById.get(id);
+              return (
+                <li key={id}>
+                  <button
+                    type="button"
+                    className="graph-element-select"
+                    aria-pressed={selectedArtifactId === id}
+                    onClick={() => setSelection({ kind: "artifact", artifact_id: id })}
+                  >
+                    Select artifact {id}
+                    {artifact
+                      ? ` · ${artifact.step_name ?? "source"}.${artifact.output_name ?? "source"}`
+                      : ""}
+                  </button>
+                </li>
+              );
+            })}
+          </ul>
+        ) : null}
         <LineageLegend />
         <Suspense fallback={<GraphCanvasLoadingFallback />}>
           <LineageGraphCanvas
@@ -112,6 +138,20 @@ export function LineageGraphExplorer({ graph }: { graph: TraceGraphResponse }) {
           rows={graph.artifacts}
           getRowKey={(row) => row.artifact_id}
           columns={[
+            {
+              key: "select",
+              label: "",
+              render: (row) => (
+                <button
+                  type="button"
+                  className="graph-element-select"
+                  aria-pressed={selectedArtifactId === row.artifact_id}
+                  onClick={() => setSelection({ kind: "artifact", artifact_id: row.artifact_id })}
+                >
+                  Select artifact {row.artifact_id}
+                </button>
+              ),
+            },
             { key: "id", label: "id", render: (row) => <IdentifierValue value={row.artifact_id} compact /> },
             { key: "origin", label: "origin", render: (row) => row.origin },
             { key: "step", label: "step", render: (row) => row.step_name ?? "source" },
@@ -127,6 +167,20 @@ export function LineageGraphExplorer({ graph }: { graph: TraceGraphResponse }) {
           rows={graph.dependencies}
           getRowKey={(row) => row.edge_id}
           columns={[
+            {
+              key: "select",
+              label: "",
+              render: (row) => (
+                <button
+                  type="button"
+                  className="graph-element-select"
+                  aria-pressed={selectedDependencyEdgeId === row.edge_id}
+                  onClick={() => setSelection({ kind: "dependency", edge_id: row.edge_id })}
+                >
+                  Select dependency {row.source_artifact_id} → {row.dependent_artifact_id}
+                </button>
+              ),
+            },
             { key: "source", label: "source", render: (row) => <IdentifierValue value={row.source_artifact_id} compact /> },
             { key: "dependent", label: "dependent", render: (row) => <IdentifierValue value={row.dependent_artifact_id} compact /> },
             { key: "reuse", label: "reuse", render: (row) => dependencyReuseLabel(row) },
@@ -200,10 +254,12 @@ function LineageSelectionPanel({
             <PathValue value={selectedDependency.input_path} />
           </DetailItem>
           <DetailItem label="source">
-            <IdentifierValue value={selectedDependency.source_artifact_id} />
+            <IdentifierValue value={selectedDependency.source_artifact_id} />{" "}
+            <Link to={`/artifacts/${selectedDependency.source_artifact_id}`}>open source</Link>
           </DetailItem>
           <DetailItem label="dependent">
-            <IdentifierValue value={selectedDependency.dependent_artifact_id} />
+            <IdentifierValue value={selectedDependency.dependent_artifact_id} />{" "}
+            <Link to={`/artifacts/${selectedDependency.dependent_artifact_id}`}>open dependent</Link>
           </DetailItem>
           <DetailItem label="set">
             <IdentifierValue value={selectedDependency.dependency_set_id} />
