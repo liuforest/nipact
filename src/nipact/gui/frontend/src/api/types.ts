@@ -94,6 +94,19 @@ export interface ArtifactsResponse {
   artifacts: Artifact[];
 }
 
+// Supported query params for GET /api/artifacts. The vocabulary is fixed by the
+// backend route (gui/app.py::artifacts); anything else is rejected with a 422
+// `unsupported_filter`. Keep the keys aligned with `_reject_unsupported_query_params`.
+export interface ArtifactFilters {
+  origin?: string;
+  workflow?: string;
+  step?: string;
+  output?: string;
+  address?: string;
+  is_selected_output?: boolean;
+  is_published?: boolean;
+}
+
 export interface TraceArtifact {
   artifact_id: number;
   origin: string;

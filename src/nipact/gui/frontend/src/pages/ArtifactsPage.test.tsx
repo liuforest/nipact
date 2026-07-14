@@ -44,21 +44,22 @@ function artifact(overrides: Partial<Artifact>): Artifact {
   };
 }
 
-function renderPage(response: ArtifactsResponse) {
-  vi.stubGlobal(
-    "fetch",
-    vi.fn(async () => new Response(JSON.stringify(response), { status: 200 })),
+function renderPage(response: ArtifactsResponse, initialEntry = "/artifacts") {
+  const fetchMock = vi.fn(
+    async (_input: string) => new Response(JSON.stringify(response), { status: 200 }),
   );
+  vi.stubGlobal("fetch", fetchMock);
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-  return render(
+  render(
     <QueryClientProvider client={client}>
-      <MemoryRouter initialEntries={["/artifacts"]}>
+      <MemoryRouter initialEntries={[initialEntry]}>
         <Routes>
           <Route path="/artifacts" element={<ArtifactsPage />} />
         </Routes>
       </MemoryRouter>
     </QueryClientProvider>,
   );
+  return fetchMock;
 }
 
 describe("ArtifactsPage", () => {
@@ -148,5 +149,32 @@ describe("ArtifactsPage", () => {
     });
 
     expect(screen.getByRole("link", { name: "4" })).toHaveAttribute("href", "/artifacts/4");
+  });
+
+  it("reads filters from the URL and forwards them to the artifacts request", async () => {
+    const fetchMock = renderPage(
+      { context: "colors", artifacts: [artifact({ artifact_id: 5 })] },
+      "/artifacts?workflow=base&step=color_sector_analysis",
+    );
+
+    expect(await screen.findByRole("heading", { name: "Artifacts" })).toBeInTheDocument();
+
+    const url = fetchMock.mock.calls[0][0];
+    const params = new URLSearchParams(url.split("?")[1] ?? "");
+    expect(params.get("workflow")).toBe("base");
+    expect(params.get("step")).toBe("color_sector_analysis");
+  });
+
+  it("shows the active-filter summary and offers a clear-filters link", async () => {
+    renderPage(
+      { context: "colors", artifacts: [artifact({ artifact_id: 6 })] },
+      "/artifacts?workflow=base",
+    );
+
+    expect(await screen.findByText("workflow = base")).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "Clear filters" })).toHaveAttribute(
+      "href",
+      "/artifacts",
+    );
   });
 });
