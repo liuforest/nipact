@@ -10,6 +10,10 @@ import { IdentifierValue } from "../components/ui/IdentifierValue";
 import { PathValue } from "../components/ui/PathValue";
 import { WarningList } from "../components/ui/WarningList";
 import type { TopologyGraphSelection } from "./TopologyGraphCanvas";
+import {
+  TopologyInstancePanel,
+  type InstanceLineageState,
+} from "./TopologyInstancePanel";
 
 const TopologyGraphCanvas = lazy(async () => ({
   default: (await import("./TopologyGraphCanvas")).TopologyGraphCanvas,
@@ -18,9 +22,15 @@ const TopologyGraphCanvas = lazy(async () => ({
 export function TopologyGraphExplorer({
   topology,
   onShowRawLineage,
+  onRequestInstances,
+  instancesRequested = false,
+  instanceLineage,
 }: {
   topology: ObservedTopologyResponse;
   onShowRawLineage?: () => void;
+  onRequestInstances?: () => void;
+  instancesRequested?: boolean;
+  instanceLineage?: InstanceLineageState;
 }) {
   const [selection, setSelection] = useState<TopologyGraphSelection | null>(null);
   useEffect(() => {
@@ -89,7 +99,16 @@ export function TopologyGraphExplorer({
         <TopologySelectionPanel
           selectedNode={selectedNode}
           selectedEdge={selectedEdge}
+          onRequestInstances={onRequestInstances}
+          instancesRequested={instancesRequested}
         />
+        {instancesRequested && selection && instanceLineage ? (
+          <TopologyInstancePanel
+            topology={topology}
+            selection={selection}
+            instanceLineage={instanceLineage}
+          />
+        ) : null}
       </section>
       <WarningList warnings={warnings} />
       <section className="panel">
@@ -232,9 +251,13 @@ function TopologyElementList({
 function TopologySelectionPanel({
   selectedNode,
   selectedEdge,
+  onRequestInstances,
+  instancesRequested,
 }: {
   selectedNode: TopologyNode | null;
   selectedEdge: TopologyEdge | null;
+  onRequestInstances?: () => void;
+  instancesRequested?: boolean;
 }) {
   if (!selectedNode && !selectedEdge) {
     return (
@@ -243,6 +266,14 @@ function TopologySelectionPanel({
       </div>
     );
   }
+  // Lineage is fetched only when the user explicitly asks for instances; a bare
+  // selection shows the aggregate coordinate above without requesting records.
+  const instancesButton =
+    onRequestInstances && !instancesRequested ? (
+      <button type="button" onClick={onRequestInstances}>
+        Show instances
+      </button>
+    ) : null;
   if (selectedEdge) {
     return (
       <div className="selection-panel">
@@ -270,6 +301,7 @@ function TopologySelectionPanel({
             </>
           ) : null}
         </dl>
+        {instancesButton}
       </div>
     );
   }
@@ -286,6 +318,7 @@ function TopologySelectionPanel({
         <DetailItem label="kind">{selectedNode.kind}</DetailItem>
         {renderNodeDetails(selectedNode)}
       </dl>
+      {instancesButton}
     </div>
   );
 }

@@ -1,5 +1,5 @@
 import { useQuery } from "@tanstack/react-query";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useParams } from "react-router-dom";
 import { fetchArtifactLineage, fetchArtifactTopology } from "../api/client";
 import { queryKeys } from "../api/queryKeys";
@@ -21,19 +21,31 @@ export function LineagePage({
 } = {}) {
   const artifactId = Number(useParams().artifactId);
   const [rawMode, setRawMode] = useState(false);
+  const [instancesRequestedFor, setInstancesRequestedFor] = useState<
+    number | null
+  >(null);
+  // Derive the latch from the current artifact so navigation never leaves a
+  // stale `true` visible to useQuery during the first render of a new root — a
+  // post-render effect reset would fire /lineage before it ran.
+  const instancesRequested = instancesRequestedFor === artifactId;
   const validId = Number.isInteger(artifactId) && artifactId > 0;
+  // Revisiting an artifact starts collapsed again.
+  useEffect(() => {
+    setInstancesRequestedFor(null);
+  }, [artifactId]);
 
   const topologyQuery = useQuery({
     queryKey: queryKeys.topology(artifactId),
     queryFn: () => fetchArtifactTopology(artifactId),
     enabled: validId && !rawMode,
   });
-  // Raw lineage is fetched only after the user explicitly opts in, so the
-  // default page load never requests /lineage.
+  // Raw lineage is fetched only after the user explicitly opts in — either by
+  // entering the raw view or by opening topology instance details. Both share
+  // this cache entry, so switching views does not start a separate lineage query.
   const lineageQuery = useQuery({
     queryKey: queryKeys.lineage(artifactId),
     queryFn: () => fetchArtifactLineage(artifactId),
-    enabled: validId && rawMode,
+    enabled: validId && (rawMode || instancesRequested),
   });
 
   if (!validId) {
@@ -90,6 +102,14 @@ export function LineagePage({
     <TopologyGraphExplorer
       topology={topology}
       onShowRawLineage={() => setRawMode(true)}
+      onRequestInstances={() => setInstancesRequestedFor(artifactId)}
+      instancesRequested={instancesRequested}
+      instanceLineage={{
+        isLoading: lineageQuery.isLoading,
+        isError: lineageQuery.isError,
+        error: lineageQuery.error,
+        data: lineageQuery.data,
+      }}
     />
   );
 }
