@@ -1,12 +1,19 @@
 import { useQuery } from "@tanstack/react-query";
-import { useMemo, useState, type ReactNode } from "react";
+import { useEffect, useMemo, useState, type ReactNode } from "react";
 import { Link, useSearchParams } from "react-router-dom";
-import { fetchArtifacts } from "../api/client";
+import { fetchArtifactGroups, fetchArtifacts } from "../api/client";
 import { queryKeys } from "../api/queryKeys";
 import type { ArtifactFilters } from "../api/types";
 import type { Artifact } from "../api/types";
-import { groupArtifacts, searchArtifacts } from "../artifacts/artifactGrouping";
+import {
+  groupArtifactCounts,
+  groupArtifacts,
+  searchArtifacts,
+} from "../artifacts/artifactGrouping";
 import type {
+  ArtifactCountOriginGroup,
+  ArtifactCountStepGroup,
+  ArtifactCountWorkflowGroup,
   ArtifactOriginGroup,
   ArtifactOutputGroup,
   ArtifactStepGroup,
@@ -19,45 +26,38 @@ import { LoadingPanel } from "../components/ui/LoadingPanel";
 import { PathValue } from "../components/ui/PathValue";
 
 export function ArtifactsPage() {
-  const [searchText, setSearchText] = useState("");
   const [searchParams] = useSearchParams();
   const filters = useMemo(
     () => readArtifactFilters(searchParams),
     [searchParams],
   );
   const activeFilters = useMemo(() => artifactFilterEntries(filters), [filters]);
-  const query = useQuery({
-    queryKey: queryKeys.artifacts(filters),
-    queryFn: () => fetchArtifacts(filters),
-  });
-  const artifacts = query.data?.artifacts ?? [];
-  const filteredArtifacts = useMemo(
-    () => searchArtifacts(artifacts, searchText),
-    [artifacts, searchText],
-  );
-  const groupedArtifacts = useMemo(
-    () => groupArtifacts(filteredArtifacts),
-    [filteredArtifacts],
-  );
-  const expandAllMatches = searchText.trim().length > 0;
 
-  if (query.isLoading) {
-    return <LoadingPanel label="Loading artifacts" />;
-  }
-  if (query.isError) {
-    return <ErrorPanel error={query.error} />;
-  }
-  if (!query.data) {
-    return <LoadingPanel label="Loading artifacts" />;
-  }
+  const [searchText, setSearchText] = useState("");
+  const [submittedQuery, setSubmittedQuery] = useState<string | null>(null);
+
+  // Changing the URL filters changes the scope a search ran against, so any
+  // active search no longer applies — drop back to browse mode.
+  useEffect(() => {
+    setSubmittedQuery(null);
+    setSearchText("");
+  }, [filters]);
 
   const hasActiveFilters = activeFilters.length > 0;
+  const searchActive = submittedQuery !== null;
 
   return (
     <div className="page-stack">
       <section className="panel">
         <h1>Artifacts</h1>
-        <div className="artifact-toolbar">
+        <form
+          className="artifact-toolbar"
+          onSubmit={(event) => {
+            event.preventDefault();
+            const trimmed = searchText.trim();
+            setSubmittedQuery(trimmed ? trimmed : null);
+          }}
+        >
           <label className="search-field">
             <span>Search artifacts</span>
             <input
@@ -68,10 +68,29 @@ export function ArtifactsPage() {
               placeholder="id, step, output, address, path, subject, hash"
             />
           </label>
-          <p className="status-line">
-            Showing {filteredArtifacts.length} of {artifacts.length} artifacts
-          </p>
-        </div>
+          <div className="button-row">
+            <button className="button" type="submit">
+              Search
+            </button>
+            {searchActive ? (
+              <button
+                className="button"
+                type="button"
+                onClick={() => {
+                  setSubmittedQuery(null);
+                  setSearchText("");
+                }}
+              >
+                Clear search
+              </button>
+            ) : null}
+          </div>
+        </form>
+        <p className="status-line">
+          {searchActive
+            ? "Search covers the current filter scope."
+            : "Browsing artifact groups. Open a group to load its rows."}
+        </p>
         {hasActiveFilters ? (
           <div className="active-filters">
             <span className="active-filters-label">Filters:</span>
@@ -86,24 +105,10 @@ export function ArtifactsPage() {
           </div>
         ) : null}
       </section>
-      {artifacts.length === 0 ? (
-        <EmptyPanel
-          title={
-            hasActiveFilters ? "No artifacts match the active filters" : "No artifacts"
-          }
-        />
-      ) : filteredArtifacts.length === 0 ? (
-        <EmptyPanel title="No matching artifacts" />
+      {searchActive ? (
+        <ArtifactSearchResults filters={filters} query={submittedQuery} />
       ) : (
-        <section className="panel artifact-browser">
-          {groupedArtifacts.map((originGroup) => (
-            <ArtifactOriginSection
-              key={originGroup.key}
-              group={originGroup}
-              forceOpen={expandAllMatches}
-            />
-          ))}
-        </section>
+        <ArtifactBrowser filters={filters} hasActiveFilters={hasActiveFilters} />
       )}
     </div>
   );
@@ -158,6 +163,220 @@ function artifactFilterEntries(
   }
   return entries;
 }
+
+// Browse mode: fetch coordinate counts and render the tree all-collapsed. A
+// group's rows are fetched only when its disclosure is opened (see
+// LazyArtifactRows), so a bare page load never pulls the whole population.
+function ArtifactBrowser({
+  filters,
+  hasActiveFilters,
+}: {
+  filters: ArtifactFilters;
+  hasActiveFilters: boolean;
+}) {
+  const query = useQuery({
+    queryKey: queryKeys.artifactGroups(filters),
+    queryFn: () => fetchArtifactGroups(filters),
+  });
+
+  if (query.isLoading) {
+    return <LoadingPanel label="Loading artifacts" />;
+  }
+  if (query.isError) {
+    return <ErrorPanel error={query.error} />;
+  }
+  if (!query.data) {
+    return <LoadingPanel label="Loading artifacts" />;
+  }
+
+  const records = query.data.groups;
+  if (records.length === 0) {
+    return (
+      <EmptyPanel
+        title={
+          hasActiveFilters ? "No artifacts match the active filters" : "No artifacts"
+        }
+      />
+    );
+  }
+
+  const groups = groupArtifactCounts(records);
+  const totalArtifacts = groups.reduce((total, group) => total + group.count, 0);
+
+  return (
+    <>
+      <p className="status-line">
+        {totalArtifacts} artifacts in {records.length} groups
+      </p>
+      <section className="panel artifact-browser">
+        {groups.map((originGroup) => (
+          <ArtifactCountOriginSection
+            key={originGroup.key}
+            group={originGroup}
+            filters={filters}
+          />
+        ))}
+      </section>
+    </>
+  );
+}
+
+// Search mode: load the current filter scope once, then filter and group it
+// client-side, expanding every match.
+function ArtifactSearchResults({
+  filters,
+  query,
+}: {
+  filters: ArtifactFilters;
+  query: string;
+}) {
+  const scope = useQuery({
+    queryKey: queryKeys.artifacts(filters),
+    queryFn: () => fetchArtifacts(filters),
+  });
+
+  if (scope.isLoading) {
+    return <LoadingPanel label="Loading artifacts" />;
+  }
+  if (scope.isError) {
+    return <ErrorPanel error={scope.error} />;
+  }
+  if (!scope.data) {
+    return <LoadingPanel label="Loading artifacts" />;
+  }
+
+  const artifacts = scope.data.artifacts;
+  const matches = searchArtifacts(artifacts, query);
+  const grouped = groupArtifacts(matches);
+
+  return (
+    <>
+      <p className="status-line">
+        Showing {matches.length} of {artifacts.length} artifacts
+      </p>
+      {matches.length === 0 ? (
+        <EmptyPanel title="No matching artifacts" />
+      ) : (
+        <section className="panel artifact-browser">
+          {grouped.map((originGroup) => (
+            <ArtifactOriginSection
+              key={originGroup.key}
+              group={originGroup}
+              forceOpen
+            />
+          ))}
+        </section>
+      )}
+    </>
+  );
+}
+
+// --- Browse-mode count sections (lazy rows) ---------------------------------
+
+function ArtifactCountOriginSection({
+  group,
+  filters,
+}: {
+  group: ArtifactCountOriginGroup;
+  filters: ArtifactFilters;
+}) {
+  return (
+    <ArtifactDisclosure
+      className="artifact-group artifact-group--origin"
+      count={group.count}
+      defaultOpen={false}
+      forceOpen={false}
+      label={group.label}
+    >
+      {group.workflows.map((workflowGroup) => (
+        <ArtifactCountWorkflowSection
+          key={workflowGroup.key}
+          group={workflowGroup}
+          filters={filters}
+        />
+      ))}
+    </ArtifactDisclosure>
+  );
+}
+
+function ArtifactCountWorkflowSection({
+  group,
+  filters,
+}: {
+  group: ArtifactCountWorkflowGroup;
+  filters: ArtifactFilters;
+}) {
+  return (
+    <ArtifactDisclosure
+      className="artifact-group artifact-group--workflow"
+      count={group.count}
+      defaultOpen={false}
+      forceOpen={false}
+      label={`workflow: ${group.label}`}
+    >
+      {group.steps.map((stepGroup) => (
+        <ArtifactCountStepSection
+          key={stepGroup.key}
+          group={stepGroup}
+          filters={filters}
+        />
+      ))}
+    </ArtifactDisclosure>
+  );
+}
+
+function ArtifactCountStepSection({
+  group,
+  filters,
+}: {
+  group: ArtifactCountStepGroup;
+  filters: ArtifactFilters;
+}) {
+  return (
+    <ArtifactDisclosure
+      className="artifact-group artifact-group--step"
+      count={group.count}
+      defaultOpen={false}
+      forceOpen={false}
+      label={`step: ${group.label}`}
+    >
+      {group.outputs.map((outputGroup) => (
+        <ArtifactDisclosure
+          key={outputGroup.key}
+          className="artifact-group artifact-group--output"
+          count={outputGroup.count}
+          defaultOpen={false}
+          forceOpen={false}
+          label={`output: ${outputGroup.label}`}
+        >
+          <LazyArtifactRows filters={{ ...filters, ...outputGroup.coordinate }} />
+        </ArtifactDisclosure>
+      ))}
+    </ArtifactDisclosure>
+  );
+}
+
+// Mounts only when its parent disclosure is open, so the leaf request fires on
+// first open and is cached by react-query thereafter.
+function LazyArtifactRows({ filters }: { filters: ArtifactFilters }) {
+  const query = useQuery({
+    queryKey: queryKeys.artifacts(filters),
+    queryFn: () => fetchArtifacts(filters),
+  });
+
+  if (query.isLoading) {
+    return <LoadingPanel label="Loading artifacts" />;
+  }
+  if (query.isError) {
+    return <ErrorPanel error={query.error} />;
+  }
+  if (!query.data) {
+    return <LoadingPanel label="Loading artifacts" />;
+  }
+  return <ArtifactRows artifacts={query.data.artifacts} />;
+}
+
+// --- Search-mode sections (artifact rows already loaded) --------------------
 
 function ArtifactOriginSection({
   group,

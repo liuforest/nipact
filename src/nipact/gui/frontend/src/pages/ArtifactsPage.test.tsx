@@ -1,8 +1,13 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { fireEvent, render, screen } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { describe, expect, it, vi } from "vitest";
-import type { Artifact, ArtifactsResponse } from "../api/types";
+import type {
+  Artifact,
+  ArtifactGroupCount,
+  ArtifactGroupsResponse,
+  ArtifactsResponse,
+} from "../api/types";
 import { ArtifactsPage } from "./ArtifactsPage";
 
 function artifact(overrides: Partial<Artifact>): Artifact {
@@ -44,10 +49,34 @@ function artifact(overrides: Partial<Artifact>): Artifact {
   };
 }
 
-function renderPage(response: ArtifactsResponse, initialEntry = "/artifacts") {
-  const fetchMock = vi.fn(
-    async (_input: string) => new Response(JSON.stringify(response), { status: 200 }),
-  );
+function groupCount(overrides: Partial<ArtifactGroupCount>): ArtifactGroupCount {
+  return {
+    origin: "workflow_output",
+    workflow_name: "base",
+    step_name: "color_sector_analysis",
+    output_name: "sector_counts",
+    artifact_count: 1,
+    ...overrides,
+  };
+}
+
+// Route the fetch mock by path: the groups endpoint serves the browse tree, the
+// collection endpoint serves lazily-loaded rows (and the search scope).
+function renderPage(
+  responses: { groups: ArtifactGroupsResponse; artifacts?: ArtifactsResponse },
+  initialEntry = "/artifacts",
+) {
+  const fetchMock = vi.fn(async (input: string) => {
+    if (input.startsWith("/api/artifacts/groups")) {
+      return new Response(JSON.stringify(responses.groups), { status: 200 });
+    }
+    return new Response(
+      JSON.stringify(
+        responses.artifacts ?? { context: "colors", artifacts: [] },
+      ),
+      { status: 200 },
+    );
+  });
   vi.stubGlobal("fetch", fetchMock);
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   render(
@@ -63,111 +92,126 @@ function renderPage(response: ArtifactsResponse, initialEntry = "/artifacts") {
 }
 
 describe("ArtifactsPage", () => {
-  it("renders grouped artifact sections and row links", async () => {
-    renderPage({
-      context: "colors",
-      artifacts: [
-        artifact({
-          artifact_id: 1,
-          origin: "source",
-          workflow_name: null,
-          step_name: null,
-          output_name: null,
-          path: "data/color_source.json",
-          display_path: "data/color_source.json",
-          lineage_url: "/api/artifacts/1/lineage",
-        }),
-        artifact({
-          artifact_id: 2,
-          step_name: "color_sector_analysis",
-          output_name: "sector_counts",
-          is_selected_output: true,
-          is_published: true,
-          display_path: "outputs/colors/base/color_sector_analysis/sector_counts/color_000.json",
-          lineage_url: "/api/artifacts/2/lineage",
-        }),
-      ],
+  it("loads only the group summary on a bare page load, not the whole population", async () => {
+    const fetchMock = renderPage({
+      groups: {
+        context: "colors",
+        groups: [
+          groupCount({
+            origin: "source",
+            workflow_name: null,
+            step_name: null,
+            output_name: null,
+            artifact_count: 1,
+          }),
+          groupCount({ artifact_count: 4 }),
+        ],
+      },
     });
 
     expect(await screen.findByRole("heading", { name: "Artifacts" })).toBeInTheDocument();
-    expect(screen.getByText("Showing 2 of 2 artifacts")).toBeInTheDocument();
-    expect(screen.getAllByText("source").length).toBeGreaterThan(0);
+    // The status line sums the group counts without holding any rows.
+    expect(await screen.findByText("5 artifacts in 2 groups")).toBeInTheDocument();
+
+    // Only the groups endpoint is hit; no bare /api/artifacts population fetch.
+    const requested = fetchMock.mock.calls.map((call) => call[0]);
+    expect(requested).toContain("/api/artifacts/groups");
+    expect(requested.every((url) => url.startsWith("/api/artifacts/groups"))).toBe(true);
+
+    // Groups render collapsed: coordinate labels are shown, rows are not.
     expect(screen.getByText("workflow_output")).toBeInTheDocument();
-    expect(screen.getByText("step: color_sector_analysis")).toBeInTheDocument();
-    expect(screen.getByText("output: sector_counts")).toBeInTheDocument();
-    expect(screen.getByRole("link", { name: "2" })).toHaveAttribute("href", "/artifacts/2");
-    expect(screen.getAllByRole("link", { name: "trace" })).toHaveLength(2);
-    expect(screen.getByText("published")).toBeInTheDocument();
-    expect(screen.getByText("selected output")).toBeInTheDocument();
+    expect(screen.queryByRole("link", { name: "trace" })).not.toBeInTheDocument();
   });
 
-  it("filters artifacts within the loaded list", async () => {
-    renderPage({
-      context: "colors",
-      artifacts: [
-        artifact({ artifact_id: 2, step_name: "color_local_transform", output_name: "local_color" }),
-        artifact({
-          artifact_id: 3,
-          step_name: "color_sector_analysis",
-          output_name: "sector_counts",
-          address: "color_123",
-        }),
-      ],
+  it("fetches a group's rows only when it is opened", async () => {
+    const fetchMock = renderPage({
+      groups: {
+        context: "colors",
+        groups: [groupCount({ artifact_count: 1 })],
+      },
+      artifacts: {
+        context: "colors",
+        artifacts: [artifact({ artifact_id: 42, step_name: "color_sector_analysis", output_name: "sector_counts" })],
+      },
     });
 
-    expect(await screen.findByText("Showing 2 of 2 artifacts")).toBeInTheDocument();
+    expect(await screen.findByText("workflow_output")).toBeInTheDocument();
+    expect(screen.queryByRole("link", { name: "42" })).not.toBeInTheDocument();
+
+    // jsdom dispatches the <details> toggle event asynchronously, so each level
+    // mounts a tick after its parent opens — await before clicking the next.
+    fireEvent.click(screen.getByText("workflow_output"));
+    fireEvent.click(await screen.findByText("workflow: base"));
+    fireEvent.click(await screen.findByText("step: color_sector_analysis"));
+    fireEvent.click(await screen.findByText("output: sector_counts"));
+
+    expect(await screen.findByRole("link", { name: "42" })).toHaveAttribute(
+      "href",
+      "/artifacts/42",
+    );
+
+    // The leaf request carries the compound coordinate.
+    const leafUrl = fetchMock.mock.calls
+      .map((call) => call[0])
+      .find((url) => url.startsWith("/api/artifacts?"));
+    expect(leafUrl).toBeDefined();
+    const params = new URLSearchParams((leafUrl ?? "").split("?")[1] ?? "");
+    expect(params.get("workflow")).toBe("base");
+    expect(params.get("step")).toBe("color_sector_analysis");
+    expect(params.get("output")).toBe("sector_counts");
+  });
+
+  it("loads and filters the scope when a search is submitted", async () => {
+    renderPage({
+      groups: { context: "colors", groups: [groupCount({ artifact_count: 2 })] },
+      artifacts: {
+        context: "colors",
+        artifacts: [
+          artifact({ artifact_id: 2, step_name: "color_local_transform", output_name: "local_color" }),
+          artifact({ artifact_id: 3, step_name: "color_sector_analysis", output_name: "sector_counts" }),
+        ],
+      },
+    });
+
+    expect(await screen.findByText(/Browsing artifact groups/)).toBeInTheDocument();
 
     fireEvent.change(screen.getByRole("searchbox", { name: "Search artifacts" }), {
       target: { value: "sector" },
     });
+    fireEvent.click(screen.getByRole("button", { name: "Search" }));
 
-    expect(screen.getByText("Showing 1 of 2 artifacts")).toBeInTheDocument();
+    expect(await screen.findByText("Showing 1 of 2 artifacts")).toBeInTheDocument();
     expect(screen.getByText("step: color_sector_analysis")).toBeInTheDocument();
     expect(screen.getByRole("link", { name: "3" })).toHaveAttribute("href", "/artifacts/3");
     expect(screen.queryByText("step: color_local_transform")).not.toBeInTheDocument();
   });
 
-  it("does not render rows for collapsed groups until search opens matches", async () => {
-    renderPage({
-      context: "colors",
-      artifacts: [
-        artifact({
-          artifact_id: 4,
-          step_name: "color_candidate_select",
-          output_name: "selected_color",
-          is_selected_output: false,
-          is_published: false,
-        }),
-      ],
-    });
-
-    expect(await screen.findByText("workflow_output")).toBeInTheDocument();
-    expect(screen.queryByRole("link", { name: "4" })).not.toBeInTheDocument();
-
-    fireEvent.change(screen.getByRole("searchbox", { name: "Search artifacts" }), {
-      target: { value: "candidate" },
-    });
-
-    expect(screen.getByRole("link", { name: "4" })).toHaveAttribute("href", "/artifacts/4");
-  });
-
-  it("reads filters from the URL and forwards them to the artifacts request", async () => {
+  it("reads filters from the URL and forwards them to the groups request", async () => {
     const fetchMock = renderPage(
-      { context: "colors", artifacts: [artifact({ artifact_id: 5 })] },
+      { groups: { context: "colors", groups: [groupCount({ artifact_count: 1 })] } },
       "/artifacts?workflow=base&step=color_sector_analysis",
     );
 
     expect(await screen.findByRole("heading", { name: "Artifacts" })).toBeInTheDocument();
 
-    const url = fetchMock.mock.calls[0][0];
-    const params = new URLSearchParams(url.split("?")[1] ?? "");
+    await waitFor(() => {
+      expect(
+        fetchMock.mock.calls.some((call) =>
+          call[0].startsWith("/api/artifacts/groups?"),
+        ),
+      ).toBe(true);
+    });
+    const url = fetchMock.mock.calls
+      .map((call) => call[0])
+      .find((value) => value.startsWith("/api/artifacts/groups?"));
+    const params = new URLSearchParams((url ?? "").split("?")[1] ?? "");
     expect(params.get("workflow")).toBe("base");
     expect(params.get("step")).toBe("color_sector_analysis");
   });
 
   it("shows the active-filter summary and offers a clear-filters link", async () => {
     renderPage(
-      { context: "colors", artifacts: [artifact({ artifact_id: 6 })] },
+      { groups: { context: "colors", groups: [groupCount({ artifact_count: 1 })] } },
       "/artifacts?workflow=base",
     );
 

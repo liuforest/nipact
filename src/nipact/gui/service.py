@@ -7,8 +7,10 @@ from typing import Any
 
 from nipact.errors import ValidationError
 from nipact.registry import (
+    ArtifactGroupCount,
     RegistryArtifact,
     RegistryManifest,
+    list_artifact_group_counts,
     list_artifacts,
     list_manifests,
     read_artifact_by_id_for_context,
@@ -129,6 +131,33 @@ class GuiService:
             artifacts=[_artifact_payload(artifact) for artifact in artifacts],
         )
 
+    def artifact_groups(
+        self,
+        *,
+        origin: str | None = None,
+        workflow_name: str | None = None,
+        step_name: str | None = None,
+        output_name: str | None = None,
+        address: str | None = None,
+        is_selected_output: bool | None = None,
+        is_published: bool | None = None,
+    ) -> models.ArtifactGroupsResponse:
+        groups = list_artifact_group_counts(
+            self.project.registry_path,
+            context=self.project.context,
+            origin=origin,
+            workflow_name=workflow_name,
+            step_name=step_name,
+            output_name=output_name,
+            address=address,
+            is_selected_output=is_selected_output,
+            is_published=is_published,
+        )
+        return models.ArtifactGroupsResponse(
+            context=self.project.context,
+            groups=[_artifact_group_count(group) for group in groups],
+        )
+
     def artifact(self, artifact_id: int) -> models.Artifact:
         return _artifact_payload(self._artifact_for_context(artifact_id))
 
@@ -236,6 +265,16 @@ def _artifact_payload(artifact: RegistryArtifact) -> models.Artifact:
         software_ref=artifact.software_ref,
         created_at=artifact.created_at,
         lineage_url=f"/api/artifacts/{artifact.artifact_id}/lineage",
+    )
+
+
+def _artifact_group_count(group: ArtifactGroupCount) -> models.ArtifactGroupCount:
+    return models.ArtifactGroupCount(
+        origin=group.origin,
+        workflow_name=group.workflow_name,
+        step_name=group.step_name,
+        output_name=group.output_name,
+        artifact_count=group.artifact_count,
     )
 
 

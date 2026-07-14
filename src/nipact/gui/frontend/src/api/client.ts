@@ -2,6 +2,7 @@ import type {
   ApiErrorBody,
   Artifact,
   ArtifactFilters,
+  ArtifactGroupsResponse,
   ArtifactsResponse,
   ManifestDetail,
   ManifestsResponse,
@@ -70,9 +71,7 @@ export function fetchManifest(manifestName: string): Promise<ManifestDetail> {
   return getJson<ManifestDetail>(`/api/manifests/${encodeURIComponent(manifestName)}`);
 }
 
-export function fetchArtifacts(
-  filters: ArtifactFilters = {},
-): Promise<ArtifactsResponse> {
+function artifactQueryString(filters: ArtifactFilters): string {
   const params = new URLSearchParams();
   for (const [key, value] of Object.entries(filters)) {
     if (value === undefined) {
@@ -80,9 +79,24 @@ export function fetchArtifacts(
     }
     params.set(key, typeof value === "boolean" ? String(value) : value);
   }
-  const query = params.toString();
+  return params.toString();
+}
+
+export function fetchArtifacts(
+  filters: ArtifactFilters = {},
+): Promise<ArtifactsResponse> {
+  const query = artifactQueryString(filters);
   return getJson<ArtifactsResponse>(
     query ? `/api/artifacts?${query}` : "/api/artifacts",
+  );
+}
+
+export function fetchArtifactGroups(
+  filters: ArtifactFilters = {},
+): Promise<ArtifactGroupsResponse> {
+  const query = artifactQueryString(filters);
+  return getJson<ArtifactGroupsResponse>(
+    query ? `/api/artifacts/groups?${query}` : "/api/artifacts/groups",
   );
 }
 

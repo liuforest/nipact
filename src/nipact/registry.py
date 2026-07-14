@@ -200,6 +200,15 @@ class RegistryManifest:
     manifest_body: str
 
 
+@dataclass(frozen=True)
+class ArtifactGroupCount:
+    origin: str
+    workflow_name: str | None
+    step_name: str | None
+    output_name: str | None
+    artifact_count: int
+
+
 _ARTIFACT_SELECT_COLUMNS = """
     a.artifact_id,
     a.origin,
@@ -797,19 +806,23 @@ def resolve_registered_artifact_path(
     return _registry_artifact_from_row(rows[0])
 
 
-def list_artifacts(
-    path: Path,
+def _artifact_filter_where(
     *,
-    context: str | None = None,
-    origin: str | None = None,
-    workflow_name: str | None = None,
-    step_name: str | None = None,
-    output_name: str | None = None,
-    address: str | None = None,
-    is_selected_output: bool | None = None,
-    is_published: bool | None = None,
-) -> list[RegistryArtifact]:
-    """List registered artifacts with simple exact-match filters."""
+    context: str | None,
+    origin: str | None,
+    workflow_name: str | None,
+    step_name: str | None,
+    output_name: str | None,
+    address: str | None,
+    is_selected_output: bool | None,
+    is_published: bool | None,
+) -> tuple[str, list[object]]:
+    """Build the shared exact-match WHERE clause for artifact queries.
+
+    ``list_artifacts`` and ``list_artifact_group_counts`` must filter identically
+    so a group's count describes exactly the rows the list would return under the
+    same filters; sharing this builder makes that impossible to drift.
+    """
     if origin is not None and origin not in {"source", "workflow_output"}:
         raise ValidationError("artifact origin must be source or workflow_output")
     filters: list[tuple[str, object]] = []
@@ -828,11 +841,36 @@ def list_artifacts(
     if is_published is not None:
         filters.append(("a.is_published", int(is_published)))
 
-    where_sql = ""
-    values: list[object] = []
-    if filters:
-        where_sql = "WHERE " + " AND ".join(f"{column} = ?" for column, _ in filters)
-        values = [value for _, value in filters]
+    if not filters:
+        return "", []
+    where_sql = "WHERE " + " AND ".join(f"{column} = ?" for column, _ in filters)
+    values = [value for _, value in filters]
+    return where_sql, values
+
+
+def list_artifacts(
+    path: Path,
+    *,
+    context: str | None = None,
+    origin: str | None = None,
+    workflow_name: str | None = None,
+    step_name: str | None = None,
+    output_name: str | None = None,
+    address: str | None = None,
+    is_selected_output: bool | None = None,
+    is_published: bool | None = None,
+) -> list[RegistryArtifact]:
+    """List registered artifacts with simple exact-match filters."""
+    where_sql, values = _artifact_filter_where(
+        context=context,
+        origin=origin,
+        workflow_name=workflow_name,
+        step_name=step_name,
+        output_name=output_name,
+        address=address,
+        is_selected_output=is_selected_output,
+        is_published=is_published,
+    )
 
     try:
         with _connect_readonly_rows(path) as conn:
@@ -852,6 +890,67 @@ def list_artifacts(
     except sqlite3.Error as exc:
         raise ValidationError(f"registry.db is malformed: {exc}") from exc
     return [_registry_artifact_from_row(row) for row in rows]
+
+
+def list_artifact_group_counts(
+    path: Path,
+    *,
+    context: str | None = None,
+    origin: str | None = None,
+    workflow_name: str | None = None,
+    step_name: str | None = None,
+    output_name: str | None = None,
+    address: str | None = None,
+    is_selected_output: bool | None = None,
+    is_published: bool | None = None,
+) -> list[ArtifactGroupCount]:
+    """Count registered artifacts grouped by their coordinate.
+
+    Honors the same filters as :func:`list_artifacts`, so each group's count is
+    exactly the number of rows that ``list_artifacts`` would return for that
+    coordinate. Source rows keep their null workflow/step/output coordinates.
+    """
+    where_sql, values = _artifact_filter_where(
+        context=context,
+        origin=origin,
+        workflow_name=workflow_name,
+        step_name=step_name,
+        output_name=output_name,
+        address=address,
+        is_selected_output=is_selected_output,
+        is_published=is_published,
+    )
+
+    try:
+        with _connect_readonly_rows(path) as conn:
+            _validate_schema_version(conn)
+            rows = conn.execute(
+                f"""
+                SELECT
+                    a.origin,
+                    a.workflow_name,
+                    a.step_name,
+                    a.output_name,
+                    COUNT(*) AS artifact_count
+                FROM artifacts a
+                {where_sql}
+                GROUP BY a.origin, a.workflow_name, a.step_name, a.output_name
+                ORDER BY a.origin, a.workflow_name, a.step_name, a.output_name
+                """,
+                tuple(values),
+            ).fetchall()
+    except sqlite3.Error as exc:
+        raise ValidationError(f"registry.db is malformed: {exc}") from exc
+    return [
+        ArtifactGroupCount(
+            origin=row["origin"],
+            workflow_name=row["workflow_name"],
+            step_name=row["step_name"],
+            output_name=row["output_name"],
+            artifact_count=row["artifact_count"],
+        )
+        for row in rows
+    ]
 
 
 def resolve_reusable_artifact(

@@ -1,7 +1,8 @@
 import { describe, expect, it } from "vitest";
-import type { Artifact } from "../api/types";
+import type { Artifact, ArtifactGroupCount } from "../api/types";
 import {
   artifactGroupDefaultOpen,
+  groupArtifactCounts,
   groupArtifacts,
   searchArtifacts,
 } from "./artifactGrouping";
@@ -91,5 +92,67 @@ describe("artifact grouping helpers", () => {
     expect(artifactGroupDefaultOpen([artifact({ is_selected_output: true })])).toBe(true);
     expect(artifactGroupDefaultOpen([artifact({ is_published: true })])).toBe(true);
     expect(artifactGroupDefaultOpen([artifact({})])).toBe(false);
+  });
+});
+
+function groupCount(overrides: Partial<ArtifactGroupCount>): ArtifactGroupCount {
+  return {
+    origin: "workflow_output",
+    workflow_name: "base",
+    step_name: "color_local_transform",
+    output_name: "local_color",
+    artifact_count: 1,
+    ...overrides,
+  };
+}
+
+describe("groupArtifactCounts", () => {
+  it("builds a count tree and sums parent counts from the leaves", () => {
+    const groups = groupArtifactCounts([
+      groupCount({
+        origin: "source",
+        workflow_name: null,
+        step_name: null,
+        output_name: null,
+        artifact_count: 3,
+      }),
+      groupCount({ output_name: "local_color", artifact_count: 5 }),
+      groupCount({
+        step_name: "color_sector_analysis",
+        output_name: "sector_counts",
+        artifact_count: 7,
+      }),
+    ]);
+
+    expect(groups.map((group) => group.key)).toEqual(["source", "workflow_output"]);
+
+    const source = groups[0];
+    expect(source.count).toBe(3);
+    // The source leaf targets origin=source, not the "source" display sentinel.
+    expect(source.workflows[0].steps[0].outputs[0].coordinate).toEqual({
+      origin: "source",
+    });
+
+    const workflowOutput = groups[1];
+    // 5 + 7 across two steps of the same workflow.
+    expect(workflowOutput.count).toBe(12);
+    expect(workflowOutput.workflows[0].steps).toHaveLength(2);
+  });
+
+  it("gives workflow_output leaves a compound coordinate", () => {
+    const [group] = groupArtifactCounts([
+      groupCount({
+        workflow_name: "base",
+        step_name: "color_sector_analysis",
+        output_name: "sector_counts",
+        artifact_count: 2,
+      }),
+    ]);
+
+    expect(group.workflows[0].steps[0].outputs[0].coordinate).toEqual({
+      workflow: "base",
+      step: "color_sector_analysis",
+      output: "sector_counts",
+    });
   });
 });

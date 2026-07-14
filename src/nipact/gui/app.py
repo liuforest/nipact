@@ -16,6 +16,7 @@ from nipact.errors import ValidationError
 from .models import (
     ApiError,
     Artifact,
+    ArtifactGroupsResponse,
     ArtifactsResponse,
     ManifestDetail,
     ManifestsResponse,
@@ -93,6 +94,39 @@ def _install_api_routes(app: FastAPI, service: GuiService) -> None:
             },
         )
         return service.artifacts(
+            origin=origin,
+            workflow_name=workflow,
+            step_name=step,
+            output_name=output,
+            address=address,
+            is_selected_output=is_selected_output,
+            is_published=is_published,
+        )
+
+    @app.get("/api/artifacts/groups", response_model=ArtifactGroupsResponse)
+    def artifact_groups(
+        request: Request,
+        origin: str | None = Query(default=None),
+        workflow: str | None = Query(default=None),
+        step: str | None = Query(default=None),
+        output: str | None = Query(default=None),
+        address: str | None = Query(default=None),
+        is_selected_output: bool | None = Query(default=None),
+        is_published: bool | None = Query(default=None),
+    ) -> ArtifactGroupsResponse:
+        _reject_unsupported_query_params(
+            request,
+            allowed={
+                "origin",
+                "workflow",
+                "step",
+                "output",
+                "address",
+                "is_selected_output",
+                "is_published",
+            },
+        )
+        return service.artifact_groups(
             origin=origin,
             workflow_name=workflow,
             step_name=step,
