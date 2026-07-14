@@ -43,7 +43,7 @@ export function ManifestsPage() {
           { key: "entities", label: "entities", render: (row) => row.entity_count },
           { key: "first", label: "first", render: (row) => row.first_entity_id },
           { key: "last", label: "last", render: (row) => row.last_entity_id },
-          { key: "path", label: "path", render: (row) => <PathValue value={row.path} /> },
+          { key: "path", label: "path", render: (row) => <PathValue value={row.path} compact /> },
         ]}
       />
     </section>
