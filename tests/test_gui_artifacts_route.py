@@ -34,6 +34,23 @@ def test_artifacts_route_returns_full_population_unfiltered(
     assert len(body["artifacts"]) > 0
 
 
+def test_artifacts_route_list_profile_omits_detail_only_fields(
+    colors_registry: ColorsRegistry,
+) -> None:
+    # The list profile is slim: the unbounded source_metadata blob and the
+    # derivable lineage_url ride only on the /{id} detail record, never on rows.
+    client = _client(colors_registry)
+    rows = client.get("/api/artifacts").json()["artifacts"]
+    assert rows
+    for row in rows:
+        assert "source_metadata" not in row
+        assert "lineage_url" not in row
+
+    detail = client.get(f"/api/artifacts/{rows[0]['artifact_id']}").json()
+    assert "source_metadata" in detail
+    assert "lineage_url" not in detail
+
+
 def test_artifacts_route_step_filter_narrows_population(
     colors_registry: ColorsRegistry,
 ) -> None:

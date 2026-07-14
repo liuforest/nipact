@@ -36,12 +36,10 @@ function artifact(overrides: Partial<Artifact>): Artifact {
     run_label: null,
     datatype: null,
     suffix: null,
-    source_metadata: null,
     workflow_artifact_ref: "artifact:step:output",
     callable_ref: null,
     software_ref: null,
     created_at: "2026-06-04T00:00:00",
-    lineage_url: "/api/artifacts/1/lineage",
     ...overrides,
   };
 }

@@ -128,7 +128,7 @@ class GuiService:
         )
         return models.ArtifactsResponse(
             context=self.project.context,
-            artifacts=[_artifact_payload(artifact) for artifact in artifacts],
+            artifacts=[_artifact_summary(artifact) for artifact in artifacts],
         )
 
     def artifact_groups(
@@ -158,10 +158,10 @@ class GuiService:
             groups=[_artifact_group_count(group) for group in groups],
         )
 
-    def artifact(self, artifact_id: int) -> models.Artifact:
-        return _artifact_payload(self._artifact_for_context(artifact_id))
+    def artifact(self, artifact_id: int) -> models.ArtifactDetail:
+        return _artifact_detail(self._artifact_for_context(artifact_id))
 
-    def resolve_artifact_path(self, artifact_path: str) -> models.Artifact:
+    def resolve_artifact_path(self, artifact_path: str) -> models.ArtifactDetail:
         try:
             artifact = resolve_registered_artifact_path(
                 self.project.registry_path,
@@ -173,7 +173,7 @@ class GuiService:
             if message.startswith("unknown registered artifact path:"):
                 raise GuiApiError(404, "artifact_not_found", message) from exc
             raise
-        return _artifact_payload(artifact)
+        return _artifact_detail(artifact)
 
     def lineage(self, artifact_id: int) -> models.TraceGraphResponse:
         artifact = self._artifact_for_context(artifact_id)
@@ -230,7 +230,7 @@ def _manifest_detail(manifest: RegistryManifest) -> models.ManifestDetail:
     )
 
 
-def _artifact_payload(artifact: RegistryArtifact) -> models.Artifact:
+def _artifact_summary(artifact: RegistryArtifact) -> models.Artifact:
     return models.Artifact(
         artifact_id=artifact.artifact_id,
         origin=artifact.origin,
@@ -259,12 +259,17 @@ def _artifact_payload(artifact: RegistryArtifact) -> models.Artifact:
         run_label=artifact.run_label,
         datatype=artifact.datatype,
         suffix=artifact.suffix,
-        source_metadata=artifact.source_metadata,
         workflow_artifact_ref=_workflow_artifact_ref(artifact),
         callable_ref=artifact.callable_ref,
         software_ref=artifact.software_ref,
         created_at=artifact.created_at,
-        lineage_url=f"/api/artifacts/{artifact.artifact_id}/lineage",
+    )
+
+
+def _artifact_detail(artifact: RegistryArtifact) -> models.ArtifactDetail:
+    return models.ArtifactDetail(
+        **_artifact_summary(artifact).model_dump(),
+        source_metadata=artifact.source_metadata,
     )
 
 

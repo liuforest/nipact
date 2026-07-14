@@ -81,12 +81,16 @@ export interface Artifact {
   run_label: string | null;
   datatype: string | null;
   suffix: string | null;
-  source_metadata: Record<string, unknown> | null;
   workflow_artifact_ref: string | null;
   callable_ref: string | null;
   software_ref: string | null;
   created_at: string;
-  lineage_url: string;
+}
+
+// Full single-artifact record from GET /api/artifacts/{id}. source_metadata is
+// an unbounded blob dropped from the list profile above (mirrors gui/models.py).
+export interface ArtifactDetail extends Artifact {
+  source_metadata: Record<string, unknown> | null;
 }
 
 export interface ArtifactsResponse {
