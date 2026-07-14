@@ -107,6 +107,19 @@ class ArtifactsResponse(Dto):
     artifacts: list[Artifact]
 
 
+class ArtifactGroupCount(Dto):
+    origin: str
+    workflow_name: str | None
+    step_name: str | None
+    output_name: str | None
+    artifact_count: NonNegativeInt
+
+
+class ArtifactGroupsResponse(Dto):
+    context: str
+    groups: list[ArtifactGroupCount]
+
+
 class TraceArtifact(Dto):
     artifact_id: int
     origin: str

@@ -13,6 +13,7 @@ from nipact.execution import build_run_plan, execute_run_plan
 from nipact.registry import (
     REGISTRY_DB_PATH,
     _open_registry_read_session,
+    list_artifact_group_counts,
     list_artifacts,
     list_manifests,
     list_run_manifest_bindings,
@@ -316,6 +317,56 @@ def test_registry_reads_workflow_output_and_neighbors(
     assert {edge.binding_name for edge in upstream_edges} == {"sector_label"}
     assert len(manifest_bindings) == len(run_plan.manifest_bindings)
     assert {binding.context for binding in manifest_bindings} == {"colors"}
+
+
+def test_list_artifact_group_counts_matches_list_artifacts(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _project_dir, runtime_dir, _run_plan = _successful_sector_run(
+        tmp_path,
+        capsys,
+        monkeypatch,
+    )
+    registry_path = runtime_dir / REGISTRY_DB_PATH
+
+    groups = list_artifact_group_counts(registry_path, context="colors")
+
+    # Every group's count equals the number of rows list_artifacts returns for
+    # the same coordinate, so the summary can't drift from the list.
+    assert sum(group.artifact_count for group in groups) == len(
+        list_artifacts(registry_path, context="colors")
+    )
+    for group in groups:
+        assert group.artifact_count == len(
+            list_artifacts(
+                registry_path,
+                context="colors",
+                origin=group.origin,
+                workflow_name=group.workflow_name,
+                step_name=group.step_name,
+                output_name=group.output_name,
+            )
+        )
+
+    # The source group preserves its null coordinates rather than a sentinel.
+    source_groups = [group for group in groups if group.origin == "source"]
+    assert len(source_groups) == 1
+    assert source_groups[0].workflow_name is None
+    assert source_groups[0].step_name is None
+    assert source_groups[0].output_name is None
+
+    # Filters narrow the grouped population exactly as they narrow the list.
+    filtered = list_artifact_group_counts(
+        registry_path,
+        context="colors",
+        step_name="color_sector_analysis",
+    )
+    assert {group.step_name for group in filtered} == {"color_sector_analysis"}
+    assert 0 < sum(group.artifact_count for group in filtered) < sum(
+        group.artifact_count for group in groups
+    )
 
 
 def test_registry_context_safe_artifact_lookup_hides_foreign_contexts(

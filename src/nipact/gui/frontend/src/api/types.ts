@@ -94,6 +94,21 @@ export interface ArtifactsResponse {
   artifacts: Artifact[];
 }
 
+// One coordinate group with a row count, from GET /api/artifacts/groups. Source
+// rows keep their null workflow/step/output coordinates (see gui/models.py).
+export interface ArtifactGroupCount {
+  origin: string;
+  workflow_name: string | null;
+  step_name: string | null;
+  output_name: string | null;
+  artifact_count: number;
+}
+
+export interface ArtifactGroupsResponse {
+  context: string;
+  groups: ArtifactGroupCount[];
+}
+
 // Supported query params for GET /api/artifacts. The vocabulary is fixed by the
 // backend route (gui/app.py::artifacts); anything else is rejected with a 422
 // `unsupported_filter`. Keep the keys aligned with `_reject_unsupported_query_params`.

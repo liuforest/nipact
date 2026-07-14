@@ -6,6 +6,8 @@ export const queryKeys = {
   manifests: ["manifests"] as const,
   manifest: (manifestName: string) => ["manifest", manifestName] as const,
   artifacts: (filters: ArtifactFilters = {}) => ["artifacts", filters] as const,
+  artifactGroups: (filters: ArtifactFilters = {}) =>
+    ["artifact-groups", filters] as const,
   artifact: (artifactId: number) => ["artifact", artifactId] as const,
   lineage: (artifactId: number) => ["lineage", artifactId] as const,
   topology: (artifactId: number) => ["topology", artifactId] as const,

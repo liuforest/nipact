@@ -1,5 +1,10 @@
 import { describe, expect, it, vi } from "vitest";
-import { ApiError, fetchArtifact, fetchArtifacts } from "./client";
+import {
+  ApiError,
+  fetchArtifact,
+  fetchArtifactGroups,
+  fetchArtifacts,
+} from "./client";
 
 describe("api client", () => {
   it("requests the artifact route with the JSON accept header", async () => {
@@ -67,5 +72,21 @@ describe("api client", () => {
     expect(params.get("workflow")).toBe("base");
     expect(params.get("step")).toBe("color_sector_analysis");
     expect(params.get("is_published")).toBe("true");
+  });
+
+  it("requests the artifact groups endpoint with serialized filters", async () => {
+    const fetchMock = vi.fn(async (_input: string) =>
+      new Response(JSON.stringify({ context: "colors", groups: [] }), {
+        status: 200,
+      }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    await fetchArtifactGroups({ step: "color_sector_analysis" });
+
+    const url = fetchMock.mock.calls[0][0];
+    expect(url.startsWith("/api/artifacts/groups?")).toBe(true);
+    const params = new URLSearchParams(url.split("?")[1] ?? "");
+    expect(params.get("step")).toBe("color_sector_analysis");
   });
 });
