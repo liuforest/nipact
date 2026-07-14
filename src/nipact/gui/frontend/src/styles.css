@@ -22,11 +22,12 @@
   --accent: #1d4ed8;
   --focus-ring: var(--accent);
 
-  /* Spacing scale — seeded here; the vertical-rhythm commit applies it. */
+  /* Spacing scale — the vertical rhythm across panels, stacks, and rows. */
   --space-1: 0.35rem;
   --space-2: 0.5rem;
   --space-3: 0.75rem;
   --space-4: 1rem;
+  --space-5: 1.25rem;
 
   background: var(--bg);
   color: var(--text);
@@ -40,6 +41,7 @@ body {
   margin: 0;
   min-height: 100vh;
   background: var(--bg);
+  line-height: 1.5;
 }
 
 code,
@@ -101,14 +103,38 @@ a:hover {
 
 .page-stack {
   display: grid;
-  gap: 0.75rem;
+  gap: var(--space-3);
+}
+
+/* Wayfinding trail (PR-2 <ArtifactBreadcrumb>): de-emphasized links with the
+   current page distinct; each crumb span is an atomic flex item so a separator
+   never wraps away from the label that follows it. */
+.breadcrumb {
+  color: var(--text-muted);
+  display: flex;
+  flex-wrap: wrap;
+  font-size: 0.82rem;
+}
+
+.breadcrumb a {
+  color: var(--text-muted);
+}
+
+.breadcrumb a:hover {
+  color: var(--accent);
+}
+
+.breadcrumb [aria-current="page"] {
+  color: var(--text-strong);
+  font-weight: 600;
 }
 
 .panel {
   background: var(--surface);
   border: 1px solid var(--border);
   border-radius: 6px;
-  padding: 0.95rem 1rem;
+  box-shadow: 0 1px 3px rgba(15, 23, 42, 0.06);
+  padding: var(--space-5);
 }
 
 .panel h1,
@@ -160,7 +186,7 @@ a:hover {
 
 .eyebrow {
   color: var(--text-muted);
-  font-size: 0.72rem;
+  font-size: 0.75rem;
   letter-spacing: 0.08em;
   margin-bottom: 0.2rem;
   text-transform: uppercase;
@@ -189,7 +215,7 @@ a:hover {
 
 .detail-grid dt {
   color: var(--text-muted);
-  font-size: 0.72rem;
+  font-size: 0.75rem;
   letter-spacing: 0.08em;
   margin: 0;
   text-transform: uppercase;
@@ -329,7 +355,7 @@ td {
 
 th {
   color: var(--text-muted);
-  font-size: 0.72rem;
+  font-size: 0.75rem;
   letter-spacing: 0.08em;
   text-transform: uppercase;
 }
@@ -390,7 +416,7 @@ td {
 
 .search-field span {
   color: var(--text-muted);
-  font-size: 0.72rem;
+  font-size: 0.75rem;
   letter-spacing: 0.08em;
   text-transform: uppercase;
 }
@@ -593,8 +619,8 @@ td {
 
 .selection-panel {
   border-top: 1px solid var(--border-subtle);
-  margin-top: 0.75rem;
-  padding-top: 0.75rem;
+  margin-top: var(--space-3);
+  padding-top: var(--space-3);
 }
 
 .selection-panel h2 {

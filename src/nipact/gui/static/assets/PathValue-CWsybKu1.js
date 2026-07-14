@@ -1,0 +1,1 @@
+import{j as n}from"./index-DBfxfXwO.js";function s({value:e}){return e?n.jsx("code",{className:"inline-code path-value",title:e,children:e}):n.jsx("span",{className:"muted-value",children:"none"})}export{s as P};
