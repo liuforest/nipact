@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { fireEvent, render, screen } from "@testing-library/react";
+import { fireEvent, render, screen, within } from "@testing-library/react";
 import { MemoryRouter, Route, Routes, useNavigate } from "react-router-dom";
 import { describe, expect, it, vi } from "vitest";
 import type {
@@ -576,5 +576,86 @@ describe("LineagePage", () => {
       }),
     ).toBeInTheDocument();
     expect(screen.queryByTestId("lineage-canvas")).toBeNull();
+  });
+
+  // The lineage breadcrumb renders above the branch switch, so its list + detail
+  // exits are present on every valid-id view — success and both refusals alike.
+  function expectLineageBreadcrumb() {
+    const nav = screen.getByRole("navigation", { name: "Breadcrumb" });
+    expect(within(nav).getByRole("link", { name: "Artifacts" })).toHaveAttribute(
+      "href",
+      "/artifacts",
+    );
+    expect(within(nav).getByRole("link", { name: "Artifact 2" })).toHaveAttribute(
+      "href",
+      "/artifacts/2",
+    );
+    // "Lineage" is the current page, not a link.
+    expect(within(nav).getByText("Lineage")).toBeInTheDocument();
+    expect(within(nav).queryByRole("link", { name: "Lineage" })).toBeNull();
+  }
+
+  it("shows the lineage breadcrumb on the observed topology view", async () => {
+    stubFetch();
+
+    renderPage();
+
+    await screen.findByRole("heading", { name: /Observed Topology/ });
+    expectLineageBreadcrumb();
+  });
+
+  it("shows the lineage breadcrumb in raw mode", async () => {
+    stubFetch();
+
+    renderPage();
+
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Show raw lineage" }),
+    );
+    await screen.findByRole("heading", { name: "Trace Artifact 2" });
+    expectLineageBreadcrumb();
+  });
+
+  it("keeps the breadcrumb exits on the oversized-topology refusal", async () => {
+    stubFetch();
+
+    renderPage(1);
+
+    await screen.findByRole("heading", {
+      name: "Observed topology too large to render",
+    });
+    expectLineageBreadcrumb();
+    // No unsafe "show raw anyway" bypass from the refusal state.
+    expect(screen.queryByRole("button", { name: "Show raw lineage" })).toBeNull();
+  });
+
+  it("keeps the breadcrumb and back-to-topology exit on the oversized-raw refusal", async () => {
+    const oversizedGraph: TraceGraphResponse = {
+      ...graph,
+      manifest_bindings: Array.from({ length: 6 }, (_, index) => ({
+        run_id: index + 1,
+        workflow_name: "base",
+        step_name: "finish",
+        role: "analysis",
+        manifest_name: "colors",
+        manifest_digest: `digest-${index}`,
+        manifest_hash: `hash-${index}`,
+        entity_count: 2,
+      })),
+    };
+    stubFetch({ graphResponse: oversizedGraph });
+
+    renderPage(6);
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Show raw lineage" }),
+    );
+
+    await screen.findByRole("heading", {
+      name: "Raw lineage too large to render",
+    });
+    expectLineageBreadcrumb();
+    expect(
+      screen.getByRole("button", { name: "Back to observed topology" }),
+    ).toBeInTheDocument();
   });
 });
