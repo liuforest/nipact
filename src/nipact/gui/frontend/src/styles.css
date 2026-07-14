@@ -1,8 +1,35 @@
 :root {
   color-scheme: light;
   font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-  background: #f4f6f8;
-  color: #1f2937;
+
+  /* Surfaces */
+  --bg: #f4f6f8;
+  --surface: #ffffff;
+  --surface-muted: #f8fafc;
+
+  /* Text */
+  --text: #1f2937;
+  --text-strong: #111827;
+  --text-muted: #475569;
+
+  /* Borders */
+  --border: #d1d5db;
+  --border-subtle: #e5e7eb;
+  --border-control: #cbd5e1;
+
+  /* Accent — formalized from the existing link blue. Kept distinct from the
+     graph-semantic legend/source blues, which stay literal below. */
+  --accent: #1d4ed8;
+  --focus-ring: var(--accent);
+
+  /* Spacing scale — seeded here; the vertical-rhythm commit applies it. */
+  --space-1: 0.35rem;
+  --space-2: 0.5rem;
+  --space-3: 0.75rem;
+  --space-4: 1rem;
+
+  background: var(--bg);
+  color: var(--text);
 }
 
 * {
@@ -12,7 +39,7 @@
 body {
   margin: 0;
   min-height: 100vh;
-  background: #f4f6f8;
+  background: var(--bg);
 }
 
 code,
@@ -21,7 +48,7 @@ pre {
 }
 
 a {
-  color: #1d4ed8;
+  color: var(--accent);
   text-decoration: none;
 }
 
@@ -41,12 +68,12 @@ a:hover {
   justify-content: space-between;
   gap: 1rem;
   padding: 0.35rem 0 0.65rem;
-  border-bottom: 1px solid #d1d5db;
+  border-bottom: 1px solid var(--border);
   margin-bottom: 0.75rem;
 }
 
 .brand {
-  color: #111827;
+  color: var(--text-strong);
   font-size: 1rem;
   font-weight: 700;
   letter-spacing: 0;
@@ -61,14 +88,14 @@ a:hover {
 
 .nav-link {
   border-bottom: 2px solid transparent;
-  color: #475569;
+  color: var(--text-muted);
   padding: 0.35rem 0.05rem;
 }
 
 .nav-link--active,
 .nav-link:hover {
   border-bottom-color: #334155;
-  color: #111827;
+  color: var(--text-strong);
   text-decoration: none;
 }
 
@@ -78,8 +105,8 @@ a:hover {
 }
 
 .panel {
-  background: #ffffff;
-  border: 1px solid #d1d5db;
+  background: var(--surface);
+  border: 1px solid var(--border);
   border-radius: 6px;
   padding: 0.95rem 1rem;
 }
@@ -91,21 +118,21 @@ a:hover {
 }
 
 .panel h1 {
-  color: #111827;
+  color: var(--text-strong);
   font-size: 1.35rem;
   font-weight: 650;
   line-height: 1.2;
 }
 
 .panel h2 {
-  color: #111827;
+  color: var(--text-strong);
   font-size: 1.03rem;
   font-weight: 625;
   line-height: 1.2;
 }
 
 .panel--muted {
-  background: #f8fafc;
+  background: var(--surface-muted);
   color: #4b5563;
 }
 
@@ -132,7 +159,7 @@ a:hover {
 }
 
 .eyebrow {
-  color: #475569;
+  color: var(--text-muted);
   font-size: 0.72rem;
   letter-spacing: 0.08em;
   margin-bottom: 0.2rem;
@@ -150,7 +177,7 @@ a:hover {
   gap: 0.35rem 1.25rem;
   margin: 0.75rem 0 0;
   padding-top: 0.65rem;
-  border-top: 1px solid #e5e7eb;
+  border-top: 1px solid var(--border-subtle);
 }
 
 .detail-grid div {
@@ -161,7 +188,7 @@ a:hover {
 }
 
 .detail-grid dt {
-  color: #475569;
+  color: var(--text-muted);
   font-size: 0.72rem;
   letter-spacing: 0.08em;
   margin: 0;
@@ -183,11 +210,12 @@ a:hover {
 .link-grid a,
 .button {
   align-items: center;
-  background: #ffffff;
-  border: 1px solid #cbd5e1;
+  background: var(--surface);
+  border: 1px solid var(--border-control);
   border-radius: 4px;
-  color: #1f2937;
+  color: var(--text);
   display: inline-flex;
+  font: inherit;
   justify-content: center;
   min-height: 2.1rem;
   padding: 0.35rem 0.65rem;
@@ -195,8 +223,56 @@ a:hover {
 
 .link-grid a:hover,
 .button:hover {
-  background: #f8fafc;
+  background: var(--surface-muted);
   text-decoration: none;
+}
+
+.button:disabled {
+  color: var(--text-muted);
+  cursor: default;
+  opacity: 0.55;
+}
+
+/* Cancel the hover affordance while disabled (pagination at its bounds). */
+.button:disabled:hover {
+  background: var(--surface);
+}
+
+/* Node/edge selector rows — left-aligned, compact, with a visible pressed
+   state. Deliberately NOT .button (its centered layout would box each row). */
+.topology-select {
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  color: var(--text);
+  cursor: pointer;
+  display: block;
+  font: inherit;
+  padding: 0.15rem 0.35rem;
+  text-align: left;
+  width: 100%;
+}
+
+.topology-select:hover {
+  background: var(--surface-muted);
+}
+
+.topology-select[aria-pressed="true"] {
+  background: var(--surface-muted);
+  border-color: var(--accent);
+  color: var(--text-strong);
+}
+
+/* Visible keyboard focus across every interactive surface — explicit list so
+   inputs, disclosure summaries, and the selector rows are covered, not just
+   links and buttons. */
+a:focus-visible,
+.button:focus-visible,
+.topology-select:focus-visible,
+input:focus-visible,
+summary:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 2px;
 }
 
 .button-row {
@@ -207,8 +283,8 @@ a:hover {
 }
 
 .inline-code {
-  background: #f8fafc;
-  border: 1px solid #e5e7eb;
+  background: var(--surface-muted);
+  border: 1px solid var(--border-subtle);
   border-radius: 3px;
   display: inline-block;
   max-width: 100%;
@@ -245,14 +321,14 @@ table {
 
 th,
 td {
-  border-bottom: 1px solid #e5e7eb;
+  border-bottom: 1px solid var(--border-subtle);
   padding: 0.45rem 0.55rem;
   text-align: left;
   vertical-align: top;
 }
 
 th {
-  color: #475569;
+  color: var(--text-muted);
   font-size: 0.72rem;
   letter-spacing: 0.08em;
   text-transform: uppercase;
@@ -263,7 +339,7 @@ td {
 }
 
 .graph-shell {
-  border: 1px solid #e5e7eb;
+  border: 1px solid var(--border-subtle);
   height: min(68vh, 760px);
   min-height: 420px;
   width: 100%;
@@ -313,16 +389,16 @@ td {
 }
 
 .search-field span {
-  color: #475569;
+  color: var(--text-muted);
   font-size: 0.72rem;
   letter-spacing: 0.08em;
   text-transform: uppercase;
 }
 
 .search-field input {
-  border: 1px solid #cbd5e1;
+  border: 1px solid var(--border-control);
   border-radius: 4px;
-  color: #111827;
+  color: var(--text-strong);
   font: inherit;
   min-height: 2.1rem;
   padding: 0.35rem 0.5rem;
@@ -345,13 +421,13 @@ td {
 }
 
 .active-filters-label {
-  color: #475569;
+  color: var(--text-muted);
   font-size: 0.82rem;
 }
 
 .active-filter {
   background: #f1f5f9;
-  border: 1px solid #cbd5e1;
+  border: 1px solid var(--border-control);
   border-radius: 999px;
   color: #334155;
   font-size: 0.78rem;
@@ -368,9 +444,9 @@ td {
 }
 
 .artifact-group {
-  border: 1px solid #e5e7eb;
+  border: 1px solid var(--border-subtle);
   border-radius: 4px;
-  background: #ffffff;
+  background: var(--surface);
 }
 
 .artifact-group summary {
@@ -384,7 +460,7 @@ td {
 }
 
 .artifact-group summary:hover {
-  background: #f8fafc;
+  background: var(--surface-muted);
 }
 
 .artifact-group--workflow,
@@ -394,19 +470,19 @@ td {
 }
 
 .artifact-group--workflow {
-  background: #f8fafc;
+  background: var(--surface-muted);
 }
 
 .artifact-group--step,
 .artifact-group--output {
-  background: #ffffff;
+  background: var(--surface);
 }
 
 .artifact-group-count {
   background: #f1f5f9;
-  border: 1px solid #cbd5e1;
+  border: 1px solid var(--border-control);
   border-radius: 999px;
-  color: #475569;
+  color: var(--text-muted);
   font-size: 0.76rem;
   min-width: 1.7rem;
   padding: 0.08rem 0.45rem;
@@ -420,10 +496,10 @@ td {
 }
 
 .artifact-flag {
-  background: #f8fafc;
-  border: 1px solid #cbd5e1;
+  background: var(--surface-muted);
+  border: 1px solid var(--border-control);
   border-radius: 999px;
-  color: #475569;
+  color: var(--text-muted);
   display: inline-flex;
   font-size: 0.78rem;
   line-height: 1.35;
@@ -443,7 +519,7 @@ td {
 
 .graph-legend span {
   align-items: center;
-  color: #475569;
+  color: var(--text-muted);
   display: inline-flex;
   font-size: 0.86rem;
   gap: 0.3rem;
@@ -516,7 +592,7 @@ td {
 }
 
 .selection-panel {
-  border-top: 1px solid #e5e7eb;
+  border-top: 1px solid var(--border-subtle);
   margin-top: 0.75rem;
   padding-top: 0.75rem;
 }
@@ -526,7 +602,7 @@ td {
 }
 
 .selection-panel h3 {
-  color: #111827;
+  color: var(--text-strong);
   font-size: 0.92rem;
   margin: 0.7rem 0 0.2rem;
 }
@@ -542,8 +618,8 @@ td {
 }
 
 .json-block {
-  background: #f8fafc;
-  border: 1px solid #e5e7eb;
+  background: var(--surface-muted);
+  border: 1px solid var(--border-subtle);
   border-radius: 4px;
   margin: 0.65rem 0 0;
   max-height: 520px;

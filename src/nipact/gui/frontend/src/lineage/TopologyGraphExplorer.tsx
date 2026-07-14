@@ -73,7 +73,11 @@ export function TopologyGraphExplorer({
         ) : null}
         {onShowRawLineage ? (
           <div className="graph-search-toolbar">
-            <button type="button" onClick={onShowRawLineage}>
+            <button
+              type="button"
+              className="button"
+              onClick={onShowRawLineage}
+            >
               Show raw lineage
             </button>
             <span className="status-line">
@@ -215,6 +219,7 @@ function TopologyElementList({
             <li key={node.node_id}>
               <button
                 type="button"
+                className="topology-select"
                 aria-pressed={
                   selection?.kind === "node" && selection.node_id === node.node_id
                 }
@@ -233,6 +238,7 @@ function TopologyElementList({
             <li key={edge.edge_id}>
               <button
                 type="button"
+                className="topology-select"
                 aria-pressed={
                   selection?.kind === "edge" && selection.edge_id === edge.edge_id
                 }
@@ -270,7 +276,7 @@ function TopologySelectionPanel({
   // selection shows the aggregate coordinate above without requesting records.
   const instancesButton =
     onRequestInstances && !instancesRequested ? (
-      <button type="button" onClick={onRequestInstances}>
+      <button type="button" className="button" onClick={onRequestInstances}>
         Show instances
       </button>
     ) : null;
