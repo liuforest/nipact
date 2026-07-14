@@ -1,8 +1,12 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { fireEvent, render, screen } from "@testing-library/react";
-import { MemoryRouter, Route, Routes } from "react-router-dom";
+import { MemoryRouter, Route, Routes, useNavigate } from "react-router-dom";
 import { describe, expect, it, vi } from "vitest";
-import type { ObservedTopologyResponse, TraceGraphResponse } from "../api/types";
+import type {
+  ObservedTopologyResponse,
+  TraceArtifact,
+  TraceGraphResponse,
+} from "../api/types";
 import type { TopologyGraphSelection } from "../lineage/TopologyGraphCanvas";
 import { LineagePage } from "./LineagePage";
 
@@ -180,12 +184,29 @@ const multiWorkflowTopology: ObservedTopologyResponse = {
   ],
 };
 
+// 120 workflow-output artifacts in the base.finish.result slot, so instance
+// paging (page size 50) spans three pages.
+const bigGraph: TraceGraphResponse = {
+  ...graph,
+  artifacts: Array.from(
+    { length: 120 },
+    (_, index): TraceArtifact => ({
+      ...graph.artifacts[0],
+      artifact_id: index + 1,
+      address: `addr-${index + 1}`,
+      display_path: `outputs/result-${index + 1}.json`,
+    }),
+  ),
+};
+
 function stubFetch({
   topologyResponse = topology,
   graphResponse = graph,
+  lineageStatus = 200,
 }: {
   topologyResponse?: ObservedTopologyResponse;
   graphResponse?: TraceGraphResponse;
+  lineageStatus?: number;
 } = {}) {
   const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
     const url = String(input);
@@ -193,12 +214,24 @@ function stubFetch({
       return new Response(JSON.stringify(topologyResponse), { status: 200 });
     }
     if (url.includes("/lineage")) {
+      if (lineageStatus !== 200) {
+        return new Response(
+          JSON.stringify({ code: "boom", message: "lineage failed" }),
+          { status: lineageStatus },
+        );
+      }
       return new Response(JSON.stringify(graphResponse), { status: 200 });
     }
     return new Response("not found", { status: 404 });
   });
   vi.stubGlobal("fetch", fetchMock);
   return fetchMock;
+}
+
+function lineageRequestCount(fetchMock: ReturnType<typeof stubFetch>): number {
+  return fetchMock.mock.calls.filter(([input]) =>
+    String(input).includes("/lineage"),
+  ).length;
 }
 
 function renderPage(renderLimit?: number) {
@@ -211,6 +244,32 @@ function renderPage(renderLimit?: number) {
             path="/artifacts/:artifactId/lineage"
             element={<LineagePage renderLimit={renderLimit} />}
           />
+        </Routes>
+      </MemoryRouter>
+    </QueryClientProvider>,
+  );
+}
+
+// Renders the page under a route whose :artifactId can change without
+// remounting LineagePage, so per-root laziness is exercised across navigation.
+function renderWithNavigation() {
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  function Harness() {
+    const navigate = useNavigate();
+    return (
+      <>
+        <button type="button" onClick={() => navigate("/artifacts/3/lineage")}>
+          Go to artifact 3
+        </button>
+        <LineagePage />
+      </>
+    );
+  }
+  return render(
+    <QueryClientProvider client={client}>
+      <MemoryRouter initialEntries={["/artifacts/2/lineage"]}>
+        <Routes>
+          <Route path="/artifacts/:artifactId/lineage" element={<Harness />} />
         </Routes>
       </MemoryRouter>
     </QueryClientProvider>,
@@ -343,6 +402,150 @@ describe("LineagePage", () => {
       await screen.findByRole("heading", {
         name: "Observed topology too large to render",
       }),
+    ).toBeInTheDocument();
+  });
+
+  it("loads instances lazily and reuses the cached lineage for later selections", async () => {
+    const fetchMock = stubFetch();
+
+    renderPage();
+
+    await screen.findByRole("heading", { name: /Observed Topology/ });
+    // Selecting an element alone must not request raw lineage.
+    fireEvent.click(
+      screen.getByRole("button", { name: "output: base.finish.result" }),
+    );
+    expect(lineageRequestCount(fetchMock)).toBe(0);
+
+    fireEvent.click(screen.getByRole("button", { name: "Show instances" }));
+    expect(
+      await screen.findByRole("heading", { name: /Instances/ }),
+    ).toBeInTheDocument();
+    expect(await screen.findByText("init")).toBeInTheDocument();
+    expect(lineageRequestCount(fetchMock)).toBe(1);
+
+    // Switching selection re-resolves from the cached response, no new fetch.
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: "input: base.finish.raw (source_input)",
+      }),
+    );
+    await screen.findByRole("heading", { name: /Instances/ });
+    expect(lineageRequestCount(fetchMock)).toBe(1);
+  });
+
+  it("does not auto-request lineage when navigating to a new root", async () => {
+    const fetchMock = stubFetch();
+
+    renderWithNavigation();
+
+    await screen.findByRole("heading", { name: /Observed Topology/ });
+    fireEvent.click(
+      screen.getByRole("button", { name: "output: base.finish.result" }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Show instances" }));
+    await screen.findByRole("heading", { name: /Instances/ });
+    expect(lineageRequestCount(fetchMock)).toBe(1);
+
+    // Navigating to a different root must start collapsed: the stale latch from
+    // artifact 2 must not enable the artifact-3 lineage query on first render.
+    fireEvent.click(screen.getByRole("button", { name: "Go to artifact 3" }));
+    await screen.findByRole("heading", { name: /Observed Topology/ });
+    expect(lineageRequestCount(fetchMock)).toBe(1);
+  });
+
+  it("reuses the instance lineage cache when entering raw mode", async () => {
+    const fetchMock = stubFetch();
+
+    renderPage();
+
+    await screen.findByRole("heading", { name: /Observed Topology/ });
+    fireEvent.click(
+      screen.getByRole("button", { name: "output: base.finish.result" }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Show instances" }));
+    await screen.findByRole("heading", { name: /Instances/ });
+    expect(lineageRequestCount(fetchMock)).toBe(1);
+
+    fireEvent.click(screen.getByRole("button", { name: "Show raw lineage" }));
+    expect(
+      await screen.findByRole("heading", { name: "Trace Artifact 2" }),
+    ).toBeInTheDocument();
+    // The raw view shares the lineage cache entry already populated for
+    // instances, so it must not trigger a second fetch.
+    expect(lineageRequestCount(fetchMock)).toBe(1);
+  });
+
+  it("pages instance records and resets to the first page on selection change", async () => {
+    stubFetch({ graphResponse: bigGraph });
+
+    renderPage();
+
+    await screen.findByRole("heading", { name: /Observed Topology/ });
+    fireEvent.click(
+      screen.getByRole("button", { name: "output: base.finish.result" }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Show instances" }));
+
+    expect(await screen.findByText("addr-1")).toBeInTheDocument();
+    expect(screen.getByText("addr-50")).toBeInTheDocument();
+    expect(screen.queryByText("addr-51")).toBeNull();
+    expect(screen.getByText("Page 1 of 3")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Next" }));
+    expect(await screen.findByText("addr-51")).toBeInTheDocument();
+    expect(screen.getByText("addr-100")).toBeInTheDocument();
+    expect(screen.queryByText("addr-1")).toBeNull();
+    expect(screen.getByText("Page 2 of 3")).toBeInTheDocument();
+
+    // Changing the inspected element resets paging back to the first page.
+    fireEvent.click(screen.getByRole("button", { name: "step: base.finish" }));
+    expect(await screen.findByText("addr-1")).toBeInTheDocument();
+    expect(screen.getByText("Page 1 of 3")).toBeInTheDocument();
+  });
+
+  it("filters instances by scoped search and resets paging", async () => {
+    stubFetch({ graphResponse: bigGraph });
+
+    renderPage();
+
+    await screen.findByRole("heading", { name: /Observed Topology/ });
+    fireEvent.click(
+      screen.getByRole("button", { name: "output: base.finish.result" }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Show instances" }));
+    await screen.findByText("addr-1");
+
+    fireEvent.click(screen.getByRole("button", { name: "Next" }));
+    expect(await screen.findByText("Page 2 of 3")).toBeInTheDocument();
+
+    fireEvent.change(
+      screen.getByRole("searchbox", { name: "Search instances" }),
+      { target: { value: "ADDR-117" } },
+    );
+
+    expect(await screen.findByText("addr-117")).toBeInTheDocument();
+    expect(screen.getByText("Page 1 of 1")).toBeInTheDocument();
+    expect(screen.queryByText("addr-1")).toBeNull();
+  });
+
+  it("keeps an instance load error inside the topology page", async () => {
+    stubFetch({ lineageStatus: 500 });
+
+    renderPage();
+
+    await screen.findByRole("heading", { name: /Observed Topology/ });
+    fireEvent.click(
+      screen.getByRole("button", { name: "output: base.finish.result" }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Show instances" }));
+
+    expect(
+      await screen.findByText(/Could not load instance records/),
+    ).toBeInTheDocument();
+    // The topology view is still present; no full-page error panel replaces it.
+    expect(
+      screen.getByRole("heading", { name: /Observed Topology/ }),
     ).toBeInTheDocument();
   });
 
