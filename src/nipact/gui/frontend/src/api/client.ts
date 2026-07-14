@@ -1,6 +1,6 @@
 import type {
   ApiErrorBody,
-  Artifact,
+  ArtifactDetail,
   ArtifactFilters,
   ArtifactGroupsResponse,
   ArtifactsResponse,
@@ -100,8 +100,8 @@ export function fetchArtifactGroups(
   );
 }
 
-export function fetchArtifact(artifactId: number): Promise<Artifact> {
-  return getJson<Artifact>(`/api/artifacts/${artifactId}`);
+export function fetchArtifact(artifactId: number): Promise<ArtifactDetail> {
+  return getJson<ArtifactDetail>(`/api/artifacts/${artifactId}`);
 }
 
 export function fetchArtifactLineage(

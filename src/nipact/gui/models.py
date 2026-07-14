@@ -94,12 +94,16 @@ class Artifact(Dto):
     run_label: str | None
     datatype: str | None
     suffix: str | None
-    source_metadata: dict[str, Any] | None
     workflow_artifact_ref: str | None
     callable_ref: str | None
     software_ref: str | None
     created_at: str
-    lineage_url: str
+
+
+class ArtifactDetail(Artifact):
+    # Full single-artifact record. source_metadata is an unbounded blob dropped
+    # from the list profile above; it rides only on the /{id} detail endpoint.
+    source_metadata: dict[str, Any] | None
 
 
 class ArtifactsResponse(Dto):

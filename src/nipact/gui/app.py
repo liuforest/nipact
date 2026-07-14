@@ -15,7 +15,7 @@ from nipact.errors import ValidationError
 
 from .models import (
     ApiError,
-    Artifact,
+    ArtifactDetail,
     ArtifactGroupsResponse,
     ArtifactsResponse,
     ManifestDetail,
@@ -136,12 +136,12 @@ def _install_api_routes(app: FastAPI, service: GuiService) -> None:
             is_published=is_published,
         )
 
-    @app.get("/api/artifacts/resolve", response_model=Artifact)
-    def resolve_artifact(path: str = Query()) -> Artifact:
+    @app.get("/api/artifacts/resolve", response_model=ArtifactDetail)
+    def resolve_artifact(path: str = Query()) -> ArtifactDetail:
         return service.resolve_artifact_path(path)
 
-    @app.get("/api/artifacts/{artifact_id}", response_model=Artifact)
-    def artifact(artifact_id: int) -> Artifact:
+    @app.get("/api/artifacts/{artifact_id}", response_model=ArtifactDetail)
+    def artifact(artifact_id: int) -> ArtifactDetail:
         return service.artifact(artifact_id)
 
     @app.get("/api/artifacts/{artifact_id}/lineage", response_model=TraceGraphResponse)
