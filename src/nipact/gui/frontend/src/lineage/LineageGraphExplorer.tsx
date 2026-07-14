@@ -10,7 +10,7 @@ import { DataTable } from "../components/ui/DataTable";
 import { IdentifierValue } from "../components/ui/IdentifierValue";
 import { PathValue } from "../components/ui/PathValue";
 import { WarningList } from "../components/ui/WarningList";
-import type { LineageGraphSelection } from "./LineageGraphCanvas";
+import { lineageSelectionElementId, type LineageGraphSelection } from "./LineageGraphCanvas";
 import {
   buildArtifactNeighborhood,
   findTraceArtifact,
@@ -25,9 +25,21 @@ const LineageGraphCanvas = lazy(async () => ({
 export function LineageGraphExplorer({ graph }: { graph: TraceGraphResponse }) {
   const [searchText, setSearchText] = useState("");
   const [selection, setSelection] = useState<LineageGraphSelection | null>(null);
+  const [focusRequest, setFocusRequest] = useState<{
+    elementId: string;
+    token: number;
+  } | null>(null);
   useEffect(() => {
     setSelection(null);
+    setFocusRequest(null);
   }, [graph.selected_artifact_id]);
+  const selectAndFocus = (nextSelection: LineageGraphSelection) => {
+    setSelection(nextSelection);
+    setFocusRequest((prev) => ({
+      elementId: lineageSelectionElementId(nextSelection),
+      token: (prev?.token ?? 0) + 1,
+    }));
+  };
   const searchArtifactIds = useMemo(
     () => searchLineageArtifacts(graph, searchText),
     [graph, searchText],
@@ -84,7 +96,7 @@ export function LineageGraphExplorer({ graph }: { graph: TraceGraphResponse }) {
                     type="button"
                     className="graph-element-select"
                     aria-pressed={selectedArtifactId === id}
-                    onClick={() => setSelection({ kind: "artifact", artifact_id: id })}
+                    onClick={() => selectAndFocus({ kind: "artifact", artifact_id: id })}
                   >
                     Select artifact {id}
                     {artifact
@@ -100,6 +112,7 @@ export function LineageGraphExplorer({ graph }: { graph: TraceGraphResponse }) {
         <Suspense fallback={<GraphCanvasLoadingFallback />}>
           <LineageGraphCanvas
             graph={graph}
+            focusRequest={focusRequest}
             onSelectionChange={setSelection}
             searchArtifactIds={searchArtifactIds}
             selectedArtifactId={selectedArtifactId}
@@ -146,7 +159,7 @@ export function LineageGraphExplorer({ graph }: { graph: TraceGraphResponse }) {
                   type="button"
                   className="graph-element-select"
                   aria-pressed={selectedArtifactId === row.artifact_id}
-                  onClick={() => setSelection({ kind: "artifact", artifact_id: row.artifact_id })}
+                  onClick={() => selectAndFocus({ kind: "artifact", artifact_id: row.artifact_id })}
                 >
                   Select artifact {row.artifact_id}
                 </button>
@@ -175,7 +188,7 @@ export function LineageGraphExplorer({ graph }: { graph: TraceGraphResponse }) {
                   type="button"
                   className="graph-element-select"
                   aria-pressed={selectedDependencyEdgeId === row.edge_id}
-                  onClick={() => setSelection({ kind: "dependency", edge_id: row.edge_id })}
+                  onClick={() => selectAndFocus({ kind: "dependency", edge_id: row.edge_id })}
                 >
                   Select dependency {row.source_artifact_id} → {row.dependent_artifact_id}
                 </button>

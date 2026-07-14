@@ -4,8 +4,28 @@ import { describe, expect, it, vi } from "vitest";
 import type { TraceArtifact, TraceDependency, TraceGraphResponse } from "../api/types";
 import { LineageGraphExplorer } from "./LineageGraphExplorer";
 
-vi.mock("./LineageGraphCanvas", () => ({
-  LineageGraphCanvas: () => <div data-testid="lineage-canvas" />,
+vi.mock("./LineageGraphCanvas", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./LineageGraphCanvas")>()),
+  LineageGraphCanvas: ({
+    focusRequest,
+    onSelectionChange,
+  }: {
+    focusRequest?: { elementId: string; token: number } | null;
+    onSelectionChange?: (selection: { kind: "artifact"; artifact_id: number }) => void;
+  }) => (
+    <div
+      data-testid="lineage-canvas"
+      data-focus-element={focusRequest?.elementId ?? ""}
+      data-focus-token={focusRequest?.token ?? ""}
+    >
+      <button
+        type="button"
+        onClick={() => onSelectionChange?.({ kind: "artifact", artifact_id: 2 })}
+      >
+        canvas tap artifact 2
+      </button>
+    </div>
+  ),
 }));
 
 function makeArtifact(overrides: Partial<TraceArtifact> & { artifact_id: number }): TraceArtifact {
@@ -169,5 +189,48 @@ describe("LineageGraphExplorer", () => {
 
     fireEvent.change(searchbox, { target: { value: "no-such-artifact" } });
     expect(screen.getByText("0 artifacts match")).toBeInTheDocument();
+  });
+
+  it("requests focus with a bumping token from external controls", () => {
+    renderExplorer();
+    const canvas = screen.getByTestId("lineage-canvas");
+    expect(canvas).toHaveAttribute("data-focus-token", "");
+
+    fireEvent.click(screen.getByRole("button", { name: "Select artifact 1" }));
+    expect(canvas).toHaveAttribute("data-focus-element", "artifact:1");
+    expect(canvas).toHaveAttribute("data-focus-token", "1");
+
+    fireEvent.click(screen.getByRole("button", { name: "Select dependency 1 → 2" }));
+    expect(canvas).toHaveAttribute("data-focus-element", "e0");
+    expect(canvas).toHaveAttribute("data-focus-token", "2");
+
+    // Re-selecting the same element still refires (new token).
+    fireEvent.click(screen.getByRole("button", { name: "Select dependency 1 → 2" }));
+    expect(canvas).toHaveAttribute("data-focus-token", "3");
+  });
+
+  it("does not request focus when the canvas drives selection", () => {
+    renderExplorer();
+    const canvas = screen.getByTestId("lineage-canvas");
+
+    fireEvent.click(screen.getByRole("button", { name: "canvas tap artifact 2" }));
+
+    expect(screen.getByRole("heading", { name: "Selected Artifact" })).toBeInTheDocument();
+    expect(canvas).toHaveAttribute("data-focus-token", "");
+  });
+
+  it("clears the focus request when the graph changes", () => {
+    const { rerender } = renderExplorer();
+
+    fireEvent.click(screen.getByRole("button", { name: "Select artifact 1" }));
+    expect(screen.getByTestId("lineage-canvas")).toHaveAttribute("data-focus-token", "1");
+
+    rerender(
+      <MemoryRouter>
+        <LineageGraphExplorer graph={{ ...graph, selected_artifact_id: 1 }} />
+      </MemoryRouter>,
+    );
+
+    expect(screen.getByTestId("lineage-canvas")).toHaveAttribute("data-focus-token", "");
   });
 });

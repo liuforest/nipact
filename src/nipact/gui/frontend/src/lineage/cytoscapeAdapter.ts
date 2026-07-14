@@ -66,7 +66,7 @@ export function buildLineageElements(
   return elements;
 }
 
-function artifactNodeId(artifactId: number): string {
+export function artifactNodeId(artifactId: number): string {
   return `artifact:${artifactId}`;
 }
 
