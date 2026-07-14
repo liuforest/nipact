@@ -3,6 +3,7 @@ import { Link, useParams } from "react-router-dom";
 import { fetchArtifact } from "../api/client";
 import { queryKeys } from "../api/queryKeys";
 import type { Artifact } from "../api/types";
+import { ArtifactBreadcrumb } from "../components/ui/ArtifactBreadcrumb";
 import { ErrorPanel } from "../components/ui/ErrorPanel";
 import { IdentifierValue } from "../components/ui/IdentifierValue";
 import { KeyValueGrid } from "../components/ui/KeyValueGrid";
@@ -34,6 +35,7 @@ export function ArtifactDetailPage() {
 
   return (
     <div className="page-stack">
+      <ArtifactBreadcrumb artifactId={artifact.artifact_id} view="detail" />
       <section className="panel">
         <p className="eyebrow">Artifact {artifact.artifact_id}</p>
         <h1>
@@ -50,18 +52,6 @@ export function ArtifactDetailPage() {
       <DetailSection title="Workflow And Run" items={workflowItems(artifact)} />
       <DetailSection title="Hashes And Parameters" items={hashItems(artifact)} />
       <DetailSection title="Entity Fields" items={entityItems(artifact)} />
-      <section className="panel">
-        <h2>Trace</h2>
-        <p className="status-line">
-          Open the trace view to inspect upstream artifacts, dependency edges, warnings, and
-          manifest bindings for this artifact.
-        </p>
-        <div className="button-row">
-          <Link className="button" to={`/artifacts/${artifact.artifact_id}/lineage`}>
-            Trace artifact
-          </Link>
-        </div>
-      </section>
       {artifact.source_metadata ? (
         <section className="panel">
           <h2>Source Metadata</h2>

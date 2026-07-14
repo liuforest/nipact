@@ -3,6 +3,7 @@ import { useEffect, useState } from "react";
 import { useParams } from "react-router-dom";
 import { fetchArtifactLineage, fetchArtifactTopology } from "../api/client";
 import { queryKeys } from "../api/queryKeys";
+import { ArtifactBreadcrumb } from "../components/ui/ArtifactBreadcrumb";
 import { ErrorPanel } from "../components/ui/ErrorPanel";
 import { LoadingPanel } from "../components/ui/LoadingPanel";
 import { LineageGraphExplorer } from "../lineage/LineageGraphExplorer";
@@ -52,65 +53,77 @@ export function LineagePage({
     return <ErrorPanel error={new Error("invalid artifact id")} />;
   }
 
-  if (rawMode) {
-    if (lineageQuery.isError) {
-      return <ErrorPanel error={lineageQuery.error} />;
+  // The lineage breadcrumb is rendered above this branch switch, so it — and the
+  // list + detail exits it provides — is present across the successful views and
+  // both render-refusal states without any per-branch control props.
+  const body = (function renderLineageBody() {
+    if (rawMode) {
+      if (lineageQuery.isError) {
+        return <ErrorPanel error={lineageQuery.error} />;
+      }
+      if (lineageQuery.isLoading || !lineageQuery.data) {
+        return <LoadingPanel label="Loading lineage" />;
+      }
+      const graph = lineageQuery.data;
+      if (exceedsRenderLimit(traceGraphElementCount(graph), renderLimit)) {
+        return (
+          <RenderRefusalPanel
+            title="Raw lineage too large to render"
+            elementCount={traceGraphElementCount(graph)}
+            limit={renderLimit}
+            onShowTopology={() => setRawMode(false)}
+          />
+        );
+      }
+      return (
+        <>
+          <section className="panel">
+            <button type="button" onClick={() => setRawMode(false)}>
+              Back to observed topology
+            </button>
+          </section>
+          <LineageGraphExplorer graph={graph} />
+        </>
+      );
     }
-    if (lineageQuery.isLoading || !lineageQuery.data) {
-      return <LoadingPanel label="Loading lineage" />;
+
+    if (topologyQuery.isError) {
+      return <ErrorPanel error={topologyQuery.error} />;
     }
-    const graph = lineageQuery.data;
-    if (exceedsRenderLimit(traceGraphElementCount(graph), renderLimit)) {
+    if (topologyQuery.isLoading || !topologyQuery.data) {
+      return <LoadingPanel label="Loading topology" />;
+    }
+    const topology = topologyQuery.data;
+    if (exceedsRenderLimit(topologyElementCount(topology), renderLimit)) {
       return (
         <RenderRefusalPanel
-          title="Raw lineage too large to render"
-          elementCount={traceGraphElementCount(graph)}
+          title="Observed topology too large to render"
+          elementCount={topologyElementCount(topology)}
           limit={renderLimit}
-          onShowTopology={() => setRawMode(false)}
         />
       );
     }
     return (
-      <div className="page-stack">
-        <section className="panel">
-          <button type="button" onClick={() => setRawMode(false)}>
-            Back to observed topology
-          </button>
-        </section>
-        <LineageGraphExplorer graph={graph} />
-      </div>
-    );
-  }
-
-  if (topologyQuery.isError) {
-    return <ErrorPanel error={topologyQuery.error} />;
-  }
-  if (topologyQuery.isLoading || !topologyQuery.data) {
-    return <LoadingPanel label="Loading topology" />;
-  }
-  const topology = topologyQuery.data;
-  if (exceedsRenderLimit(topologyElementCount(topology), renderLimit)) {
-    return (
-      <RenderRefusalPanel
-        title="Observed topology too large to render"
-        elementCount={topologyElementCount(topology)}
-        limit={renderLimit}
+      <TopologyGraphExplorer
+        topology={topology}
+        onShowRawLineage={() => setRawMode(true)}
+        onRequestInstances={() => setInstancesRequestedFor(artifactId)}
+        instancesRequested={instancesRequested}
+        instanceLineage={{
+          isLoading: lineageQuery.isLoading,
+          isError: lineageQuery.isError,
+          error: lineageQuery.error,
+          data: lineageQuery.data,
+        }}
       />
     );
-  }
+  })();
+
   return (
-    <TopologyGraphExplorer
-      topology={topology}
-      onShowRawLineage={() => setRawMode(true)}
-      onRequestInstances={() => setInstancesRequestedFor(artifactId)}
-      instancesRequested={instancesRequested}
-      instanceLineage={{
-        isLoading: lineageQuery.isLoading,
-        isError: lineageQuery.isError,
-        error: lineageQuery.error,
-        data: lineageQuery.data,
-      }}
-    />
+    <div className="page-stack">
+      <ArtifactBreadcrumb artifactId={artifactId} view="lineage" />
+      {body}
+    </div>
   );
 }
 
