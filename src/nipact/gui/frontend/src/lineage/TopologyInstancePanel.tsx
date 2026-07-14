@@ -107,6 +107,7 @@ export function TopologyInstancePanel({
       <div className="graph-search-toolbar">
         <button
           type="button"
+          className="button"
           disabled={safePage <= 0}
           onClick={() => setPage(safePage - 1)}
         >
@@ -117,6 +118,7 @@ export function TopologyInstancePanel({
         </span>
         <button
           type="button"
+          className="button"
           disabled={safePage >= pageCount - 1}
           onClick={() => setPage(safePage + 1)}
         >

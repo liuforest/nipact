@@ -78,7 +78,11 @@ export function LineagePage({
       return (
         <>
           <section className="panel">
-            <button type="button" onClick={() => setRawMode(false)}>
+            <button
+              type="button"
+              className="button"
+              onClick={() => setRawMode(false)}
+            >
               Back to observed topology
             </button>
           </section>
@@ -147,7 +151,7 @@ function RenderRefusalPanel({
         more specific artifact to narrow the closure.
       </p>
       {onShowTopology ? (
-        <button type="button" onClick={onShowTopology}>
+        <button type="button" className="button" onClick={onShowTopology}>
           Back to observed topology
         </button>
       ) : null}
