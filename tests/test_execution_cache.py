@@ -885,7 +885,7 @@ def test_cross_target_run_plan_reuses_upstream_from_registry(
     ]
 
 
-def test_cross_target_dry_run_hydrates_reused_upstream_without_registry_update(
+def test_cross_target_dry_run_maps_reused_upstream_without_copying(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -898,15 +898,23 @@ def test_cross_target_dry_run_hydrates_reused_upstream_without_registry_update(
     )
     assert execute_run_plan(b_plan, cores=1).published_count == len(b_plan.published_outputs)
     assert log_path.read_text(encoding="utf-8").splitlines() == ["B sub_001"]
-    with sqlite3.connect(runtime_dir / "database/registry.db") as conn:
-        counts_before = {
-            "workflow_runs": conn.execute(
-                "SELECT COUNT(*) FROM workflow_runs"
-            ).fetchone()[0],
-            "artifacts": conn.execute(
-                "SELECT COUNT(*) FROM artifacts WHERE origin = 'workflow_output'"
-            ).fetchone()[0],
-        }
+    registered_b_path = _latest_registered_path(
+        runtime_dir,
+        step_name="b_transform",
+        output_name="b_out",
+        address="sub_001",
+    )
+    counts_before = _registry_row_counts(runtime_dir)
+    outputs_before = {
+        str(path.relative_to(runtime_dir)): sha256_file_digest(path)
+        for path in sorted((runtime_dir / "outputs").rglob("*"))
+        if path.is_file()
+    }
+
+    def fail_copy(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("dry run must not copy reused artifacts")
+
+    monkeypatch.setattr("nipact.execution.shutil.copy2", fail_copy)
 
     c_plan = build_run_plan(
         project_dir=project_dir,
@@ -917,19 +925,213 @@ def test_cross_target_dry_run_hydrates_reused_upstream_without_registry_update(
     )
     assert execute_run_plan(c_plan, cores=1).published_count == 0
 
-    assert (c_plan.run_workspace / "staging/b_transform/b_out/sub_001.json").is_file()
-    assert not (c_plan.run_workspace / "staging/c_transform/c_out/sub_001.json").exists()
+    # Real Snakemake built the dry-run DAG against the mapped registered
+    # source: the reused producer rule is absent, no artifact was staged, and
+    # no callable executed.
+    assert "b_transform" not in [job.step_name for job in c_plan.jobs]
+    assert list((c_plan.run_workspace / "staging").rglob("*")) == []
+    snakefile_text = (c_plan.run_workspace / "Snakefile").read_text(encoding="utf-8")
+    mapped_b = os.path.relpath(
+        runtime_dir / registered_b_path,
+        c_plan.run_workspace,
+    ).replace(os.sep, "/")
+    assert json.dumps(mapped_b) in snakefile_text
+    assert "staging/b_transform/b_out/sub_001.json" not in snakefile_text
+    # The serialized staging contract is unchanged: only the generated
+    # Snakefile maps reused inputs to registered sources.
+    run_plan_payload = json.loads(
+        (c_plan.run_workspace / "run_plan.json").read_text(encoding="utf-8")
+    )
+    assert run_plan_payload["reused_outputs"][0]["staging_path"] == (
+        "staging/b_transform/b_out/sub_001.json"
+    )
+    assert run_plan_payload["reused_outputs"][0]["source_path"] == registered_b_path
     assert log_path.read_text(encoding="utf-8").splitlines() == ["B sub_001"]
+    assert _registry_row_counts(runtime_dir) == counts_before
+    outputs_after = {
+        str(path.relative_to(runtime_dir)): sha256_file_digest(path)
+        for path in sorted((runtime_dir / "outputs").rglob("*"))
+        if path.is_file()
+    }
+    assert outputs_after == outputs_before
+
+
+def test_dry_run_maps_fresh_candidate_path_when_registered_path_moves(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project_dir, runtime_dir, _log_path = _write_cache_project(tmp_path, monkeypatch)
+    b_plan = build_run_plan(
+        project_dir=project_dir,
+        context="cache",
+        workflow_name="main",
+        step_name="b_transform",
+    )
+    assert execute_run_plan(b_plan, cores=1).published_count == len(b_plan.published_outputs)
+
+    c_plan = build_run_plan(
+        project_dir=project_dir,
+        context="cache",
+        workflow_name="main",
+        step_name="c_transform",
+        dry_run=True,
+    )
+    assert len(c_plan.reused_outputs) == 1
+    planned_source = c_plan.reused_outputs[0].source_path
+    old_rel = c_plan.reused_outputs[0].source_path_relative
+    artifact_id = c_plan.reused_outputs[0].source_artifact_id
+
+    # Re-register the artifact at a new path under outputs/ while leaving the
+    # old file present with a valid size: an implementation that confirmed only
+    # the artifact_id and then mapped the stale planned path would still pass
+    # every validation check, so only genuine re-resolution finds the move.
+    new_rel = "/".join([*old_rel.split("/")[:-1], "moved", old_rel.split("/")[-1]])
+    new_path = runtime_dir / new_rel
+    new_path.parent.mkdir(parents=True, exist_ok=True)
+    new_path.write_bytes(planned_source.read_bytes())
     with sqlite3.connect(runtime_dir / "database/registry.db") as conn:
-        counts_after = {
-            "workflow_runs": conn.execute(
-                "SELECT COUNT(*) FROM workflow_runs"
-            ).fetchone()[0],
-            "artifacts": conn.execute(
-                "SELECT COUNT(*) FROM artifacts WHERE origin = 'workflow_output'"
-            ).fetchone()[0],
-        }
-    assert counts_after == counts_before
+        conn.execute(
+            "UPDATE artifacts SET path = ?, published_path = ? WHERE artifact_id = ?",
+            (new_rel, new_rel, artifact_id),
+        )
+        conn.execute(
+            "UPDATE published_outputs SET path = ? WHERE artifact_id = ?",
+            (new_rel, artifact_id),
+        )
+    assert planned_source.is_file()
+
+    calls: list[bool] = []
+
+    def record_run(run_plan: object, *, cores: int, dry_run: bool) -> int:
+        calls.append(dry_run)
+        return 0
+
+    monkeypatch.setattr("nipact.execution._run_snakemake", record_run)
+    assert execute_run_plan(c_plan, cores=1).published_count == 0
+    assert calls == [True]
+
+    snakefile_text = (c_plan.run_workspace / "Snakefile").read_text(encoding="utf-8")
+    mapped_new = os.path.relpath(
+        runtime_dir / new_rel,
+        c_plan.run_workspace,
+    ).replace(os.sep, "/")
+    mapped_old = os.path.relpath(
+        runtime_dir / old_rel,
+        c_plan.run_workspace,
+    ).replace(os.sep, "/")
+    assert json.dumps(mapped_new) in snakefile_text
+    assert mapped_old not in snakefile_text
+
+
+@pytest.mark.parametrize(
+    ("change", "message"),
+    [
+        ("delete", "registered reusable artifact file is missing"),
+        ("resize", "registered reusable artifact file size mismatch"),
+        ("retract", "reusable artifact is no longer valid"),
+    ],
+)
+def test_dry_run_revalidates_reused_source_before_snakemake(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    change: str,
+    message: str,
+) -> None:
+    project_dir, runtime_dir, _log_path = _write_cache_project(tmp_path, monkeypatch)
+    b_plan = build_run_plan(
+        project_dir=project_dir,
+        context="cache",
+        workflow_name="main",
+        step_name="b_transform",
+    )
+    assert execute_run_plan(b_plan, cores=1).published_count == len(b_plan.published_outputs)
+
+    c_plan = build_run_plan(
+        project_dir=project_dir,
+        context="cache",
+        workflow_name="main",
+        step_name="c_transform",
+        dry_run=True,
+    )
+    assert len(c_plan.reused_outputs) == 1
+    source = c_plan.reused_outputs[0].source_path
+
+    # The mapping exposes a direct registered path to Snakemake, so the reused
+    # source is revalidated between planning and Snakemake invocation exactly
+    # like hydration would: a failure aborts before the dry workspace or any
+    # Snakemake process exists.
+    if change == "delete":
+        source.unlink()
+    elif change == "resize":
+        source.write_text(
+            source.read_text(encoding="utf-8") + "tampered\n",
+            encoding="utf-8",
+        )
+    else:
+        with sqlite3.connect(runtime_dir / "database/registry.db") as conn:
+            conn.execute(
+                "DELETE FROM published_outputs WHERE artifact_id = ?",
+                (c_plan.reused_outputs[0].source_artifact_id,),
+            )
+    counts_before = _registry_row_counts(runtime_dir)
+
+    calls: list[bool] = []
+
+    def record_run(run_plan: object, *, cores: int, dry_run: bool) -> int:
+        calls.append(dry_run)
+        return 0
+
+    monkeypatch.setattr("nipact.execution._run_snakemake", record_run)
+    with pytest.raises(ValidationError, match=message):
+        execute_run_plan(c_plan, cores=1)
+    assert calls == []
+    assert not c_plan.run_workspace.exists()
+    assert _registry_row_counts(runtime_dir) == counts_before
+
+
+def test_dry_run_accepts_same_size_corruption_real_run_rejects_it(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project_dir, runtime_dir, _log_path = _write_cache_project(tmp_path, monkeypatch)
+    b_plan = build_run_plan(
+        project_dir=project_dir,
+        context="cache",
+        workflow_name="main",
+        step_name="b_transform",
+    )
+    assert execute_run_plan(b_plan, cores=1).published_count == len(b_plan.published_outputs)
+
+    dry_plan = build_run_plan(
+        project_dir=project_dir,
+        context="cache",
+        workflow_name="main",
+        step_name="c_transform",
+        dry_run=True,
+    )
+    assert len(dry_plan.reused_outputs) == 1
+    source = dry_plan.reused_outputs[0].source_path
+    source.write_text(
+        source.read_text(encoding="utf-8").replace("alpha", "omega"),
+        encoding="utf-8",
+    )
+
+    # The byte-integrity boundary: dry-run revalidation is existence and size
+    # without hashing, so same-size corruption passes the forecast; the
+    # following real execution still hashes the source at hydration and fails.
+    assert execute_run_plan(dry_plan, cores=1).published_count == 0
+
+    real_plan = build_run_plan(
+        project_dir=project_dir,
+        context="cache",
+        workflow_name="main",
+        step_name="c_transform",
+    )
+    with pytest.raises(
+        ValidationError,
+        match="reusable artifact digest mismatch during hydration",
+    ):
+        execute_run_plan(real_plan, cores=1)
 
 
 def test_dry_run_forecast_not_suppressed_by_completed_real_run(
@@ -1225,6 +1427,61 @@ def test_multi_output_selected_step_publishes_siblings_for_reuse(
     ] == ["left_out"]
     assert execute_run_plan(use_plan, cores=1).published_count == len(use_plan.published_outputs)
     assert log_path.read_text(encoding="utf-8").splitlines() == ["B sub_001"]
+
+
+def test_multi_output_dry_run_maps_consumed_reused_sibling(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project_dir, runtime_dir, log_path = _write_cache_project(tmp_path, monkeypatch)
+    b_plan = build_run_plan(
+        project_dir=project_dir,
+        context="cache",
+        workflow_name="main",
+        step_name="b_transform",
+    )
+    assert execute_run_plan(b_plan, cores=1).published_count == len(b_plan.published_outputs)
+    multi_plan = build_run_plan(
+        project_dir=project_dir,
+        context="cache",
+        workflow_name="main",
+        step_name="multi_transform",
+    )
+    assert execute_run_plan(multi_plan, cores=1).published_count == len(
+        multi_plan.published_outputs
+    )
+    log_before = log_path.read_text(encoding="utf-8")
+    counts_before = _registry_row_counts(runtime_dir)
+
+    use_plan = build_run_plan(
+        project_dir=project_dir,
+        context="cache",
+        workflow_name="main",
+        step_name="use_multi",
+        dry_run=True,
+    )
+    assert "multi_transform" not in [job.step_name for job in use_plan.jobs]
+    assert [
+        output_ref.output_name
+        for output_ref in use_plan.reused_outputs
+        if output_ref.step_name == "multi_transform"
+    ] == ["left_out"]
+    assert execute_run_plan(use_plan, cores=1).published_count == 0
+
+    # Every reachable reused input — including the consumed sibling of the
+    # multi-output producer — is mapped to its registered source, and the
+    # staging alias appears nowhere in the generated rules.
+    snakefile_text = (use_plan.run_workspace / "Snakefile").read_text(encoding="utf-8")
+    for output_ref in use_plan.reused_outputs:
+        mapped = os.path.relpath(
+            runtime_dir / output_ref.source_path_relative,
+            use_plan.run_workspace,
+        ).replace(os.sep, "/")
+        assert json.dumps(mapped) in snakefile_text
+        assert output_ref.staging_path_relative not in snakefile_text
+    assert list((use_plan.run_workspace / "staging").rglob("*")) == []
+    assert log_path.read_text(encoding="utf-8") == log_before
+    assert _registry_row_counts(runtime_dir) == counts_before
 
 
 def test_targeted_multi_output_run_publishes_both_siblings_for_one_entity(
@@ -2268,6 +2525,67 @@ def test_targeted_apply_reuses_registered_cohort_fit_without_executing_sibling(
     }
 
 
+def test_targeted_apply_dry_run_maps_registered_cohort_fit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project_dir, runtime_dir, log_path = _write_cache_project(
+        tmp_path,
+        monkeypatch,
+        entities=("sub_001", "sub_002"),
+    )
+    _write_sibling_workflow(
+        project_dir,
+        workflow_name="apply_flow",
+        step_names=["a_source", "b_transform", "fit_transform", "apply_transform"],
+    )
+    fit_plan = build_run_plan(
+        project_dir=project_dir,
+        context="cache",
+        workflow_name="apply_flow",
+        step_name="fit_transform",
+    )
+    assert execute_run_plan(fit_plan, cores=1).published_count == len(
+        fit_plan.published_outputs
+    )
+    log_before = log_path.read_text(encoding="utf-8")
+    counts_before = _registry_row_counts(runtime_dir)
+
+    apply_plan = build_run_plan(
+        project_dir=project_dir,
+        context="cache",
+        workflow_name="apply_flow",
+        step_name="apply_transform",
+        address="sub_001",
+        dry_run=True,
+    )
+    assert _reused_keys(apply_plan) == {
+        ("b_transform", "b_out", "sub_001"),
+        ("fit_transform", "fit_out", "subjects"),
+    }
+    assert execute_run_plan(apply_plan, cores=1).published_count == 0
+
+    snakefile_text = (apply_plan.run_workspace / "Snakefile").read_text(encoding="utf-8")
+    mapped_by_key = {
+        (output_ref.step_name, output_ref.output_name): os.path.relpath(
+            runtime_dir / output_ref.source_path_relative,
+            apply_plan.run_workspace,
+        ).replace(os.sep, "/")
+        for output_ref in apply_plan.reused_outputs
+    }
+    assert json.dumps(mapped_by_key[("b_transform", "b_out")]) in snakefile_text
+    # The cohort fit fans out: one mapping entry keyed by one reused ref, and
+    # the substitution rewrites every consuming rule's input line — both apply
+    # rules reference the same registered source.
+    assert snakefile_text.count(
+        json.dumps(mapped_by_key[("fit_transform", "fit_out")])
+    ) == 2
+    assert list((apply_plan.run_workspace / "staging").rglob("*")) == []
+    assert log_path.read_text(encoding="utf-8") == log_before
+    assert "APPLY" not in log_path.read_text(encoding="utf-8")
+    assert _registry_row_counts(runtime_dir) == counts_before
+
+
 def test_targeted_apply_executes_fresh_cohort_ancestor_with_population_fan_in(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2680,6 +2998,61 @@ def test_targeted_dry_run_writes_no_outputs_and_no_registry_rows(
         assert (
             conn.execute("SELECT COUNT(*) FROM published_outputs").fetchone()[0] == 0
         )
+
+
+def test_targeted_dry_run_maps_only_reachable_reused_inputs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project_dir, runtime_dir, log_path = _write_cache_project(
+        tmp_path,
+        monkeypatch,
+        entities=("sub_001", "sub_002"),
+    )
+    b_plan = build_run_plan(
+        project_dir=project_dir,
+        context="cache",
+        workflow_name="main",
+        step_name="b_transform",
+    )
+    assert execute_run_plan(b_plan, cores=1).published_count == len(b_plan.published_outputs)
+    registered_b_path = _latest_registered_path(
+        runtime_dir,
+        step_name="b_transform",
+        output_name="b_out",
+        address="sub_001",
+    )
+    log_before = log_path.read_text(encoding="utf-8")
+    counts_before = _registry_row_counts(runtime_dir)
+
+    c_plan = build_run_plan(
+        project_dir=project_dir,
+        context="cache",
+        workflow_name="main",
+        step_name="c_transform",
+        address="sub_001",
+        dry_run=True,
+    )
+    assert c_plan.run_workspace == (
+        runtime_dir / "runs/cache/main/c_transform/addresses/sub_001/dry-run"
+    )
+    assert _reused_keys(c_plan) == {("b_transform", "b_out", "sub_001")}
+    assert execute_run_plan(c_plan, cores=1).published_count == 0
+
+    # Only the reachable closure's reused inputs are mapped: sub_002's reused
+    # input keeps its (absent) staging path, and the real dry-run DAG still
+    # builds because Snakemake never demands the unreachable consumer rule.
+    snakefile_text = (c_plan.run_workspace / "Snakefile").read_text(encoding="utf-8")
+    mapped_b = os.path.relpath(
+        runtime_dir / registered_b_path,
+        c_plan.run_workspace,
+    ).replace(os.sep, "/")
+    assert json.dumps(mapped_b) in snakefile_text
+    assert "staging/b_transform/b_out/sub_001.json" not in snakefile_text
+    assert '"staging/b_transform/b_out/sub_002.json"' in snakefile_text
+    assert list((c_plan.run_workspace / "staging").rglob("*")) == []
+    assert log_path.read_text(encoding="utf-8") == log_before
+    assert _registry_row_counts(runtime_dir) == counts_before
 
 
 def test_targeted_run_becomes_current_and_keeps_full_manifest_binding(
