@@ -207,6 +207,9 @@ class RunPlan:
     selected_output_refs: tuple[RunJobOutputRef, ...]
     reused_outputs: tuple[ReusedRunJobOutputRef, ...]
     reuse_workflow_names: tuple[str, ...]
+    # Reporting statistic: fresh jobs in the selected targets' reachable
+    # closure. jobs stays population-wide; this is the executed forecast.
+    reachable_job_count: int
 
 
 @dataclass(frozen=True)
@@ -306,6 +309,7 @@ def build_run_plan(
         selected_output_refs=selected_output_refs,
         reused_outputs=reused_outputs,
         reuse_workflow_names=_reuse_workflow_names(loaded, plan.workflow_name),
+        reachable_job_count=len(reachable_job_ids),
     )
 
 

@@ -233,7 +233,11 @@ def build_parser() -> argparse.ArgumentParser:
     workflow_run_parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="Ask Snakemake to build the DAG without running jobs or publishing outputs.",
+        help=(
+            "Forecast the Snakemake DAG in an isolated dry-run workspace "
+            "without hydrating reused artifacts, running jobs, or publishing "
+            "outputs."
+        ),
     )
     return parser
 
@@ -328,8 +332,12 @@ def _run_workflow_command(args: argparse.Namespace) -> int | None:
         feedback.key_value("dry_run", run_plan.dry_run)
         feedback.key_value("selected_outputs", len(run_plan.selected_output_refs))
         # planned_jobs counts compiled fresh jobs population-wide even for a
-        # targeted run; only the reuse counters below are closure-scoped.
+        # targeted run; planned_reachable_fresh_jobs and the reuse counters
+        # below are closure-scoped.
         feedback.key_value("planned_jobs", len(run_plan.jobs))
+        feedback.key_value(
+            "planned_reachable_fresh_jobs", run_plan.reachable_job_count
+        )
         feedback.key_value(
             "planned_reused_registered_artifacts",
             len(
@@ -339,25 +347,46 @@ def _run_workflow_command(args: argparse.Namespace) -> int | None:
                 }
             ),
         )
-        feedback.key_value("planned_hydrated_inputs", len(run_plan.reused_outputs))
-        feedback.key_value(
-            "existing_staged_outputs",
-            sum(
-                1
-                for output_ref in run_plan.selected_output_refs
-                if output_ref.staging_path.is_file()
-            ),
-        )
+        feedback.key_value("planned_reused_inputs", len(run_plan.reused_outputs))
+        if run_plan.dry_run:
+            feedback.key_value("planned_hydrated_inputs", 0)
+        else:
+            feedback.key_value(
+                "planned_hydrated_inputs", len(run_plan.reused_outputs)
+            )
+            # reused_outputs holds one ref per output coordinate — one per
+            # staged copy — so summing file_size counts a fanned-out
+            # artifact once, not per consumer edge.
+            feedback.key_value(
+                "planned_hydration_bytes",
+                sum(output_ref.file_size for output_ref in run_plan.reused_outputs),
+            )
+            feedback.key_value(
+                "existing_staged_outputs",
+                sum(
+                    1
+                    for output_ref in run_plan.selected_output_refs
+                    if output_ref.staging_path.is_file()
+                ),
+            )
         feedback.key_value("run_workspace", _display_path(run_plan.run_workspace))
         feedback.key_value(
             "snakemake_log",
             _display_path(run_plan.run_workspace / "logs" / "snakemake.log"),
         )
-        feedback.key_value(
-            "note",
-            "Registered upstream artifacts can be hydrated into the current run "
-            "when their identity and digest checks pass.",
-        )
+        if run_plan.dry_run:
+            feedback.key_value(
+                "note",
+                "Dry run: reused registered artifacts are referenced at their "
+                "validated registered paths; no hydration, publication, or "
+                "registry update occurs.",
+            )
+        else:
+            feedback.key_value(
+                "note",
+                "Registered upstream artifacts can be hydrated into the current "
+                "run when their identity and digest checks pass.",
+            )
         feedback.line()
         feedback.flush()
 
