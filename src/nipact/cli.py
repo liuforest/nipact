@@ -311,6 +311,7 @@ def _run_workflow_command(args: argparse.Namespace) -> int | None:
             workflow_name=args.workflow,
             step_name=args.step,
             address=args.address,
+            dry_run=args.dry_run,
         )
         feedback = CliFeedback()
         feedback.heading("NIPACT workflow run")
@@ -324,7 +325,7 @@ def _run_workflow_command(args: argparse.Namespace) -> int | None:
             "all" if run_plan.requested_address is None else run_plan.requested_address,
         )
         feedback.key_value("cores", args.cores)
-        feedback.key_value("dry_run", args.dry_run)
+        feedback.key_value("dry_run", run_plan.dry_run)
         feedback.key_value("selected_outputs", len(run_plan.selected_output_refs))
         # planned_jobs counts compiled fresh jobs population-wide even for a
         # targeted run; only the reuse counters below are closure-scoped.
@@ -389,7 +390,6 @@ def _run_workflow_command(args: argparse.Namespace) -> int | None:
             outcome = execute_run_plan(
                 run_plan,
                 cores=args.cores,
-                dry_run=args.dry_run,
                 status_callback=status_callback,
             )
         finally:
@@ -398,7 +398,7 @@ def _run_workflow_command(args: argparse.Namespace) -> int | None:
         elapsed_seconds = perf_counter() - started_at
 
         feedback.line()
-        if args.dry_run:
+        if run_plan.dry_run:
             feedback.key_value("outputs_published", False)
             feedback.key_value("registry", "not_updated")
         else:

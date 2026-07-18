@@ -269,10 +269,10 @@ def test_workflow_run_command_executes_step(
 ) -> None:
     project_dir, _runtime_dir = _init_demo(tmp_path, capsys)
 
-    def publish_stub(*_args: object, **kwargs: object) -> RunOutcome:
+    def publish_stub(run_plan: object, **kwargs: object) -> RunOutcome:
         status_callback = kwargs["status_callback"]
         assert kwargs["cores"] == 2
-        assert kwargs["dry_run"] is False
+        assert run_plan.dry_run is False
         for event in (
             "building_workspace",
             "starting_snakemake",
