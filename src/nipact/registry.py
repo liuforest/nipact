@@ -1345,6 +1345,11 @@ def _validate_reusable_artifact_file(
     artifact: RegistryArtifact,
 ) -> None:
     artifact_path = _runtime_relative_file_path(runtime_root, artifact.path)
+    outputs_root = (runtime_root / "outputs").resolve()
+    if not _path_contains_or_same(outputs_root, artifact_path):
+        raise ValidationError(
+            "registered reusable artifact path must stay inside outputs/"
+        )
     if not artifact_path.is_file():
         raise ValidationError("registered reusable artifact file is missing")
     if artifact_path.stat().st_size != artifact.file_size:
