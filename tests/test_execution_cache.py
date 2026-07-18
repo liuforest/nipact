@@ -1336,6 +1336,10 @@ def test_published_artifact_from_another_context_is_not_reused(
         [
             ("delete", "registered reusable artifact file is missing"),
             ("mutate", "reusable artifact digest mismatch during hydration"),
+            (
+                "symlink_escape",
+                "registered reusable artifact path must stay inside outputs/",
+            ),
         ],
     )
 def test_hydration_revalidates_published_file_after_plan_construction(
@@ -1365,20 +1369,114 @@ def test_hydration_revalidates_published_file_after_plan_construction(
 
     # The planner chooses a reusable artifact from the registry, but the file is
     # still ordinary filesystem state. A user, cleanup job, or failed sync could
-    # remove or mutate that file between planning and execution. Hydration must
-    # re-check the registered path and digest at execution time rather than
-    # trusting the earlier plan snapshot.
+    # remove or mutate that file between planning and execution — or swap in a
+    # symlink whose resolved target leaves outputs/ while staying inside the
+    # runtime root. Hydration must re-check the registered path and digest at
+    # execution time rather than trusting the earlier plan snapshot.
     if change == "delete":
         published_b.unlink()
-    else:
+    elif change == "mutate":
         published_b.write_text(
             published_b.read_text(encoding="utf-8").replace("alpha", "omega"),
             encoding="utf-8",
         )
+    else:
+        escaped_target = runtime_dir / "data" / published_b.name
+        escaped_target.parent.mkdir(parents=True, exist_ok=True)
+        published_b.rename(escaped_target)
+        published_b.symlink_to(escaped_target)
 
     with pytest.raises(ValidationError, match=message):
         execute_run_plan(c_plan, cores=1)
     assert _registry_row_counts(runtime_dir) == counts_before
+
+
+def test_plan_construction_rejects_reuse_candidate_resolving_outside_outputs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project_dir, runtime_dir, _log_path = _write_cache_project(tmp_path, monkeypatch)
+    b_plan = build_run_plan(
+        project_dir=project_dir,
+        context="cache",
+        workflow_name="main",
+        step_name="b_transform",
+    )
+    assert execute_run_plan(b_plan, cores=1).published_count == len(b_plan.published_outputs)
+
+    probe_plan = build_run_plan(
+        project_dir=project_dir,
+        context="cache",
+        workflow_name="main",
+        step_name="c_transform",
+    )
+    assert len(probe_plan.reused_outputs) == 1
+    published_b = probe_plan.reused_outputs[0].source_path
+    counts_before = _registry_row_counts(runtime_dir)
+
+    # Corrupt the published path before planning: the registered string still
+    # points lexically inside outputs/, but the symlink resolves to a location
+    # elsewhere inside the runtime root. Reuse resolution is fail-closed, so
+    # plan construction itself must reject the candidate rather than silently
+    # planning against a file outside outputs/.
+    escaped_target = runtime_dir / "data" / published_b.name
+    escaped_target.parent.mkdir(parents=True, exist_ok=True)
+    published_b.rename(escaped_target)
+    published_b.symlink_to(escaped_target)
+
+    with pytest.raises(
+        ValidationError,
+        match="registered reusable artifact path must stay inside outputs/",
+    ):
+        build_run_plan(
+            project_dir=project_dir,
+            context="cache",
+            workflow_name="main",
+            step_name="c_transform",
+        )
+    assert _registry_row_counts(runtime_dir) == counts_before
+
+
+def test_symlink_resolving_inside_outputs_remains_reusable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project_dir, runtime_dir, _log_path = _write_cache_project(tmp_path, monkeypatch)
+    b_plan = build_run_plan(
+        project_dir=project_dir,
+        context="cache",
+        workflow_name="main",
+        step_name="b_transform",
+    )
+    assert execute_run_plan(b_plan, cores=1).published_count == len(b_plan.published_outputs)
+
+    probe_plan = build_run_plan(
+        project_dir=project_dir,
+        context="cache",
+        workflow_name="main",
+        step_name="c_transform",
+    )
+    assert len(probe_plan.reused_outputs) == 1
+    published_b = probe_plan.reused_outputs[0].source_path
+
+    # The containment check is about where the path resolves, not whether it is
+    # a symlink — mirroring the publication-side rule. A symlink whose resolved
+    # target stays inside outputs/ remains a valid reuse candidate.
+    relocated_target = published_b.parent / "relocated" / published_b.name
+    relocated_target.parent.mkdir(parents=True, exist_ok=True)
+    published_b.rename(relocated_target)
+    published_b.symlink_to(relocated_target)
+
+    c_plan = build_run_plan(
+        project_dir=project_dir,
+        context="cache",
+        workflow_name="main",
+        step_name="c_transform",
+    )
+    assert len(c_plan.reused_outputs) == 1
+    assert execute_run_plan(c_plan, cores=1).published_count == len(
+        c_plan.published_outputs
+    )
 
 
 # ---------------------------------------------------------------------------
