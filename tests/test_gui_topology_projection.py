@@ -541,10 +541,11 @@ def test_real_trace_projects_and_validates(
         workflow_name="base",
         step_name="color_sector_analysis",
     )
-    monkeypatch.setattr(
-        "nipact.execution._run_snakemake",
-        lambda *_args, **_kwargs: _write_all_staged_outputs(run_plan),
-    )
+    def write_staged_outputs(*_args: object, **_kwargs: object) -> int:
+        _write_all_staged_outputs(run_plan)
+        return 0
+
+    monkeypatch.setattr("nipact.execution._run_snakemake", write_staged_outputs)
     execute_run_plan(run_plan, cores=1)
 
     registry_path = runtime_dir / REGISTRY_DB_PATH

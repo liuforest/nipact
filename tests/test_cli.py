@@ -408,6 +408,40 @@ def test_workflow_run_accepts_address_and_reports_targeted_summary(
     assert "PASS: workflow run" in output
 
 
+def test_workflow_run_dry_run_failure_exits_nonzero_without_pass(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project_dir, _runtime_dir = _init_demo(tmp_path, capsys)
+
+    def fail_dry_run(*_args: object, **_kwargs: object) -> int:
+        return 1
+
+    monkeypatch.setattr("nipact.execution._run_snakemake", fail_dry_run)
+
+    assert (
+        main(
+            [
+                "workflow",
+                "run",
+                *_workflow_base_args(project_dir),
+                "--workflow",
+                "base",
+                "--step",
+                "color_sector_analysis",
+                "--dry-run",
+            ]
+        )
+        == 1
+    )
+
+    captured = capsys.readouterr()
+    assert "error: Snakemake failed with exit code 1" in captured.err
+    assert "logs/snakemake.log" in captured.err
+    assert "PASS" not in captured.out
+
+
 def test_workflow_run_targeted_summary_keeps_population_job_count(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],

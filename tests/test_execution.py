@@ -826,7 +826,7 @@ def test_execute_run_plan_publishes_selected_outputs_without_real_snakemake(
         step_name="color_sector_analysis",
     )
 
-    def write_staged_outputs(*_args: object, **_kwargs: object) -> None:
+    def write_staged_outputs(*_args: object, **_kwargs: object) -> int:
         _write_all_staged_outputs(
             run_plan,
             selected_payload={
@@ -840,6 +840,7 @@ def test_execute_run_plan_publishes_selected_outputs_without_real_snakemake(
                 "red_minus_green": -48,
             },
         )
+        return 0
 
     monkeypatch.setattr("nipact.execution._run_snakemake", write_staged_outputs)
     events: list[str] = []
@@ -949,8 +950,9 @@ def test_execute_run_plan_removes_published_files_when_registration_fails(
         step_name="color_sector_analysis",
     )
 
-    def write_staged_outputs(*_args: object, **_kwargs: object) -> None:
+    def write_staged_outputs(*_args: object, **_kwargs: object) -> int:
         _write_all_staged_outputs(run_plan)
+        return 0
 
     def fail_registration(*_args: object, **_kwargs: object) -> int:
         raise ValidationError("registry write failed")
@@ -981,10 +983,11 @@ def test_tiny_non_colors_run_registers_used_sources_and_trace(
         step_name="uppercase_text",
     )
 
-    def run_jobs_through_runtime(*_args: object, **_kwargs: object) -> None:
+    def run_jobs_through_runtime(*_args: object, **_kwargs: object) -> int:
         run_plan_path = run_plan.run_workspace / "run_plan.json"
         for job in run_plan.jobs:
             run_job(run_plan_path=run_plan_path, job_id=job.job_id)
+        return 0
 
     monkeypatch.setattr("nipact.execution._run_snakemake", run_jobs_through_runtime)
 
@@ -1396,8 +1399,9 @@ def test_dry_run_does_not_publish_outputs(
     )
     calls: list[bool] = []
 
-    def dry_run_stub(*_args: object, dry_run: bool, **_kwargs: object) -> None:
+    def dry_run_stub(*_args: object, dry_run: bool, **_kwargs: object) -> int:
         calls.append(dry_run)
+        return 0
 
     monkeypatch.setattr("nipact.execution._run_snakemake", dry_run_stub)
     events: list[str] = []
@@ -1419,6 +1423,58 @@ def test_dry_run_does_not_publish_outputs(
         "snakemake_complete",
     ]
     assert (run_plan.run_workspace / "Snakefile").is_file()
+    with sqlite3.connect(runtime_dir / "database/registry.db") as conn:
+        counts = {
+            "published_outputs": conn.execute(
+                "SELECT COUNT(*) FROM published_outputs"
+            ).fetchone()[0],
+            "workflow_runs": conn.execute("SELECT COUNT(*) FROM workflow_runs").fetchone()[0],
+            "workflow_artifacts": conn.execute(
+                "SELECT COUNT(*) FROM artifacts WHERE origin = 'workflow_output'"
+            ).fetchone()[0],
+            "dependencies": conn.execute(
+                "SELECT COUNT(*) FROM artifact_dependencies"
+            ).fetchone()[0],
+            "manifest_bindings": conn.execute(
+                "SELECT COUNT(*) FROM run_manifest_bindings"
+            ).fetchone()[0],
+        }
+    assert counts == {
+        "published_outputs": 0,
+        "workflow_runs": 0,
+        "workflow_artifacts": 0,
+        "dependencies": 0,
+        "manifest_bindings": 0,
+    }
+    assert not (
+        runtime_dir / "outputs/colors/base/color_sector_analysis/sector_counts"
+    ).exists()
+
+
+def test_dry_run_fails_on_nonzero_snakemake_exit(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project_dir, runtime_dir = _init_demo(tmp_path, capsys)
+    run_plan = build_run_plan(
+        project_dir=project_dir,
+        context="colors",
+        workflow_name="base",
+        step_name="color_sector_analysis",
+    )
+
+    def fail_dry_run(*_args: object, **_kwargs: object) -> int:
+        return 1
+
+    monkeypatch.setattr("nipact.execution._run_snakemake", fail_dry_run)
+
+    with pytest.raises(
+        ValidationError, match="Snakemake failed with exit code 1"
+    ) as excinfo:
+        execute_run_plan(run_plan, cores=1, dry_run=True)
+
+    assert str(run_plan.run_workspace / "logs" / "snakemake.log") in str(excinfo.value)
     with sqlite3.connect(runtime_dir / "database/registry.db") as conn:
         counts = {
             "published_outputs": conn.execute(
