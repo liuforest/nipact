@@ -913,8 +913,9 @@ def test_cross_target_dry_run_hydrates_reused_upstream_without_registry_update(
         context="cache",
         workflow_name="main",
         step_name="c_transform",
+        dry_run=True,
     )
-    assert execute_run_plan(c_plan, cores=1, dry_run=True).published_count == 0
+    assert execute_run_plan(c_plan, cores=1).published_count == 0
 
     assert (c_plan.run_workspace / "staging/b_transform/b_out/sub_001.json").is_file()
     assert not (c_plan.run_workspace / "staging/c_transform/c_out/sub_001.json").exists()
@@ -929,6 +930,87 @@ def test_cross_target_dry_run_hydrates_reused_upstream_without_registry_update(
             ).fetchone()[0],
         }
     assert counts_after == counts_before
+
+
+def test_dry_run_forecast_not_suppressed_by_completed_real_run(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project_dir, runtime_dir, _log_path = _write_cache_project(tmp_path, monkeypatch)
+    real_plan = build_run_plan(
+        project_dir=project_dir,
+        context="cache",
+        workflow_name="main",
+        step_name="c_transform",
+    )
+    assert execute_run_plan(real_plan, cores=1).published_count == len(
+        real_plan.published_outputs
+    )
+    staged_real_c = real_plan.selected_output_refs[0].staging_path
+    assert staged_real_c.is_file()
+
+    dry_plan = build_run_plan(
+        project_dir=project_dir,
+        context="cache",
+        workflow_name="main",
+        step_name="c_transform",
+        dry_run=True,
+    )
+    assert dry_plan.run_workspace == real_plan.run_workspace / "dry-run"
+
+    staged_seen: list[bool] = []
+
+    def record_staging(*_args: object, **_kwargs: object) -> int:
+        staged_seen.append(dry_plan.selected_output_refs[0].staging_path.exists())
+        return 0
+
+    monkeypatch.setattr("nipact.execution._run_snakemake", record_staging)
+    assert execute_run_plan(dry_plan, cores=1).published_count == 0
+
+    # The executable workspace still holds the completed run's staged output,
+    # but the isolated dry-run workspace does not, so Snakemake plans the
+    # fresh job instead of reporting nothing to do.
+    assert staged_seen == [False]
+    assert staged_real_c.is_file()
+
+
+def test_dry_run_leaves_executable_workspace_byte_identical(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project_dir, runtime_dir, _log_path = _write_cache_project(tmp_path, monkeypatch)
+    real_plan = build_run_plan(
+        project_dir=project_dir,
+        context="cache",
+        workflow_name="main",
+        step_name="c_transform",
+    )
+    assert execute_run_plan(real_plan, cores=1).published_count == len(
+        real_plan.published_outputs
+    )
+
+    def executable_snapshot() -> dict[str, str]:
+        # The isolated dry-run workspace nests under the executable one, so
+        # the executable snapshot is everything outside the dry-run subtree.
+        return {
+            str(path.relative_to(real_plan.run_workspace)): sha256_file_digest(path)
+            for path in sorted(real_plan.run_workspace.rglob("*"))
+            if path.is_file()
+            and "dry-run" not in path.relative_to(real_plan.run_workspace).parts
+        }
+
+    snapshot_before = executable_snapshot()
+
+    dry_plan = build_run_plan(
+        project_dir=project_dir,
+        context="cache",
+        workflow_name="main",
+        step_name="c_transform",
+        dry_run=True,
+    )
+    assert execute_run_plan(dry_plan, cores=1).published_count == 0
+
+    assert executable_snapshot() == snapshot_before
 
 
 @pytest.mark.parametrize("change", ["params", "callable", "extension"])
@@ -2577,13 +2659,14 @@ def test_targeted_dry_run_writes_no_outputs_and_no_registry_rows(
         workflow_name="main",
         step_name="b_transform",
         address="sub_001",
+        dry_run=True,
     )
-    outcome = execute_run_plan(run_plan, cores=1, dry_run=True)
+    outcome = execute_run_plan(run_plan, cores=1)
 
     assert outcome.published_count == 0
-    # The targeted workspace itself may be written (run plan, Snakefile).
+    # The targeted dry-run workspace itself may be written (run plan, Snakefile).
     assert run_plan.run_workspace == (
-        runtime_dir / "runs/cache/main/b_transform/addresses/sub_001"
+        runtime_dir / "runs/cache/main/b_transform/addresses/sub_001/dry-run"
     )
     assert (run_plan.run_workspace / "run_plan.json").is_file()
     assert not log_path.exists()
