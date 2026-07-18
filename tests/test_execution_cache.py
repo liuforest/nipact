@@ -8,8 +8,9 @@ import pytest
 import yaml
 
 import nipact.registry as registry_module
+from nipact.cli import main
 from nipact.errors import ValidationError
-from nipact.execution import build_run_plan, execute_run_plan
+from nipact.execution import RunOutcome, build_run_plan, execute_run_plan
 from nipact.hashing import sha256_file_digest
 from nipact.trace import build_trace_graph_for_workflow_coordinate
 
@@ -954,6 +955,168 @@ def test_cross_target_dry_run_maps_reused_upstream_without_copying(
         if path.is_file()
     }
     assert outputs_after == outputs_before
+
+
+def test_dry_run_cli_reports_reuse_without_hydration(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    project_dir, runtime_dir, log_path = _write_cache_project(tmp_path, monkeypatch)
+    b_plan = build_run_plan(
+        project_dir=project_dir,
+        context="cache",
+        workflow_name="main",
+        step_name="b_transform",
+    )
+    assert execute_run_plan(b_plan, cores=1).published_count == len(
+        b_plan.published_outputs
+    )
+    log_before = log_path.read_text(encoding="utf-8")
+    counts_before = _registry_row_counts(runtime_dir)
+    capsys.readouterr()
+
+    assert (
+        main(
+            [
+                "workflow",
+                "run",
+                "--project-dir",
+                str(project_dir),
+                "--context",
+                "cache",
+                "--workflow",
+                "main",
+                "--step",
+                "c_transform",
+                "--dry-run",
+            ]
+        )
+        == 0
+    )
+
+    captured = capsys.readouterr()
+    lines = captured.out.splitlines()
+    summary = dict(line.split("=", maxsplit=1) for line in lines if "=" in line)
+    assert summary["dry_run"] == "true"
+    # b is reused, so the forecast is the single fresh c job while the reuse
+    # counters report the reference without any hydration.
+    assert summary["planned_reachable_fresh_jobs"] == "1"
+    assert summary["planned_reused_registered_artifacts"] == "1"
+    assert summary["planned_reused_inputs"] == "1"
+    assert summary["planned_hydrated_inputs"] == "0"
+    assert "existing_staged_outputs" not in summary
+    assert "planned_hydration_bytes" not in summary
+    assert summary["note"].startswith("Dry run:")
+    assert summary["outputs_published"] == "false"
+    assert summary["registry"] == "not_updated"
+    assert "PASS: workflow run" in lines
+    # Real Snakemake built the DAG; nothing executed, staged, or recorded.
+    assert log_path.read_text(encoding="utf-8") == log_before
+    assert _registry_row_counts(runtime_dir) == counts_before
+    dry_workspace = runtime_dir / "runs/cache/main/c_transform/dry-run"
+    assert list((dry_workspace / "staging").rglob("*")) == []
+
+
+def test_real_run_cli_reports_planned_hydration_bytes_fanout_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    project_dir, runtime_dir, _log_path = _write_cache_project(
+        tmp_path,
+        monkeypatch,
+        entities=("sub_001", "sub_002"),
+    )
+    _write_sibling_workflow(
+        project_dir,
+        workflow_name="apply_flow",
+        step_names=["a_source", "b_transform", "fit_transform", "apply_transform"],
+    )
+    fit_plan = build_run_plan(
+        project_dir=project_dir,
+        context="cache",
+        workflow_name="apply_flow",
+        step_name="fit_transform",
+    )
+    assert execute_run_plan(fit_plan, cores=1).published_count == len(
+        fit_plan.published_outputs
+    )
+    # Expected bytes come from the published files themselves, independent of
+    # the plan's file_size bookkeeping the CLI sums.
+    expected_bytes = sum(
+        (runtime_dir / _latest_registered_path(
+            runtime_dir,
+            step_name=step_name,
+            output_name=output_name,
+            address=address,
+        )).stat().st_size
+        for step_name, output_name, address in (
+            ("b_transform", "b_out", "sub_001"),
+            ("b_transform", "b_out", "sub_002"),
+            ("fit_transform", "fit_out", "subjects"),
+        )
+    )
+
+    captured_plans = []
+
+    def publish_stub(run_plan: object, **_kwargs: object) -> RunOutcome:
+        captured_plans.append(run_plan)
+        return RunOutcome(
+            published_count=0,
+            failed_jobs=(),
+            all_selected_published=True,
+        )
+
+    monkeypatch.setattr("nipact.execution.execute_run_plan", publish_stub)
+    capsys.readouterr()
+
+    assert (
+        main(
+            [
+                "workflow",
+                "run",
+                "--project-dir",
+                str(project_dir),
+                "--context",
+                "cache",
+                "--workflow",
+                "apply_flow",
+                "--step",
+                "apply_transform",
+            ]
+        )
+        == 0
+    )
+
+    summary = dict(
+        line.split("=", maxsplit=1)
+        for line in capsys.readouterr().out.splitlines()
+        if "=" in line
+    )
+    (apply_plan,) = captured_plans
+    # The cohort fit fans out to both apply jobs but is one reused ref — one
+    # staged copy — so the aggregate counts its bytes once, not per consumer.
+    fit_ref = next(
+        ref for ref in apply_plan.reused_outputs if ref.step_name == "fit_transform"
+    )
+    fit_consumers = [
+        job
+        for job in apply_plan.jobs
+        if fit_ref.staging_path_relative
+        in [str(path) for paths in job.inputs.values() for path in paths]
+    ]
+    assert len(fit_consumers) == 2
+    assert len(apply_plan.reused_outputs) == 3
+    assert summary["dry_run"] == "false"
+    assert summary["planned_reachable_fresh_jobs"] == "2"
+    assert summary["planned_reused_registered_artifacts"] == "3"
+    assert summary["planned_reused_inputs"] == "3"
+    # Real execution hydrates everything it reuses: the two counters agree.
+    assert summary["planned_hydrated_inputs"] == "3"
+    assert summary["planned_hydration_bytes"] == str(expected_bytes)
+    assert summary["existing_staged_outputs"] == "0"
+    assert "can be hydrated" in summary["note"]
 
 
 def test_dry_run_maps_fresh_candidate_path_when_registered_path_moves(
@@ -3037,6 +3200,10 @@ def test_targeted_dry_run_maps_only_reachable_reused_inputs(
         runtime_dir / "runs/cache/main/c_transform/addresses/sub_001/dry-run"
     )
     assert _reused_keys(c_plan) == {("b_transform", "b_out", "sub_001")}
+    # The retained forecast count matches the Snakemake-verified closure: one
+    # fresh c job, while the compiled job set stays population-wide.
+    assert c_plan.reachable_job_count == 1
+    assert len(c_plan.jobs) > c_plan.reachable_job_count
     assert execute_run_plan(c_plan, cores=1).published_count == 0
 
     # Only the reachable closure's reused inputs are mapped: sub_002's reused
