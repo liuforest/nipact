@@ -310,8 +310,9 @@ def execute_run_plan(
 
     Snakemake runs with ``--keep-going``, so a single failed job no longer aborts
     the run: every job whose declared outputs all landed in staging is published
-    and recorded, the failures are skipped, and the survivors stay reusable. A run
-    that published nothing while Snakemake exited non-zero is the one hard error.
+    and recorded, the failures are skipped, and the survivors stay reusable. The
+    hard errors are a real run that published nothing while Snakemake exited
+    non-zero, and a dry run whose Snakemake invocation exited non-zero.
     """
     if cores <= 0:
         raise ValidationError("cores must be a positive integer")
@@ -324,6 +325,11 @@ def execute_run_plan(
     returncode = _run_snakemake(run_plan, cores=cores, dry_run=dry_run)
     _emit_status(status_callback, "snakemake_complete")
     if dry_run:
+        if returncode != 0:
+            log_path = run_plan.run_workspace / "logs" / "snakemake.log"
+            raise ValidationError(
+                f"Snakemake failed with exit code {returncode}; see {log_path}"
+            )
         return RunOutcome(
             published_count=0,
             failed_jobs=(),

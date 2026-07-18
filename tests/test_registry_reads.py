@@ -99,8 +99,9 @@ def _successful_sector_run(
         step_name="color_sector_analysis",
     )
 
-    def write_staged_outputs(*_args: object, **_kwargs: object) -> None:
+    def write_staged_outputs(*_args: object, **_kwargs: object) -> int:
         _write_all_staged_outputs(run_plan)
+        return 0
 
     monkeypatch.setattr("nipact.execution._run_snakemake", write_staged_outputs)
     assert execute_run_plan(run_plan, cores=1).published_count == len(run_plan.published_outputs)
