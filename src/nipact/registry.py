@@ -648,6 +648,13 @@ def record_workflow_run(
                 projection_recipes=projection_recipe_rows,
                 reused_projection_seeds=reused_projection_seed_rows,
             )
+            _validate_no_divergent_fresh_bundles(
+                conn,
+                context=context,
+                run_id=run_id,
+                artifact_rows=artifact_rows,
+                finalized_projections=finalized_projections,
+            )
             parameter_ids = {
                 (row.step_name, row.parameters_json): _upsert_parameter(
                     conn,
@@ -2006,6 +2013,92 @@ def _insert_workflow_output_artifacts(
             cursor.lastrowid
         )
     return artifact_ids
+
+
+def _validate_no_divergent_fresh_bundles(
+    conn: sqlite3.Connection,
+    *,
+    context: str,
+    run_id: int,
+    artifact_rows: tuple[WorkflowOutputArtifactRow, ...],
+    finalized_projections: dict[tuple[str, str], str],
+) -> None:
+    fresh_rows_by_job: dict[
+        tuple[str, str], dict[str, WorkflowOutputArtifactRow]
+    ] = {}
+    for row in artifact_rows:
+        job_key = (row.step_name, row.address)
+        fresh_outputs = fresh_rows_by_job.setdefault(job_key, {})
+        if row.output_name in fresh_outputs:
+            raise ValidationError("fresh deterministic bundle repeats a sibling output")
+        fresh_outputs[row.output_name] = row
+
+    for (step_name, address), fresh_outputs in sorted(fresh_rows_by_job.items()):
+        try:
+            projection_json = finalized_projections[(step_name, address)]
+        except KeyError as exc:
+            raise ValidationError(
+                "fresh deterministic bundle is missing its finalized projection"
+            ) from exc
+        fresh_output_names = set(fresh_outputs)
+        fresh_signature = tuple(
+            (output_name, fresh_outputs[output_name].content_digest)
+            for output_name in sorted(fresh_outputs)
+        )
+        historical_rows = conn.execute(
+            """
+            SELECT artifact_id, run_id, output_name, content_digest
+            FROM artifacts
+            WHERE origin = 'workflow_output'
+              AND is_published = 1
+              AND context = ?
+              AND step_name = ?
+              AND address = ?
+              AND identity_contract_version = ?
+              AND request_bundle_projection_json = ?
+            ORDER BY run_id, output_name, artifact_id
+            """,
+            (
+                context,
+                step_name,
+                address,
+                IDENTITY_CONTRACT_VERSION,
+                projection_json,
+            ),
+        ).fetchall()
+        historical_by_run: dict[int, dict[str, tuple[int, str]]] = {}
+        for historical_row in historical_rows:
+            historical_run_id = historical_row[1]
+            output_name = historical_row[2]
+            if historical_run_id is None or not isinstance(output_name, str):
+                raise ValidationError("registry deterministic bundle row is incomplete")
+            outputs = historical_by_run.setdefault(int(historical_run_id), {})
+            if output_name in outputs:
+                raise ValidationError(
+                    "registry deterministic bundle repeats a sibling output"
+                )
+            outputs[output_name] = (int(historical_row[0]), str(historical_row[3]))
+
+        for historical_run_id, historical_outputs in sorted(
+            historical_by_run.items()
+        ):
+            if set(historical_outputs) != fresh_output_names:
+                continue
+            historical_signature = tuple(
+                (output_name, historical_outputs[output_name][1])
+                for output_name in sorted(historical_outputs)
+            )
+            if historical_signature == fresh_signature:
+                continue
+            historical_artifact_ids = tuple(
+                historical_outputs[output_name][0]
+                for output_name in sorted(historical_outputs)
+            )
+            raise ValidationError(
+                "deterministic request bundle produced divergent content: "
+                f"new run {run_id} conflicts with historical run "
+                f"{historical_run_id}, artifacts {historical_artifact_ids}"
+            )
 
 
 def _finalize_retained_job_projections(

@@ -3306,6 +3306,11 @@ def test_targeted_rerun_with_identical_bytes_revalidates_published_file(
         address="sub_001",
     )
     digest_before = sha256_file_digest(runtime_dir / row_before[1])
+    with sqlite3.connect(runtime_dir / "database/registry.db") as conn:
+        projection_before = conn.execute(
+            "SELECT request_bundle_projection_json FROM artifacts WHERE artifact_id = ?",
+            (row_before[0],),
+        ).fetchone()[0]
 
     # Unchanged inputs: the forced-fresh selected job recomputes identical
     # bytes, so publication validates the existing content-addressed file.
@@ -3330,6 +3335,379 @@ def test_targeted_rerun_with_identical_bytes_revalidates_published_file(
     assert sha256_file_digest(runtime_dir / row_after[1]) == digest_before
     with sqlite3.connect(runtime_dir / "database/registry.db") as conn:
         assert conn.execute("SELECT COUNT(*) FROM workflow_runs").fetchone()[0] == 2
+        projection_after, current_run_id = conn.execute(
+            """
+            SELECT a.request_bundle_projection_json, wr.run_id
+            FROM artifacts AS a
+            JOIN workflow_runs AS wr ON wr.run_id = a.run_id
+            WHERE a.artifact_id = ? AND wr.is_current = 1
+            """,
+            (row_after[0],),
+        ).fetchone()
+    assert projection_after == projection_before
+    assert current_run_id == _artifact_run_id(
+        runtime_dir,
+        artifact_id=row_after[0],
+    )
+
+
+def test_targeted_rerun_rejects_divergent_deterministic_output_and_rolls_back(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project_dir, runtime_dir, _log_path = _write_cache_project(
+        tmp_path,
+        monkeypatch,
+        entities=("sub_001",),
+    )
+    first_plan = build_run_plan(
+        project_dir=project_dir,
+        context="cache",
+        workflow_name="main",
+        step_name="b_transform",
+        address="sub_001",
+    )
+    assert execute_run_plan(first_plan, cores=1).all_selected_published
+
+    row_before = _published_output_row(
+        runtime_dir,
+        step_name="b_transform",
+        output_name="b_out",
+        address="sub_001",
+    )
+    historical_run_id = _artifact_run_id(runtime_dir, artifact_id=row_before[0])
+    historical_path = runtime_dir / row_before[1]
+    historical_bytes = historical_path.read_bytes()
+    output_dir = historical_path.parent
+    files_before = sorted(path.name for path in output_dir.glob("*.json"))
+    with sqlite3.connect(runtime_dir / "database/registry.db") as conn:
+        counts_before = {
+            "runs": conn.execute("SELECT COUNT(*) FROM workflow_runs").fetchone()[0],
+            "artifacts": conn.execute(
+                "SELECT COUNT(*) FROM artifacts"
+            ).fetchone()[0],
+            "dependencies": conn.execute(
+                "SELECT COUNT(*) FROM artifact_dependencies"
+            ).fetchone()[0],
+            "memberships": conn.execute(
+                "SELECT COUNT(*) FROM published_outputs"
+            ).fetchone()[0],
+        }
+        current_run_before = conn.execute(
+            "SELECT run_id FROM workflow_runs WHERE is_current = 1"
+        ).fetchone()[0]
+
+    rerun_plan = build_run_plan(
+        project_dir=project_dir,
+        context="cache",
+        workflow_name="main",
+        step_name="b_transform",
+        address="sub_001",
+    )
+
+    def write_divergent_output(
+        _run_plan: object,
+        *,
+        cores: int,
+        dry_run: bool,
+    ) -> int:
+        output = next(
+            job.outputs["b_out"]
+            for job in rerun_plan.jobs
+            if job.step_name == "b_transform"
+        )
+        output.staging_path.parent.mkdir(parents=True, exist_ok=True)
+        output.staging_path.write_text(
+            json.dumps({"address": "sub_001", "value": "divergent"}) + "\n",
+            encoding="utf-8",
+        )
+        (rerun_plan.run_workspace / "logs/snakemake.log").write_text(
+            "synthetic completed run\n",
+            encoding="utf-8",
+        )
+        return 0
+
+    monkeypatch.setattr("nipact.execution._run_snakemake", write_divergent_output)
+    with pytest.raises(
+        ValidationError,
+        match=(
+            rf"new run \d+ conflicts with historical run {historical_run_id}, "
+            rf"artifacts \({row_before[0]},\)"
+        ),
+    ):
+        execute_run_plan(rerun_plan, cores=1)
+
+    assert sorted(path.name for path in output_dir.glob("*.json")) == files_before
+    assert historical_path.read_bytes() == historical_bytes
+    divergent_staging = next(
+        job.outputs["b_out"].staging_path
+        for job in rerun_plan.jobs
+        if job.step_name == "b_transform"
+    )
+    assert divergent_staging.is_file()
+    assert divergent_staging.read_bytes() != historical_bytes
+    assert (rerun_plan.run_workspace / "run_plan.json").is_file()
+    assert (rerun_plan.run_workspace / "Snakefile").is_file()
+    assert (rerun_plan.run_workspace / "logs/snakemake.log").is_file()
+    with sqlite3.connect(runtime_dir / "database/registry.db") as conn:
+        assert {
+            "runs": conn.execute("SELECT COUNT(*) FROM workflow_runs").fetchone()[0],
+            "artifacts": conn.execute(
+                "SELECT COUNT(*) FROM artifacts"
+            ).fetchone()[0],
+            "dependencies": conn.execute(
+                "SELECT COUNT(*) FROM artifact_dependencies"
+            ).fetchone()[0],
+            "memberships": conn.execute(
+                "SELECT COUNT(*) FROM published_outputs"
+            ).fetchone()[0],
+        } == counts_before
+        assert conn.execute(
+            "SELECT run_id FROM workflow_runs WHERE is_current = 1"
+        ).fetchone()[0] == current_run_before
+    assert (
+        _published_output_row(
+            runtime_dir,
+            step_name="b_transform",
+            output_name="b_out",
+            address="sub_001",
+        )
+        == row_before
+    )
+
+
+def test_targeted_multi_output_rerun_rejects_one_divergent_sibling_atomically(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project_dir, runtime_dir, _log_path = _write_cache_project(
+        tmp_path,
+        monkeypatch,
+        entities=("sub_001",),
+    )
+    first_plan = build_run_plan(
+        project_dir=project_dir,
+        context="cache",
+        workflow_name="main",
+        step_name="multi_transform",
+        address="sub_001",
+    )
+    assert execute_run_plan(first_plan, cores=1).all_selected_published
+
+    rows_before = {
+        output_name: _published_output_row(
+            runtime_dir,
+            step_name="multi_transform",
+            output_name=output_name,
+            address="sub_001",
+        )
+        for output_name in ("left_out", "right_out")
+    }
+    files_before = {
+        output_name: (runtime_dir / row[1]).read_bytes()
+        for output_name, row in rows_before.items()
+    }
+    directory_entries_before = {
+        path.relative_to(runtime_dir).as_posix()
+        for output_name in rows_before
+        for path in (runtime_dir / rows_before[output_name][1]).parent.glob("*.json")
+    }
+    counts_before = _registry_row_counts(runtime_dir)
+
+    rerun_plan = build_run_plan(
+        project_dir=project_dir,
+        context="cache",
+        workflow_name="main",
+        step_name="multi_transform",
+        address="sub_001",
+    )
+
+    def write_one_divergent_sibling(
+        _run_plan: object,
+        *,
+        cores: int,
+        dry_run: bool,
+    ) -> int:
+        job = next(
+            job for job in rerun_plan.jobs if job.step_name == "multi_transform"
+        )
+        left = job.outputs["left_out"].staging_path
+        right = job.outputs["right_out"].staging_path
+        left.parent.mkdir(parents=True, exist_ok=True)
+        right.parent.mkdir(parents=True, exist_ok=True)
+        left.write_bytes(files_before["left_out"])
+        right.write_text(
+            json.dumps(
+                {"address": "sub_001", "side": "right", "value": "divergent"}
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        return 0
+
+    monkeypatch.setattr(
+        "nipact.execution._run_snakemake",
+        write_one_divergent_sibling,
+    )
+    with pytest.raises(
+        ValidationError,
+        match="deterministic request bundle produced divergent content",
+    ):
+        execute_run_plan(rerun_plan, cores=1)
+
+    assert _registry_row_counts(runtime_dir) == counts_before
+    assert {
+        path.relative_to(runtime_dir).as_posix()
+        for output_name in rows_before
+        for path in (runtime_dir / rows_before[output_name][1]).parent.glob("*.json")
+    } == directory_entries_before
+    for output_name, row in rows_before.items():
+        assert (runtime_dir / row[1]).read_bytes() == files_before[output_name]
+        assert (
+            _published_output_row(
+                runtime_dir,
+                step_name="multi_transform",
+                output_name=output_name,
+                address="sub_001",
+            )
+            == row
+        )
+
+
+def test_incomplete_historical_bundle_does_not_block_fresh_registration(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project_dir, runtime_dir, _log_path = _write_cache_project(
+        tmp_path,
+        monkeypatch,
+        entities=("sub_001",),
+    )
+    first_plan = build_run_plan(
+        project_dir=project_dir,
+        context="cache",
+        workflow_name="main",
+        step_name="multi_transform",
+        address="sub_001",
+    )
+    assert execute_run_plan(first_plan, cores=1).all_selected_published
+
+    with sqlite3.connect(runtime_dir / "database/registry.db") as conn:
+        conn.execute(
+            """
+            UPDATE artifacts
+            SET content_digest = ?, output_hash = ?
+            WHERE context = 'cache'
+              AND step_name = 'multi_transform'
+              AND output_name = 'left_out'
+              AND address = 'sub_001'
+            """,
+            ("f" * 64, "f" * 16),
+        )
+        conn.execute(
+            """
+            UPDATE artifacts
+            SET is_published = 0
+            WHERE context = 'cache'
+              AND step_name = 'multi_transform'
+              AND output_name = 'right_out'
+              AND address = 'sub_001'
+            """
+        )
+
+    rerun_plan = build_run_plan(
+        project_dir=project_dir,
+        context="cache",
+        workflow_name="main",
+        step_name="multi_transform",
+        address="sub_001",
+    )
+    assert execute_run_plan(rerun_plan, cores=1).all_selected_published
+    with sqlite3.connect(runtime_dir / "database/registry.db") as conn:
+        rows = conn.execute(
+            """
+            SELECT output_name, content_digest
+            FROM artifacts
+            WHERE run_id = (SELECT MAX(run_id) FROM workflow_runs)
+              AND step_name = 'multi_transform'
+              AND address = 'sub_001'
+            ORDER BY output_name
+            """
+        ).fetchall()
+    assert [str(row[0]) for row in rows] == ["left_out", "right_out"]
+    assert all(str(row[1]) != "f" * 64 for row in rows)
+
+
+def test_recorded_divergence_precedes_missing_file_and_reports_first_run(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project_dir, runtime_dir, _log_path = _write_cache_project(
+        tmp_path,
+        monkeypatch,
+        entities=("sub_001",),
+    )
+    first_plan = build_run_plan(
+        project_dir=project_dir,
+        context="cache",
+        workflow_name="main",
+        step_name="b_transform",
+        address="sub_001",
+    )
+    assert execute_run_plan(first_plan, cores=1).all_selected_published
+    second_plan = build_run_plan(
+        project_dir=project_dir,
+        context="cache",
+        workflow_name="main",
+        step_name="b_transform",
+        address="sub_001",
+    )
+    assert execute_run_plan(second_plan, cores=1).all_selected_published
+    shared_path = runtime_dir / _published_output_row(
+        runtime_dir,
+        step_name="b_transform",
+        output_name="b_out",
+        address="sub_001",
+    )[1]
+    with sqlite3.connect(runtime_dir / "database/registry.db") as conn:
+        historical = conn.execute(
+            """
+            SELECT artifact_id, run_id
+            FROM artifacts
+            WHERE context = 'cache'
+              AND step_name = 'b_transform'
+              AND output_name = 'b_out'
+              AND address = 'sub_001'
+            ORDER BY run_id
+            """
+        ).fetchall()
+        assert len(historical) == 2
+        for row, digest in zip(historical, ("1" * 64, "2" * 64), strict=True):
+            conn.execute(
+                """
+                UPDATE artifacts
+                SET content_digest = ?, output_hash = ?
+                WHERE artifact_id = ?
+                """,
+                (digest, digest[:16], int(row[0])),
+            )
+    shared_path.unlink()
+    rerun_plan = build_run_plan(
+        project_dir=project_dir,
+        context="cache",
+        workflow_name="main",
+        step_name="b_transform",
+        address="sub_001",
+    )
+    with pytest.raises(
+        ValidationError,
+        match=(
+            rf"new run \d+ conflicts with historical run {int(historical[0][1])}, "
+            rf"artifacts \({int(historical[0][0])},\)"
+        ),
+    ):
+        execute_run_plan(rerun_plan, cores=1)
+    assert not shared_path.exists()
 
 
 def test_failed_targeted_rerun_preserves_prior_published_coordinate(
