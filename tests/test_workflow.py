@@ -87,6 +87,7 @@ def test_generated_colors_demo_workflow_files_load(tmp_path: Path) -> None:
         "color_sector_analysis",
     }
     assert loaded.steps["color_source"].source_inputs == ("colors_source",)
+    assert loaded.steps["color_source"].step_contract_version == "1"
     assert set(loaded.workflows) == {"base", "red-qc-target"}
     expected_step_order = (
         "color_source",
@@ -117,6 +118,43 @@ def test_generated_colors_demo_workflow_files_load(tmp_path: Path) -> None:
     assert variant.step_overrides["color_candidate_select"].params == {
         "qc_target_theta": 0.0
     }
+
+
+def test_step_contract_version_is_loaded_and_compiled(tmp_path: Path) -> None:
+    project_dir, _runtime_dir = _init_demo(tmp_path)
+    step_path = project_dir / "steps/color_source.yaml"
+    payload = _read_yaml(step_path)
+    payload["step_contract_version"] = "source-v2"
+    _write_yaml(step_path, payload)
+
+    loaded = _load(project_dir)
+    plan = compile_workflow_plan(
+        loaded,
+        workflow_name="base",
+        step_name="color_local_transform",
+    )
+
+    assert loaded.steps["color_source"].step_contract_version == "source-v2"
+    assert plan.steps[0].step_contract_version == "source-v2"
+    assert plan.steps[1].step_contract_version == "1"
+
+
+@pytest.mark.parametrize("value", [1, True, ""])
+def test_loader_rejects_invalid_step_contract_version(
+    tmp_path: Path,
+    value: object,
+) -> None:
+    project_dir, _runtime_dir = _init_demo(tmp_path)
+    step_path = project_dir / "steps/color_source.yaml"
+    payload = _read_yaml(step_path)
+    payload["step_contract_version"] = value
+    _write_yaml(step_path, payload)
+
+    with pytest.raises(
+        ValidationError,
+        match="step color_source step_contract_version must be a non-empty string",
+    ):
+        _load(project_dir)
 
 
 def test_loader_rejects_missing_workflow_file(tmp_path: Path) -> None:

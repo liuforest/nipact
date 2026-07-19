@@ -22,6 +22,7 @@ STEP_FIELDS = frozenset(
         "execution_role",
         "address_scope",
         "callable",
+        "step_contract_version",
         "inputs",
         "source_inputs",
         "params",
@@ -105,6 +106,7 @@ class StepDefinition:
     execution_role: str
     address_scope: str
     callable_ref: str
+    step_contract_version: str
     inputs: dict[str, StepInput]
     source_inputs: tuple[str, ...]
     params: dict[str, Any]
@@ -164,6 +166,7 @@ class WorkflowPlanStep:
     execution_role: str
     address_scope: str
     callable_ref: str
+    step_contract_version: str
     inputs: dict[str, StepInput]
     source_inputs: tuple[str, ...]
     params: dict[str, Any]
@@ -288,6 +291,7 @@ def compile_workflow_plan(
                 execution_role=step.execution_role,
                 address_scope=step.address_scope,
                 callable_ref=step.callable_ref,
+                step_contract_version=step.step_contract_version,
                 inputs=dict(step.inputs),
                 source_inputs=step.source_inputs,
                 params=params,
@@ -1032,6 +1036,11 @@ def _load_step(path: Path, *, manifest_names: set[str]) -> StepDefinition:
     )
     callable_ref = _required_string(payload, "callable", f"step {step_name} callable")
     _validate_callable(callable_ref, label=f"step {step_name} callable")
+    step_contract_version = payload.get("step_contract_version", "1")
+    if not isinstance(step_contract_version, str) or not step_contract_version:
+        raise ValidationError(
+            f"step {step_name} step_contract_version must be a non-empty string"
+        )
     pattern_kind = _allowed_value(
         _required_string(payload, "pattern_kind", f"step {step_name} pattern_kind"),
         allowed=PATTERN_KINDS,
@@ -1069,6 +1078,7 @@ def _load_step(path: Path, *, manifest_names: set[str]) -> StepDefinition:
         execution_role=execution_role,
         address_scope=address_scope,
         callable_ref=callable_ref,
+        step_contract_version=step_contract_version,
         inputs=inputs,
         source_inputs=source_inputs,
         params=params,
