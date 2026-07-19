@@ -12,6 +12,9 @@ from nipact.errors import ValidationError
 from nipact.execution import build_run_plan, execute_run_plan
 from nipact.projection import RegisteredSourceSnapshot, SourceCoordinate
 from nipact.registry import (
+    MembershipIntent,
+    PublishedOutputRow,
+    SelectedOutputResolutionIntent,
     REGISTRY_DB_PATH,
     _open_registry_read_session,
     list_artifact_group_counts,
@@ -124,6 +127,8 @@ def test_registry_reads_initialized_source_artifact(
     assert source.origin == "source"
     assert source.path == "data/color_source.json"
     assert source.run_id is None
+    assert source.identity_contract_version is None
+    assert source.request_bundle_projection_json is None
     assert source.source_metadata is not None
     assert source.source_metadata["entity_count"] == 200
     assert read_artifact_by_id(registry_path, source.artifact_id) == source
@@ -195,6 +200,48 @@ def test_registry_reads_source_snapshots_without_reading_live_bytes(
     ) == {}
 
 
+def test_connection_local_source_snapshot_sees_uncommitted_upsert(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _project_dir, runtime_dir = _init_demo(tmp_path, capsys)
+    registry_path = runtime_dir / REGISTRY_DB_PATH
+    with sqlite3.connect(registry_path) as conn:
+        conn.execute("BEGIN")
+        conn.execute(
+            """
+            INSERT INTO artifacts (
+                origin, context, path, content_digest, output_hash, file_size,
+                extension, created_at
+            )
+            VALUES ('source', ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "colors",
+                "data/uncommitted.json",
+                "d" * 64,
+                "d" * 16,
+                17,
+                ".json",
+                "2026-07-19T00:00:00+00:00",
+            ),
+        )
+
+        snapshots = registry._read_registered_source_snapshots_conn(
+            conn,
+            context="colors",
+        )
+        conn.rollback()
+
+    assert snapshots[SourceCoordinate("colors", "data/uncommitted.json")] == (
+        RegisteredSourceSnapshot(
+            content_digest="d" * 64,
+            file_size=17,
+            declared_extension=".json",
+        )
+    )
+
+
 def test_registry_manifest_helpers_and_summary(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
@@ -239,10 +286,11 @@ def test_registry_path_lookup_rejects_duplicate_rows(
                 INSERT INTO artifacts (
                     origin, context, workflow_name, step_name, output_name,
                     address, job_id, path, content_digest, output_hash,
-                    file_size, extension, created_at
+                    file_size, extension, identity_contract_version,
+                    request_bundle_projection_json, created_at
                 )
                 VALUES (
-                    'workflow_output', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                    'workflow_output', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?
                 )
                 """,
                 (
@@ -257,6 +305,34 @@ def test_registry_path_lookup_rejects_duplicate_rows(
                     str(index) * 16,
                     index,
                     ".json",
+                    json.dumps(
+                        {
+                            "address": "init",
+                            "canonical_parameters": {},
+                            "determinism_contract": "deterministic",
+                            "identity_contract_version": 1,
+                            "namespace": "colors",
+                            "output_contract": {
+                                "output_contract_version": 1,
+                                "sibling_outputs": [
+                                    {
+                                        "declared_extension": ".json",
+                                        "output_name": "output",
+                                    }
+                                ],
+                            },
+                            "result_affecting_settings": {},
+                            "role_labelled_bindings": [],
+                            "step_contract": {
+                                "callable_ref": "tests:manual",
+                                "runner_contract_version": "1",
+                                "step_contract_id": f"manual_step_{index}",
+                                "step_contract_version": "1",
+                            },
+                        },
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ),
                     "2026-06-03T00:00:00+00:00",
                 ),
             )
@@ -295,6 +371,11 @@ def test_registry_reads_workflow_output_and_neighbors(
     assert selected.run_id is not None
     assert selected.parameter_hash is not None
     assert selected.parameters_json is not None
+    assert selected.identity_contract_version == 1
+    assert selected.request_bundle_projection_json is not None
+    assert json.loads(selected.request_bundle_projection_json)[
+        "identity_contract_version"
+    ] == 1
     assert set(json.loads(selected.parameters_json)) == {"arc_half_width", "min_radius"}
     assert read_artifact_by_id(registry_path, selected.artifact_id) == selected
     assert (
@@ -359,6 +440,102 @@ def test_registry_reads_workflow_output_and_neighbors(
     assert {edge.binding_name for edge in upstream_edges} == {"sector_label"}
     assert len(manifest_bindings) == len(run_plan.manifest_bindings)
     assert {binding.context for binding in manifest_bindings} == {"colors"}
+
+
+def test_membership_intent_can_reference_one_existing_artifact_more_than_once(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _project_dir, runtime_dir, _run_plan = _successful_sector_run(
+        tmp_path,
+        capsys,
+        monkeypatch,
+    )
+    registry_path = runtime_dir / REGISTRY_DB_PATH
+    with sqlite3.connect(registry_path) as conn:
+        conn.execute("PRAGMA foreign_keys = ON")
+        artifact_id, path, digest, output_hash = conn.execute(
+            """
+            SELECT artifact_id, path, content_digest, output_hash
+            FROM artifacts
+            WHERE step_name = 'color_sector_analysis'
+              AND output_name = 'sector_counts'
+              AND address = 'init'
+            """
+        ).fetchone()
+        registry._insert_memberships(
+            conn,
+            intents=(
+                MembershipIntent(
+                    row=PublishedOutputRow(
+                        context="colors",
+                        workflow_name="derived",
+                        step_name="color_sector_analysis",
+                        output_name="sector_counts",
+                        address="init",
+                        path=path,
+                        output_digest=digest,
+                        output_hash=output_hash,
+                    ),
+                    existing_artifact_id=artifact_id,
+                ),
+            ),
+            artifact_ids={},
+        )
+        assert conn.execute(
+            "SELECT COUNT(*) FROM published_outputs WHERE artifact_id = ?",
+            (artifact_id,),
+        ).fetchone()[0] == 2
+        reused_summary = json.loads(
+            registry._resolution_summary_json(
+                (
+                    SelectedOutputResolutionIntent(
+                        context="colors",
+                        workflow_name="derived",
+                        step_name="color_sector_analysis",
+                        output_name="sector_counts",
+                        address="init",
+                        outcome="reused",
+                        existing_artifact_id=artifact_id,
+                    ),
+                ),
+                artifact_ids={},
+                conn=conn,
+            )
+        )
+        assert reused_summary["selected_outputs"][0]["resolution"] == {
+            "artifact_id": artifact_id,
+            "outcome": "reused",
+        }
+        with pytest.raises(
+            sqlite3.IntegrityError,
+            match="FOREIGN KEY constraint failed",
+        ):
+            conn.execute(
+                """
+                INSERT INTO published_outputs (
+                    context, workflow_name, step_name, output_name, address,
+                    path, output_digest, output_hash, artifact_id
+                )
+                VALUES ('colors', 'bad', 'step', 'output', 'init', ?, ?, ?, ?)
+                """,
+                (path, digest, output_hash, artifact_id + 10000),
+            )
+        with pytest.raises(
+            sqlite3.IntegrityError,
+            match="NOT NULL constraint failed",
+        ):
+            conn.execute(
+                """
+                INSERT INTO published_outputs (
+                    context, workflow_name, step_name, output_name, address,
+                    path, output_digest, output_hash, artifact_id
+                )
+                VALUES ('colors', 'null', 'step', 'output', 'init', ?, ?, ?, NULL)
+                """,
+                (path, digest, output_hash),
+            )
 
 
 def test_list_artifact_group_counts_matches_list_artifacts(
@@ -482,7 +659,7 @@ def test_registry_reads_reject_unknown_ids_runs_and_schema(
     (incompatible_runtime / "database").mkdir(parents=True)
     incompatible_path = incompatible_runtime / REGISTRY_DB_PATH
     with sqlite3.connect(incompatible_path) as conn:
-        conn.execute("PRAGMA user_version = 1")
+        conn.execute("PRAGMA user_version = 14")
 
     with pytest.raises(ValidationError, match="schema version is incompatible"):
         read_published_outputs(
@@ -664,7 +841,7 @@ def test_read_session_rejects_incompatible_schema(tmp_path: Path) -> None:
     (incompatible_runtime / "database").mkdir(parents=True)
     incompatible_path = incompatible_runtime / REGISTRY_DB_PATH
     with sqlite3.connect(incompatible_path) as conn:
-        conn.execute("PRAGMA user_version = 1")
+        conn.execute("PRAGMA user_version = 14")
 
     with pytest.raises(ValidationError, match="schema version is incompatible"):
         with _open_registry_read_session(incompatible_path):
