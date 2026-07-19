@@ -2353,6 +2353,29 @@ def test_sibling_does_not_reuse_when_source_data_differs(
     assert execute_run_plan(main_b_plan, cores=1).published_count == len(
         main_b_plan.published_outputs
     )
+    main_a_alpha_id = _workflow_artifact_id(
+        runtime_dir,
+        workflow_name="main",
+        step_name="a_source",
+        output_name="a_out",
+        address="sub_001",
+    )
+    with sqlite3.connect(runtime_dir / "database/registry.db") as conn:
+        alpha_edge_snapshot = conn.execute(
+            """
+            SELECT source_content_digest, source_file_size, source_extension
+            FROM artifact_dependencies
+            WHERE dependent_artifact_id = ?
+            """,
+            (main_a_alpha_id,),
+        ).fetchone()
+        alpha_source_digest = conn.execute(
+            """
+            SELECT content_digest
+            FROM artifacts
+            WHERE origin = 'source' AND path = 'data/source/sub_001.txt'
+            """
+        ).fetchone()[0]
 
     # Re-import: new bytes on the same path, then run the source step so the registry
     # source row is re-hashed to the new digest. main's published b is now stale.
@@ -2366,6 +2389,22 @@ def test_sibling_does_not_reuse_when_source_data_differs(
     assert execute_run_plan(main_a_plan, cores=1).published_count == len(
         main_a_plan.published_outputs
     )
+    with sqlite3.connect(runtime_dir / "database/registry.db") as conn:
+        assert conn.execute(
+            """
+            SELECT source_content_digest, source_file_size, source_extension
+            FROM artifact_dependencies
+            WHERE dependent_artifact_id = ?
+            """,
+            (main_a_alpha_id,),
+        ).fetchone() == alpha_edge_snapshot
+        assert conn.execute(
+            """
+            SELECT content_digest
+            FROM artifacts
+            WHERE origin = 'source' AND path = 'data/source/sub_001.txt'
+            """
+        ).fetchone()[0] != alpha_source_digest
     main_a_omega_id = _workflow_artifact_id(
         runtime_dir,
         workflow_name="main",

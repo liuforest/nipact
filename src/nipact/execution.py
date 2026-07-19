@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+from importlib import metadata
 import os
+import platform
 import shlex
 import shutil
 import subprocess
@@ -12,6 +14,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
+from ._version import __version__
 from .artifacts import output_filename
 from .errors import ValidationError
 from .hashing import sha256_file_digest, short_hash
@@ -35,11 +38,16 @@ from .projection import (
 )
 from .registry import (
     ArtifactInputRow,
+    EnvironmentObservationV1,
+    MembershipIntent,
     PublishedOutputRow,
     REGISTRY_DB_PATH,
+    RetainedJobProjectionRecipe,
     ReusableArtifactCandidate,
     ReusableArtifactRequest,
+    ReusedProjectionSeed,
     RunManifestBindingRow,
+    SelectedOutputResolutionIntent,
     WorkflowOutputArtifactRow,
     record_workflow_run,
     read_registered_source_snapshots,
@@ -404,6 +412,18 @@ def execute_run_plan(
             run_plan,
             published_rows=published_rows,
         )
+        projection_recipes = _retained_projection_recipes(
+            run_plan,
+            published_rows=published_rows,
+        )
+        reused_projection_seeds = _reused_projection_seeds(
+            run_plan,
+            artifact_rows=artifact_rows,
+        )
+        selected_resolution_intents = _selected_resolution_intents(
+            run_plan,
+            published_rows=published_rows,
+        )
         published_count = record_workflow_run(
             run_plan.runtime_root / REGISTRY_DB_PATH,
             runtime_root=run_plan.runtime_root,
@@ -419,8 +439,14 @@ def execute_run_plan(
             ),
             run_plan_digest=sha256_file_digest(run_plan.run_workspace / "run_plan.json"),
             artifacts=artifact_rows,
+            projection_recipes=projection_recipes,
+            reused_projection_seeds=reused_projection_seeds,
+            selected_resolution_intents=selected_resolution_intents,
+            environment_observation=_environment_observation(),
             manifest_bindings=_run_manifest_binding_rows(run_plan),
-            published_outputs=published_rows,
+            membership_intents=tuple(
+                MembershipIntent(row=row) for row in published_rows
+            ),
             allowed_reused_workflow_names=run_plan.reuse_workflow_names,
         )
         _emit_status(status_callback, "registry_updated")
@@ -987,6 +1013,108 @@ def _workflow_output_artifact_rows(
                 )
             )
     return tuple(rows)
+
+
+def _retained_projection_recipes(
+    run_plan: RunPlan,
+    *,
+    published_rows: tuple[PublishedOutputRow, ...],
+) -> tuple[RetainedJobProjectionRecipe, ...]:
+    published_jobs = {(row.step_name, row.address) for row in published_rows}
+    reachable_job_ids = _reachable_job_ids(run_plan)
+    return tuple(
+        RetainedJobProjectionRecipe(
+            step_name=job.step_name,
+            address=job.address,
+            output_names=tuple(job.outputs),
+            projection_plan=job.projection_plan,
+        )
+        for job in run_plan.jobs
+        if job.job_id in reachable_job_ids
+        and (job.step_name, job.address) in published_jobs
+    )
+
+
+def _reused_projection_seeds(
+    run_plan: RunPlan,
+    *,
+    artifact_rows: tuple[WorkflowOutputArtifactRow, ...],
+) -> tuple[ReusedProjectionSeed, ...]:
+    required_coordinates = {
+        RequestedOutputCoordinate(
+            namespace=run_plan.context,
+            step_name=record.source_step_name,
+            output_name=record.source_output_name,
+            address=record.source_address,
+        )
+        for artifact_row in artifact_rows
+        for record in artifact_row.input_records
+        if record.origin == "workflow_output"
+        and record.registry_source_artifact_id is not None
+        and record.source_step_name is not None
+        and record.source_output_name is not None
+        and record.source_address is not None
+    }
+    seeds: list[ReusedProjectionSeed] = []
+    for output_ref in run_plan.reused_outputs:
+        requested_output = RequestedOutputCoordinate(
+            namespace=run_plan.context,
+            step_name=output_ref.step_name,
+            output_name=output_ref.output_name,
+            address=output_ref.address,
+        )
+        if requested_output not in required_coordinates:
+            continue
+        if not isinstance(output_ref.projection_state, RequestBundleProjectionV1):
+            raise ValidationError("reused output has an unresolved request projection")
+        seeds.append(
+            ReusedProjectionSeed(
+                requested_output=requested_output,
+                projection=output_ref.projection_state,
+            )
+        )
+    if {seed.requested_output for seed in seeds} != required_coordinates:
+        raise ValidationError("retained closure is missing a reused projection seed")
+    return tuple(seeds)
+
+
+def _selected_resolution_intents(
+    run_plan: RunPlan,
+    *,
+    published_rows: tuple[PublishedOutputRow, ...],
+) -> tuple[SelectedOutputResolutionIntent, ...]:
+    published_keys = {
+        (row.step_name, row.output_name, row.address) for row in published_rows
+    }
+    return tuple(
+        SelectedOutputResolutionIntent(
+            context=run_plan.context,
+            workflow_name=run_plan.workflow_name,
+            step_name=output_ref.step_name,
+            output_name=output_ref.output_name,
+            address=output_ref.address,
+            outcome=(
+                "generated"
+                if (
+                    output_ref.step_name,
+                    output_ref.output_name,
+                    output_ref.address,
+                )
+                in published_keys
+                else None
+            ),
+        )
+        for output_ref in run_plan.selected_output_refs
+    )
+
+
+def _environment_observation() -> EnvironmentObservationV1:
+    return EnvironmentObservationV1(
+        nipact_version=__version__,
+        python_version=platform.python_version(),
+        platform=platform.platform(),
+        snakemake_version=metadata.version("snakemake"),
+    )
 
 
 def _reachable_job_ids(run_plan: RunPlan) -> set[str]:

@@ -254,13 +254,119 @@ def _insert_published_output(
     staging_path.rename(output_path)
     relative_path = output_path.relative_to(runtime_dir).as_posix()
     with sqlite3.connect(runtime_dir / "database/registry.db") as conn:
+        conn.execute("PRAGMA foreign_keys = ON")
+        run_id = int(
+            conn.execute(
+                """
+                INSERT INTO workflow_runs (
+                    context, workflow_name, selected_step_name,
+                    selected_output_name, run_workspace, run_plan_path,
+                    run_plan_digest, resolution_summary_json,
+                    environment_observation_json, created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    "colors",
+                    workflow_name,
+                    step_name,
+                    output_name,
+                    "runs/colors/manual",
+                    "runs/colors/manual/run_plan.json",
+                    "a" * 64,
+                    '{"all_selected_resolved":true,"forced":false,"schema_version":1,"selected_outputs":[]}',
+                    '{"nipact_version":"test","platform":"test","profile_version":1,"python_version":"test","snakemake_version":"test"}',
+                    "2026-07-19T00:00:00+00:00",
+                ),
+            ).lastrowid
+        )
+        parameter_id = int(
+            conn.execute(
+                """
+                INSERT INTO parameters (
+                    hash_version, parameter_hash, parameter_digest, step_name,
+                    parameters_json, created_at
+                )
+                VALUES (1, ?, ?, ?, '{}', ?)
+                """,
+                (
+                    "b" * 16,
+                    "b" * 64,
+                    step_name,
+                    "2026-07-19T00:00:00+00:00",
+                ),
+            ).lastrowid
+        )
+        projection_json = json.dumps(
+            {
+                "address": address,
+                "canonical_parameters": {},
+                "determinism_contract": "deterministic",
+                "identity_contract_version": 1,
+                "namespace": "colors",
+                "output_contract": {
+                    "output_contract_version": 1,
+                    "sibling_outputs": [
+                        {"declared_extension": extension, "output_name": output_name}
+                    ],
+                },
+                "result_affecting_settings": {},
+                "role_labelled_bindings": [],
+                "step_contract": {
+                    "callable_ref": "tests:manual",
+                    "runner_contract_version": "1",
+                    "step_contract_id": step_name,
+                    "step_contract_version": "1",
+                },
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        artifact_id = int(
+            conn.execute(
+                """
+                INSERT INTO artifacts (
+                    origin, run_id, context, workflow_name, step_name,
+                    output_name, address, job_id, parameter_id, path,
+                    is_selected_output, is_published, published_path,
+                    staging_path, content_digest, output_hash, file_size,
+                    extension, callable_ref, identity_contract_version,
+                    request_bundle_projection_json, created_at
+                )
+                VALUES (
+                    'workflow_output', ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 1, ?,
+                    ?, ?, ?, ?, ?, ?, 1, ?, ?
+                )
+                """,
+                (
+                    run_id,
+                    "colors",
+                    workflow_name,
+                    step_name,
+                    output_name,
+                    address,
+                    f"{step_name}:{address}",
+                    parameter_id,
+                    relative_path,
+                    relative_path,
+                    f"runs/colors/manual/staging/{step_name}/{output_name}/{address}{extension}",
+                    output_digest,
+                    output_hash,
+                    output_path.stat().st_size,
+                    extension,
+                    "tests:manual",
+                    projection_json,
+                    "2026-07-19T00:00:00+00:00",
+                ),
+            ).lastrowid
+        )
         conn.execute(
             """
             INSERT INTO published_outputs (
                 context, workflow_name, step_name, output_name, address,
-                path, output_digest, output_hash
+                path, output_digest, output_hash, artifact_id
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 "colors",
@@ -271,6 +377,7 @@ def _insert_published_output(
                 relative_path,
                 output_digest,
                 output_hash,
+                artifact_id,
             ),
         )
     return output_path, output_digest, output_hash
@@ -735,6 +842,75 @@ def test_validate_accepts_registered_published_output(
     output = capsys.readouterr().out
     assert "published_outputs=1" in output
     assert "PASS: validate" in output
+
+
+def test_registry_v15_projection_observation_and_membership_constraints(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _project_dir, runtime_dir = _init_demo(tmp_path, capsys)
+    registry_path = runtime_dir / "database/registry.db"
+    with sqlite3.connect(registry_path) as conn:
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 15
+        artifact_columns = {
+            row[1]: row for row in conn.execute("PRAGMA table_info(artifacts)")
+        }
+        run_columns = {
+            row[1]: row for row in conn.execute("PRAGMA table_info(workflow_runs)")
+        }
+        membership_columns = {
+            row[1]: row for row in conn.execute("PRAGMA table_info(published_outputs)")
+        }
+        membership_foreign_keys = conn.execute(
+            "PRAGMA foreign_key_list(published_outputs)"
+        ).fetchall()
+        membership_indexes = {
+            row[1]: row for row in conn.execute("PRAGMA index_list(published_outputs)")
+        }
+        artifact_sql = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'artifacts'"
+        ).fetchone()[0]
+
+    assert "identity_contract_version" in artifact_columns
+    assert "request_bundle_projection_json" in artifact_columns
+    assert run_columns["resolution_summary_json"][3] == 1
+    assert run_columns["environment_observation_json"][3] == 1
+    assert membership_columns["artifact_id"][3] == 1
+    artifact_fk = next(row for row in membership_foreign_keys if row[3] == "artifact_id")
+    assert artifact_fk[2] == "artifacts"
+    assert artifact_fk[6] == "RESTRICT"
+    assert membership_indexes["published_outputs_artifact_id_idx"][2] == 0
+    assert "origin = 'workflow_output'" in artifact_sql
+    assert "identity_contract_version IS NOT NULL" in artifact_sql
+    assert "origin = 'source'" in artifact_sql
+    assert "request_bundle_projection_json IS NULL" in artifact_sql
+
+    with sqlite3.connect(registry_path) as conn:
+        source_artifact_id = conn.execute(
+            "SELECT artifact_id FROM artifacts WHERE origin = 'source' LIMIT 1"
+        ).fetchone()[0]
+        with pytest.raises(sqlite3.IntegrityError, match="CHECK constraint failed"):
+            conn.execute(
+                """
+                UPDATE artifacts
+                SET identity_contract_version = 1,
+                    request_bundle_projection_json = '{}'
+                WHERE artifact_id = ?
+                """,
+                (source_artifact_id,),
+            )
+        with pytest.raises(sqlite3.IntegrityError, match="CHECK constraint failed"):
+            conn.execute(
+                """
+                INSERT INTO artifacts (
+                    origin, context, path, content_digest, file_size, extension,
+                    created_at
+                )
+                VALUES ('workflow_output', 'colors', 'outputs/missing.json', ?, 0,
+                        '.json', '2026-07-19T00:00:00+00:00')
+                """,
+                ("e" * 64,),
+            )
 
 
 @pytest.mark.parametrize(

@@ -19,6 +19,8 @@ from nipact.execution import (
     execute_run_plan,
 )
 from nipact.hashing import sha256_file_digest, short_hash
+from nipact.projection import RequestBundleProjectionV1, canonical_projection_json
+from nipact.registry import EnvironmentObservationV1
 from nipact.runtime import run_job
 from nipact.trace import build_trace_graph_for_workflow_coordinate
 
@@ -834,6 +836,25 @@ def test_multi_output_run_registers_sibling_outputs_and_exact_dependency(
             ORDER BY step_name, output_name, address
             """
         ).fetchall()
+        projection_rows = conn.execute(
+            """
+            SELECT step_name, output_name, address,
+                   identity_contract_version, request_bundle_projection_json
+            FROM artifacts
+            WHERE origin = 'workflow_output'
+            ORDER BY step_name, output_name, address
+            """
+        ).fetchall()
+        source_snapshots = {
+            path: (content_digest, file_size, extension)
+            for path, content_digest, file_size, extension in conn.execute(
+                """
+                SELECT path, content_digest, file_size, extension
+                FROM artifacts
+                WHERE origin = 'source'
+                """
+            ).fetchall()
+        }
         dependency_rows = conn.execute(
             """
             SELECT d.binding_name, d.input_path, s.step_name, s.output_name, s.address
@@ -857,6 +878,25 @@ def test_multi_output_run_registers_sibling_outputs_and_exact_dependency(
         for step, output, address, *_rest in artifact_rows
     }
     assert set(published_rows) == artifact_keys
+    assert all(row[3] == 1 and row[4] for row in projection_rows)
+    source_projection_by_address: dict[str, set[str]] = {}
+    for step_name, _output_name, address, _version, projection_json in projection_rows:
+        if step_name == "source_text":
+            source_projection_by_address.setdefault(address, set()).add(projection_json)
+    assert set(source_projection_by_address) == {"sub_001", "sub_002"}
+    assert all(
+        len(projections) == 1
+        for projections in source_projection_by_address.values()
+    )
+    for projections in source_projection_by_address.values():
+        projection = json.loads(next(iter(projections)))
+        source_binding = projection["role_labelled_bindings"][0]
+        source_path = source_binding["source_coordinate"]["path"]
+        assert (
+            source_binding["registered_content_digest"],
+            source_binding["registered_file_size"],
+            source_binding["declared_extension"],
+        ) == source_snapshots[source_path]
     assert artifact_keys == {
         ("source_text", "raw_text", "sub_001"),
         ("source_text", "raw_text", "sub_002"),
@@ -885,6 +925,18 @@ def test_multi_output_run_registers_sibling_outputs_and_exact_dependency(
             "sub_002",
         ),
     ]
+
+    equivalent_plan = build_run_plan(
+        project_dir=project_dir,
+        context="multi",
+        workflow_name="consume_qc",
+        step_name="qc_echo",
+    )
+    for reused_output in equivalent_plan.reused_outputs:
+        assert isinstance(reused_output.projection_state, RequestBundleProjectionV1)
+        assert canonical_projection_json(reused_output.projection_state) in (
+            source_projection_by_address[reused_output.address]
+        )
 
 
 def test_execute_run_plan_publishes_selected_outputs_without_real_snakemake(
@@ -917,6 +969,15 @@ def test_execute_run_plan_publishes_selected_outputs_without_real_snakemake(
         return 0
 
     monkeypatch.setattr("nipact.execution._run_snakemake", write_staged_outputs)
+    monkeypatch.setattr(
+        "nipact.execution._environment_observation",
+        lambda: EnvironmentObservationV1(
+            nipact_version="test-nipact",
+            python_version="test-python",
+            platform="test-platform",
+            snakemake_version="test-snakemake",
+        ),
+    )
     events: list[str] = []
 
     assert execute_run_plan(
@@ -982,6 +1043,13 @@ def test_execute_run_plan_publishes_selected_outputs_without_real_snakemake(
             """,
             (selected_row[5],),
         ).fetchone()
+        run_observations = conn.execute(
+            """
+            SELECT resolution_summary_json, environment_observation_json
+            FROM workflow_runs
+            WHERE is_current = 1
+            """
+        ).fetchone()
     assert len(rows) == len(run_plan.published_outputs)
     assert selected_row[:5] == (
         "base",
@@ -1007,6 +1075,31 @@ def test_execute_run_plan_publishes_selected_outputs_without_real_snakemake(
         f"outputs/colors/base/color_sector_analysis/sector_counts/{outputs[0].name}",
         "runs/colors/base/color_sector_analysis/staging/color_sector_analysis/sector_counts/init.json",
     )
+    assert json.loads(run_observations[0]) == {
+        "schema_version": 1,
+        "forced": False,
+        "all_selected_resolved": True,
+        "selected_outputs": [
+            {
+                "context": "colors",
+                "workflow_name": "base",
+                "step_name": "color_sector_analysis",
+                "output_name": "sector_counts",
+                "address": "init",
+                "resolution": {
+                    "artifact_id": selected_row[5],
+                    "outcome": "generated",
+                },
+            }
+        ],
+    }
+    assert json.loads(run_observations[1]) == {
+        "profile_version": 1,
+        "nipact_version": "test-nipact",
+        "python_version": "test-python",
+        "platform": "test-platform",
+        "snakemake_version": "test-snakemake",
+    }
     assert main(["validate", "--project-dir", str(project_dir), "--context", "colors"]) == 0
     assert f"published_outputs={len(run_plan.published_outputs)}" in capsys.readouterr().out
 
@@ -1297,14 +1390,113 @@ def test_partial_publish_records_surviving_jobs(
             "SELECT step_name, output_name, address FROM artifacts "
             "WHERE origin = 'workflow_output' ORDER BY step_name, output_name, address"
         ).fetchall()
-        workflow_runs = conn.execute("SELECT COUNT(*) FROM workflow_runs").fetchone()[0]
+        workflow_run = conn.execute(
+            "SELECT resolution_summary_json FROM workflow_runs"
+        ).fetchone()
+        selected_artifact_id = conn.execute(
+            """
+            SELECT artifact_id
+            FROM artifacts
+            WHERE step_name = 'uppercase_text'
+              AND output_name = 'upper_text'
+              AND address = 'sub_001'
+            """
+        ).fetchone()[0]
     expected = [
         ("source_text", "raw_text", "sub_001"),
         ("uppercase_text", "upper_text", "sub_001"),
     ]
     assert published == expected
     assert artifacts == expected
-    assert workflow_runs == 1
+    resolution_summary = json.loads(workflow_run[0])
+    assert resolution_summary["all_selected_resolved"] is False
+    assert resolution_summary["forced"] is False
+    assert resolution_summary["selected_outputs"] == [
+        {
+            "context": "mini",
+            "workflow_name": "main",
+            "step_name": "uppercase_text",
+            "output_name": "upper_text",
+            "address": "sub_001",
+            "resolution": {
+                "artifact_id": selected_artifact_id,
+                "outcome": "generated",
+            },
+        },
+        {
+            "context": "mini",
+            "workflow_name": "main",
+            "step_name": "uppercase_text",
+            "output_name": "upper_text",
+            "address": "sub_002",
+            "resolution": None,
+        },
+    ]
+
+
+def test_projection_finalization_failure_rolls_back_current_run(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project_dir, runtime_dir = _write_tiny_non_colors_project(tmp_path, monkeypatch)
+    active_plan: dict[str, object] = {}
+
+    def run_active_plan(*_args: object, **_kwargs: object) -> int:
+        run_plan = active_plan["value"]
+        run_plan_path = run_plan.run_workspace / "run_plan.json"
+        for job in run_plan.jobs:
+            run_job(run_plan_path=run_plan_path, job_id=job.job_id)
+        return 0
+
+    monkeypatch.setattr("nipact.execution._run_snakemake", run_active_plan)
+    first_plan = build_run_plan(
+        project_dir=project_dir,
+        context="mini",
+        workflow_name="main",
+        step_name="uppercase_text",
+        address="sub_001",
+    )
+    active_plan["value"] = first_plan
+    assert execute_run_plan(first_plan, cores=1).all_selected_published
+
+    registry_path = runtime_dir / "database/registry.db"
+    with sqlite3.connect(registry_path) as conn:
+        current_run_before = conn.execute(
+            "SELECT run_id FROM workflow_runs WHERE is_current = 1"
+        ).fetchone()[0]
+        counts_before = (
+            conn.execute("SELECT COUNT(*) FROM workflow_runs").fetchone()[0],
+            conn.execute("SELECT COUNT(*) FROM artifacts").fetchone()[0],
+            conn.execute("SELECT COUNT(*) FROM published_outputs").fetchone()[0],
+        )
+
+    rerun_plan = build_run_plan(
+        project_dir=project_dir,
+        context="mini",
+        workflow_name="main",
+        step_name="uppercase_text",
+        address="sub_001",
+    )
+    active_plan["value"] = rerun_plan
+    monkeypatch.setattr(
+        "nipact.execution._retained_projection_recipes",
+        lambda *_args, **_kwargs: (),
+    )
+    with pytest.raises(
+        ValidationError,
+        match="retained artifact is missing its projection recipe",
+    ):
+        execute_run_plan(rerun_plan, cores=1)
+
+    with sqlite3.connect(registry_path) as conn:
+        assert conn.execute(
+            "SELECT run_id FROM workflow_runs WHERE is_current = 1"
+        ).fetchone()[0] == current_run_before
+        assert (
+            conn.execute("SELECT COUNT(*) FROM workflow_runs").fetchone()[0],
+            conn.execute("SELECT COUNT(*) FROM artifacts").fetchone()[0],
+            conn.execute("SELECT COUNT(*) FROM published_outputs").fetchone()[0],
+        ) == counts_before
 
 
 def test_multi_output_partial_sibling_prunes_orphan_child(

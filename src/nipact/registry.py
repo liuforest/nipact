@@ -16,10 +16,19 @@ from .errors import ValidationError
 from .hashing import is_valid_digest, sha256_digest, sha256_file_digest, short_hash
 from .identity import validate_hash_alias, validate_path_token
 from .manifest import Manifest
-from .projection import RegisteredSourceSnapshot, SourceCoordinate
+from .projection import (
+    IDENTITY_CONTRACT_VERSION,
+    RegisteredSourceSnapshot,
+    RequestBundleProjectionPlanV1,
+    RequestBundleProjectionV1,
+    RequestedOutputCoordinate,
+    SourceCoordinate,
+    canonical_projection_json,
+    resolve_request_bundle_projection_plan,
+)
 
 REGISTRY_DB_PATH = "database/registry.db"
-REGISTRY_SCHEMA_VERSION = 14
+REGISTRY_SCHEMA_VERSION = 15
 PARAMETER_HASH_VERSION = 1
 
 
@@ -77,6 +86,46 @@ class WorkflowOutputArtifactRow:
 
 
 @dataclass(frozen=True)
+class RetainedJobProjectionRecipe:
+    step_name: str
+    address: str
+    output_names: tuple[str, ...]
+    projection_plan: RequestBundleProjectionPlanV1
+
+
+@dataclass(frozen=True)
+class ReusedProjectionSeed:
+    requested_output: RequestedOutputCoordinate
+    projection: RequestBundleProjectionV1
+
+
+@dataclass(frozen=True)
+class SelectedOutputResolutionIntent:
+    context: str
+    workflow_name: str
+    step_name: str
+    output_name: str
+    address: str
+    outcome: str | None
+    existing_artifact_id: int | None = None
+
+
+@dataclass(frozen=True)
+class MembershipIntent:
+    row: PublishedOutputRow
+    existing_artifact_id: int | None = None
+
+
+@dataclass(frozen=True)
+class EnvironmentObservationV1:
+    nipact_version: str
+    python_version: str
+    platform: str
+    snakemake_version: str
+    profile_version: int = 1
+
+
+@dataclass(frozen=True)
 class RunManifestBindingRow:
     step_name: str
     role: str
@@ -122,6 +171,8 @@ class RegistryArtifact:
     callable_ref: str | None
     software_ref: str | None
     created_at: str
+    identity_contract_version: int | None = None
+    request_bundle_projection_json: str | None = None
 
 
 @dataclass(frozen=True)
@@ -226,6 +277,8 @@ _ARTIFACT_SELECT_COLUMNS = """
     p.parameter_hash,
     p.parameter_digest,
     p.parameters_json,
+    a.identity_contract_version,
+    a.request_bundle_projection_json,
     a.path,
     a.is_selected_output,
     a.is_published,
@@ -524,16 +577,33 @@ def record_workflow_run(
     run_plan_path: str,
     run_plan_digest: str,
     artifacts: Iterable[WorkflowOutputArtifactRow],
+    projection_recipes: Iterable[RetainedJobProjectionRecipe],
+    reused_projection_seeds: Iterable[ReusedProjectionSeed],
+    selected_resolution_intents: Iterable[SelectedOutputResolutionIntent],
+    environment_observation: EnvironmentObservationV1,
     manifest_bindings: Iterable[RunManifestBindingRow],
-    published_outputs: Iterable[PublishedOutputRow],
+    membership_intents: Iterable[MembershipIntent],
     allowed_reused_workflow_names: Iterable[str] | None = None,
     base_workflow_name: str | None = None,
 ) -> int:
     """Record one run, superseding current rows while retaining history."""
     artifact_rows = tuple(artifacts)
+    projection_recipe_rows = tuple(projection_recipes)
+    reused_projection_seed_rows = tuple(reused_projection_seeds)
+    selected_resolution_rows = tuple(selected_resolution_intents)
     manifest_binding_rows = tuple(manifest_bindings)
-    published_output_rows = tuple(published_outputs)
+    membership_rows = tuple(membership_intents)
     allowed_reused_workflows = tuple(allowed_reused_workflow_names or (workflow_name,))
+    if any(
+        row.context != context or row.workflow_name != workflow_name
+        for row in selected_resolution_rows
+    ):
+        raise ValidationError("selected-output resolution belongs to another run scope")
+    if any(
+        intent.row.context != context or intent.row.workflow_name != workflow_name
+        for intent in membership_rows
+    ):
+        raise ValidationError("membership intent belongs to another run scope")
     now = _utc_now()
     try:
         with _connect(path) as conn:
@@ -555,7 +625,28 @@ def record_workflow_run(
                 run_workspace=run_workspace,
                 run_plan_path=run_plan_path,
                 run_plan_digest=run_plan_digest,
+                resolution_summary_json=_resolution_summary_json(
+                    selected_resolution_rows,
+                    artifact_ids=None,
+                ),
+                environment_observation_json=_environment_observation_json(
+                    environment_observation
+                ),
                 created_at=now,
+            )
+            _upsert_source_artifacts_for_inputs(
+                conn,
+                context=context,
+                runtime_root=runtime_root,
+                artifact_rows=artifact_rows,
+                created_at=now,
+            )
+            finalized_projections = _finalize_retained_job_projections(
+                conn,
+                context=context,
+                artifact_rows=artifact_rows,
+                projection_recipes=projection_recipe_rows,
+                reused_projection_seeds=reused_projection_seed_rows,
             )
             parameter_ids = {
                 (row.step_name, row.parameters_json): _upsert_parameter(
@@ -573,13 +664,7 @@ def record_workflow_run(
                 run_id=run_id,
                 artifact_rows=artifact_rows,
                 parameter_ids=parameter_ids,
-                created_at=now,
-            )
-            _upsert_source_artifacts_for_inputs(
-                conn,
-                context=context,
-                runtime_root=runtime_root,
-                artifact_rows=artifact_rows,
+                finalized_projections=finalized_projections,
                 created_at=now,
             )
             _insert_artifact_dependencies(
@@ -598,15 +683,29 @@ def record_workflow_run(
                 run_id=run_id,
                 rows=manifest_binding_rows,
             )
-            _delete_published_output_coordinates(conn, rows=published_output_rows)
-            _insert_published_outputs(
+            _delete_published_output_coordinates(
                 conn,
-                rows=published_output_rows,
+                rows=tuple(intent.row for intent in membership_rows),
+            )
+            _insert_memberships(
+                conn,
+                intents=membership_rows,
                 artifact_ids=artifact_ids,
+            )
+            conn.execute(
+                "UPDATE workflow_runs SET resolution_summary_json = ? WHERE run_id = ?",
+                (
+                    _resolution_summary_json(
+                        selected_resolution_rows,
+                        artifact_ids=artifact_ids,
+                        conn=conn,
+                    ),
+                    run_id,
+                ),
             )
     except sqlite3.Error as exc:
         raise ValidationError(f"registry.db is malformed: {exc}") from exc
-    return len(published_output_rows)
+    return len(membership_rows)
 
 
 def read_published_outputs(
@@ -716,27 +815,34 @@ def read_registered_source_snapshots(
     try:
         with _connect_readonly_rows(path) as conn:
             _validate_schema_version(conn)
-            rows = conn.execute(
-                """
-                SELECT path, content_digest, file_size, extension
-                FROM artifacts
-                WHERE context = ? AND origin = 'source'
-                ORDER BY path
-                """,
-                (context,),
-            ).fetchall()
+            return _read_registered_source_snapshots_conn(conn, context=context)
     except sqlite3.Error as exc:
         raise ValidationError(f"registry.db is malformed: {exc}") from exc
 
+
+def _read_registered_source_snapshots_conn(
+    conn: sqlite3.Connection,
+    *,
+    context: str,
+) -> dict[SourceCoordinate, RegisteredSourceSnapshot]:
+    rows = conn.execute(
+        """
+        SELECT path, content_digest, file_size, extension
+        FROM artifacts
+        WHERE context = ? AND origin = 'source'
+        ORDER BY path
+        """,
+        (context,),
+    ).fetchall()
     snapshots: dict[SourceCoordinate, RegisteredSourceSnapshot] = {}
     for row in rows:
         source_path = _validate_registry_artifact_path(
-            str(row["path"]),
+            str(row[0]),
             origin="source",
         )
-        content_digest = row["content_digest"]
-        file_size = row["file_size"]
-        extension = row["extension"]
+        content_digest = row[1]
+        file_size = row[2]
+        extension = row[3]
         if not is_valid_digest(content_digest):
             raise ValidationError("registry source artifact digest is malformed")
         if type(file_size) is not int or file_size < 0:
@@ -1763,6 +1869,8 @@ def _insert_workflow_run(
     run_workspace: str,
     run_plan_path: str,
     run_plan_digest: str,
+    resolution_summary_json: str,
+    environment_observation_json: str,
     created_at: str,
 ) -> int:
     cursor = conn.execute(
@@ -1770,9 +1878,10 @@ def _insert_workflow_run(
         INSERT INTO workflow_runs (
             context, workflow_name, selected_step_name, selected_output_name,
             run_workspace, run_plan_path, run_plan_digest, base_workflow_name,
+            resolution_summary_json, environment_observation_json,
             is_current, created_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
         """,
         (
             context,
@@ -1783,6 +1892,8 @@ def _insert_workflow_run(
             run_plan_path,
             run_plan_digest,
             base_workflow_name,
+            resolution_summary_json,
+            environment_observation_json,
             created_at,
         ),
     )
@@ -1840,22 +1951,31 @@ def _insert_workflow_output_artifacts(
     run_id: int,
     artifact_rows: tuple[WorkflowOutputArtifactRow, ...],
     parameter_ids: dict[tuple[str, str], int],
+    finalized_projections: dict[tuple[str, str], str],
     created_at: str,
 ) -> dict[tuple[str, str, str], int]:
     artifact_ids: dict[tuple[str, str, str], int] = {}
     for row in artifact_rows:
         parameter_id = parameter_ids[(row.step_name, row.parameters_json)]
+        try:
+            projection_json = finalized_projections[(row.step_name, row.address)]
+        except KeyError as exc:
+            raise ValidationError(
+                "workflow output artifact is missing its finalized projection"
+            ) from exc
         cursor = conn.execute(
             """
             INSERT INTO artifacts (
                 origin, run_id, context, workflow_name, step_name, output_name,
                 address, job_id, parameter_id, path, is_selected_output,
                 is_published, published_path, staging_path, content_digest,
-                output_hash, file_size, extension, callable_ref, created_at
+                output_hash, file_size, extension, callable_ref,
+                identity_contract_version, request_bundle_projection_json,
+                created_at
             )
             VALUES (
                 'workflow_output', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                ?, ?, ?, ?
+                ?, ?, ?, ?, ?, ?
             )
             """,
             (
@@ -1877,6 +1997,8 @@ def _insert_workflow_output_artifacts(
                 row.file_size,
                 row.extension,
                 row.callable_ref,
+                IDENTITY_CONTRACT_VERSION,
+                projection_json,
                 created_at,
             ),
         )
@@ -1884,6 +2006,91 @@ def _insert_workflow_output_artifacts(
             cursor.lastrowid
         )
     return artifact_ids
+
+
+def _finalize_retained_job_projections(
+    conn: sqlite3.Connection,
+    *,
+    context: str,
+    artifact_rows: tuple[WorkflowOutputArtifactRow, ...],
+    projection_recipes: tuple[RetainedJobProjectionRecipe, ...],
+    reused_projection_seeds: tuple[ReusedProjectionSeed, ...],
+) -> dict[tuple[str, str], str]:
+    source_snapshots = _read_registered_source_snapshots_conn(conn, context=context)
+    upstream_states: dict[RequestedOutputCoordinate, RequestBundleProjectionV1] = {}
+    for seed in reused_projection_seeds:
+        if seed.requested_output.namespace != context:
+            raise ValidationError("reused projection seed belongs to another context")
+        if seed.requested_output in upstream_states:
+            raise ValidationError("reused projection seed coordinate is duplicated")
+        canonical_projection_json(seed.projection)
+        sibling_names = {
+            sibling.output_name
+            for sibling in seed.projection.output_contract.sibling_outputs
+        }
+        if (
+            seed.projection.namespace != context
+            or seed.projection.address != seed.requested_output.address
+            or seed.projection.step_contract.step_contract_id
+            != seed.requested_output.step_name
+            or seed.requested_output.output_name not in sibling_names
+        ):
+            raise ValidationError("reused projection seed does not match its coordinate")
+        upstream_states[seed.requested_output] = seed.projection
+
+    artifact_outputs_by_job: dict[tuple[str, str], set[str]] = {}
+    for row in artifact_rows:
+        artifact_outputs_by_job.setdefault((row.step_name, row.address), set()).add(
+            row.output_name
+        )
+
+    finalized: dict[tuple[str, str], str] = {}
+    for recipe in projection_recipes:
+        job_key = (recipe.step_name, recipe.address)
+        if job_key in finalized:
+            raise ValidationError("retained projection recipe is duplicated")
+        if len(recipe.output_names) != len(set(recipe.output_names)):
+            raise ValidationError("retained projection recipe repeats a sibling output")
+        declared_outputs = {
+            sibling.output_name
+            for sibling in recipe.projection_plan.output_contract.sibling_outputs
+        }
+        if (
+            recipe.projection_plan.namespace != context
+            or recipe.projection_plan.step_contract.step_contract_id
+            != recipe.step_name
+            or recipe.projection_plan.address != recipe.address
+            or declared_outputs != set(recipe.output_names)
+        ):
+            raise ValidationError("retained projection recipe identity is inconsistent")
+        actual_outputs = artifact_outputs_by_job.get(job_key)
+        if actual_outputs is None or actual_outputs != set(recipe.output_names):
+            raise ValidationError(
+                "retained projection recipe does not match complete sibling artifacts"
+            )
+        projection = resolve_request_bundle_projection_plan(
+            recipe.projection_plan,
+            source_snapshots=source_snapshots,
+            upstream_states=upstream_states,
+        )
+        if not isinstance(projection, RequestBundleProjectionV1):
+            raise ValidationError("retained projection remained unresolved after source upsert")
+        projection_json = canonical_projection_json(projection)
+        finalized[job_key] = projection_json
+        for output_name in recipe.output_names:
+            coordinate = RequestedOutputCoordinate(
+                namespace=context,
+                step_name=recipe.step_name,
+                output_name=output_name,
+                address=recipe.address,
+            )
+            if coordinate in upstream_states:
+                raise ValidationError("retained requested-output coordinate is duplicated")
+            upstream_states[coordinate] = projection
+
+    if set(finalized) != set(artifact_outputs_by_job):
+        raise ValidationError("retained artifact is missing its projection recipe")
+    return finalized
 
 
 def _upsert_source_artifacts_for_inputs(
@@ -2180,21 +2387,45 @@ def _insert_run_manifest_bindings(
     )
 
 
-def _insert_published_outputs(
+def _insert_memberships(
     conn: sqlite3.Connection,
     *,
-    rows: tuple[PublishedOutputRow, ...],
+    intents: tuple[MembershipIntent, ...],
     artifact_ids: dict[tuple[str, str, str], int],
 ) -> None:
-    conn.executemany(
-        """
-        INSERT INTO published_outputs (
-            context, workflow_name, step_name, output_name, address, path,
-            output_digest, output_hash, artifact_id
-        )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
+    for intent in intents:
+        row = intent.row
+        if intent.existing_artifact_id is None:
+            try:
+                artifact_id = artifact_ids[(row.step_name, row.output_name, row.address)]
+            except KeyError as exc:
+                raise ValidationError(
+                    "fresh membership intent has no recorded artifact"
+                ) from exc
+        else:
+            _validate_positive_id(
+                intent.existing_artifact_id,
+                label="membership artifact id",
+            )
+            artifact_id = _validated_existing_artifact_id(
+                conn,
+                artifact_id=intent.existing_artifact_id,
+                context=row.context,
+                step_name=row.step_name,
+                output_name=row.output_name,
+                address=row.address,
+                path=row.path,
+                content_digest=row.output_digest,
+                output_hash=row.output_hash,
+            )
+        conn.execute(
+            """
+            INSERT INTO published_outputs (
+                context, workflow_name, step_name, output_name, address, path,
+                output_digest, output_hash, artifact_id
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
             (
                 row.context,
                 row.workflow_name,
@@ -2204,10 +2435,155 @@ def _insert_published_outputs(
                 row.path,
                 row.output_digest,
                 row.output_hash,
-                artifact_ids[(row.step_name, row.output_name, row.address)],
-            )
-            for row in rows
+                artifact_id,
+            ),
+        )
+
+
+def _resolution_summary_json(
+    intents: tuple[SelectedOutputResolutionIntent, ...],
+    *,
+    artifact_ids: dict[tuple[str, str, str], int] | None,
+    conn: sqlite3.Connection | None = None,
+) -> str:
+    selected_outputs: list[dict[str, Any]] = []
+    seen_coordinates: set[tuple[str, str, str, str, str]] = set()
+    for intent in sorted(
+        intents,
+        key=lambda value: (
+            value.context,
+            value.workflow_name,
+            value.step_name,
+            value.output_name,
+            value.address,
         ),
+    ):
+        coordinate = (
+            intent.context,
+            intent.workflow_name,
+            intent.step_name,
+            intent.output_name,
+            intent.address,
+        )
+        if coordinate in seen_coordinates:
+            raise ValidationError("selected-output resolution coordinate is duplicated")
+        seen_coordinates.add(coordinate)
+        if intent.outcome not in {None, "generated", "reused"}:
+            raise ValidationError("selected-output resolution outcome is invalid")
+        resolution: dict[str, Any] | None = None
+        if artifact_ids is not None and intent.outcome is not None:
+            if intent.outcome == "generated":
+                if intent.existing_artifact_id is not None:
+                    raise ValidationError(
+                        "generated selected-output resolution cannot name an existing artifact"
+                    )
+                try:
+                    artifact_id = artifact_ids[
+                        (intent.step_name, intent.output_name, intent.address)
+                    ]
+                except KeyError as exc:
+                    raise ValidationError(
+                        "generated selected-output resolution has no recorded artifact"
+                    ) from exc
+            else:
+                if intent.existing_artifact_id is None:
+                    raise ValidationError(
+                        "reused selected-output resolution is missing its artifact"
+                    )
+                _validate_positive_id(
+                    intent.existing_artifact_id,
+                    label="selected-output artifact id",
+                )
+                if conn is None:
+                    raise ValidationError(
+                        "reused selected-output resolution requires a registry transaction"
+                    )
+                artifact_id = _validated_existing_artifact_id(
+                    conn,
+                    artifact_id=intent.existing_artifact_id,
+                    context=intent.context,
+                    step_name=intent.step_name,
+                    output_name=intent.output_name,
+                    address=intent.address,
+                )
+            resolution = {"artifact_id": artifact_id, "outcome": intent.outcome}
+        selected_outputs.append(
+            {
+                "context": intent.context,
+                "workflow_name": intent.workflow_name,
+                "step_name": intent.step_name,
+                "output_name": intent.output_name,
+                "address": intent.address,
+                "resolution": resolution,
+            }
+        )
+    return _compact_json(
+        {
+            "schema_version": 1,
+            "forced": False,
+            "all_selected_resolved": bool(selected_outputs)
+            and all(item["resolution"] is not None for item in selected_outputs),
+            "selected_outputs": selected_outputs,
+        }
+    )
+
+
+def _validated_existing_artifact_id(
+    conn: sqlite3.Connection,
+    *,
+    artifact_id: int,
+    context: str,
+    step_name: str,
+    output_name: str,
+    address: str,
+    path: str | None = None,
+    content_digest: str | None = None,
+    output_hash: str | None = None,
+) -> int:
+    row = conn.execute(
+        """
+        SELECT path, content_digest, output_hash
+        FROM artifacts
+        WHERE artifact_id = ?
+          AND origin = 'workflow_output'
+          AND context = ?
+          AND step_name = ?
+          AND output_name = ?
+          AND address = ?
+          AND is_published = 1
+        """,
+        (artifact_id, context, step_name, output_name, address),
+    ).fetchone()
+    if row is None:
+        raise ValidationError("existing artifact intent does not name a published artifact")
+    expected = (path, content_digest, output_hash)
+    actual = (str(row[0]), str(row[1]), str(row[2]))
+    if any(value is not None for value in expected) and actual != expected:
+        raise ValidationError("existing membership intent does not match its artifact")
+    return artifact_id
+
+
+def _environment_observation_json(observation: EnvironmentObservationV1) -> str:
+    if not isinstance(observation, EnvironmentObservationV1):
+        raise ValidationError("environment observation must use the V1 contract")
+    if observation.profile_version != 1:
+        raise ValidationError("environment observation profile version must be 1")
+    values = (
+        observation.nipact_version,
+        observation.python_version,
+        observation.platform,
+        observation.snakemake_version,
+    )
+    if any(type(value) is not str or not value for value in values):
+        raise ValidationError("environment observation values must be non-empty strings")
+    return _compact_json(
+        {
+            "profile_version": observation.profile_version,
+            "nipact_version": observation.nipact_version,
+            "python_version": observation.python_version,
+            "platform": observation.platform,
+            "snakemake_version": observation.snakemake_version,
+        }
     )
 
 
@@ -2355,6 +2731,8 @@ def _create_schema(conn: sqlite3.Connection) -> None:
             run_plan_path TEXT NOT NULL,
             run_plan_digest TEXT NOT NULL,
             base_workflow_name TEXT,
+            resolution_summary_json TEXT NOT NULL,
+            environment_observation_json TEXT NOT NULL,
             is_current INTEGER NOT NULL DEFAULT 1 CHECK(is_current IN (0, 1)),
             created_at TEXT NOT NULL
         );
@@ -2407,7 +2785,21 @@ def _create_schema(conn: sqlite3.Connection) -> None:
             source_metadata_json TEXT,
             callable_ref TEXT,
             software_ref TEXT,
+            identity_contract_version INTEGER,
+            request_bundle_projection_json TEXT,
             created_at TEXT NOT NULL,
+            CHECK (
+                (
+                    origin = 'workflow_output'
+                    AND identity_contract_version IS NOT NULL
+                    AND request_bundle_projection_json IS NOT NULL
+                )
+                OR (
+                    origin = 'source'
+                    AND identity_contract_version IS NULL
+                    AND request_bundle_projection_json IS NULL
+                )
+            ),
             CHECK (
                 origin != 'source'
                 OR (
@@ -2484,10 +2876,13 @@ def _create_schema(conn: sqlite3.Connection) -> None:
             path TEXT NOT NULL,
             output_digest TEXT NOT NULL,
             output_hash TEXT NOT NULL,
-            artifact_id INTEGER UNIQUE
-                REFERENCES artifacts(artifact_id) ON DELETE SET NULL,
+            artifact_id INTEGER NOT NULL
+                REFERENCES artifacts(artifact_id) ON DELETE RESTRICT,
             PRIMARY KEY (context, workflow_name, step_name, output_name, address)
         );
+
+        CREATE INDEX IF NOT EXISTS published_outputs_artifact_id_idx
+            ON published_outputs(artifact_id);
 
         PRAGMA user_version = {REGISTRY_SCHEMA_VERSION};
         """
@@ -2660,6 +3055,8 @@ def _registry_artifact_from_row(row: sqlite3.Row) -> RegistryArtifact:
         parameter_hash=row["parameter_hash"],
         parameter_digest=row["parameter_digest"],
         parameters_json=row["parameters_json"],
+        identity_contract_version=_optional_int(row["identity_contract_version"]),
+        request_bundle_projection_json=row["request_bundle_projection_json"],
         path=path,
         is_selected_output=is_selected_output,
         is_published=is_published,
