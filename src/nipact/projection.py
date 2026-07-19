@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import math
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, TypeAlias
 
@@ -29,6 +30,13 @@ class StepContract:
 class SourceCoordinate:
     namespace: str
     path: str
+
+
+@dataclass(frozen=True)
+class RegisteredSourceSnapshot:
+    content_digest: str
+    file_size: int
+    declared_extension: str
 
 
 @dataclass(frozen=True)
@@ -83,6 +91,194 @@ class RequestBundleProjectionV1:
     result_affecting_settings: dict[str, JsonValue]
     determinism_contract: str
     output_contract: OutputContract
+
+
+@dataclass(frozen=True)
+class RequestedOutputCoordinate:
+    namespace: str
+    step_name: str
+    output_name: str
+    address: str
+
+
+@dataclass(frozen=True)
+class SourceBindingPlan:
+    role: str
+    source_coordinate: SourceCoordinate
+
+
+@dataclass(frozen=True)
+class UpstreamRequestedOutputBindingPlan:
+    role: str
+    requested_output: RequestedOutputCoordinate
+
+
+@dataclass(frozen=True)
+class CollectionBindingPlan:
+    role: str
+    collection_semantics: str
+    manifest_digest: str | None
+    members: tuple[RequestedOutputCoordinate, ...]
+
+
+ProjectionBindingPlan: TypeAlias = (
+    SourceBindingPlan
+    | UpstreamRequestedOutputBindingPlan
+    | CollectionBindingPlan
+)
+
+
+@dataclass(frozen=True)
+class RequestBundleProjectionPlanV1:
+    """Planning recipe for a projection whose source snapshots may be absent."""
+
+    identity_contract_version: int
+    namespace: str
+    step_contract: StepContract
+    address: str
+    canonical_parameters: JsonValue
+    role_labelled_binding_plans: tuple[ProjectionBindingPlan, ...]
+    result_affecting_settings: dict[str, JsonValue]
+    determinism_contract: str
+    output_contract: OutputContract
+
+
+@dataclass(frozen=True)
+class UnresolvedRequestBundleProjection:
+    missing_source_coordinates: tuple[SourceCoordinate, ...]
+
+
+RequestBundleProjectionState: TypeAlias = (
+    RequestBundleProjectionV1 | UnresolvedRequestBundleProjection
+)
+
+
+def resolve_request_bundle_projection_plan(
+    plan: RequestBundleProjectionPlanV1,
+    *,
+    source_snapshots: Mapping[SourceCoordinate, RegisteredSourceSnapshot],
+    upstream_states: Mapping[
+        RequestedOutputCoordinate,
+        RequestBundleProjectionState,
+    ],
+) -> RequestBundleProjectionState:
+    """Resolve one planning recipe without reading the registry or filesystem."""
+    if not isinstance(plan, RequestBundleProjectionPlanV1):
+        raise ValidationError("plan must be a RequestBundleProjectionPlanV1")
+
+    resolved_bindings: list[ProjectionBinding] = []
+    missing_sources: set[SourceCoordinate] = set()
+    for binding_plan in plan.role_labelled_binding_plans:
+        if isinstance(binding_plan, SourceBindingPlan):
+            snapshot = source_snapshots.get(binding_plan.source_coordinate)
+            if snapshot is None:
+                missing_sources.add(binding_plan.source_coordinate)
+                continue
+            resolved_bindings.append(
+                RegisteredSourceBinding(
+                    role=binding_plan.role,
+                    source_coordinate=binding_plan.source_coordinate,
+                    registered_content_digest=snapshot.content_digest,
+                    registered_file_size=snapshot.file_size,
+                    declared_extension=snapshot.declared_extension,
+                )
+            )
+            continue
+
+        if isinstance(binding_plan, UpstreamRequestedOutputBindingPlan):
+            upstream_state = _required_upstream_state(
+                binding_plan.requested_output,
+                upstream_states=upstream_states,
+            )
+            if isinstance(upstream_state, UnresolvedRequestBundleProjection):
+                missing_sources.update(upstream_state.missing_source_coordinates)
+                continue
+            resolved_bindings.append(
+                UpstreamRequestedOutputBinding(
+                    role=binding_plan.role,
+                    upstream_request_projection=upstream_state,
+                    output_name=binding_plan.requested_output.output_name,
+                )
+            )
+            continue
+
+        if isinstance(binding_plan, CollectionBindingPlan):
+            resolved_members: list[UpstreamRequestedOutputBinding] = []
+            for requested_output in binding_plan.members:
+                upstream_state = _required_upstream_state(
+                    requested_output,
+                    upstream_states=upstream_states,
+                )
+                if isinstance(upstream_state, UnresolvedRequestBundleProjection):
+                    missing_sources.update(upstream_state.missing_source_coordinates)
+                    continue
+                resolved_members.append(
+                    UpstreamRequestedOutputBinding(
+                        role=binding_plan.role,
+                        upstream_request_projection=upstream_state,
+                        output_name=requested_output.output_name,
+                    )
+                )
+            if not missing_sources:
+                resolved_bindings.append(
+                    CollectionBinding(
+                        role=binding_plan.role,
+                        collection_semantics=binding_plan.collection_semantics,
+                        manifest_digest=binding_plan.manifest_digest,
+                        members=tuple(resolved_members),
+                    )
+                )
+            continue
+
+        raise ValidationError("projection plan contains an unsupported binding")
+
+    if missing_sources:
+        return UnresolvedRequestBundleProjection(
+            missing_source_coordinates=tuple(
+                sorted(missing_sources, key=_source_coordinate_sort_key)
+            )
+        )
+
+    projection = RequestBundleProjectionV1(
+        identity_contract_version=plan.identity_contract_version,
+        namespace=plan.namespace,
+        step_contract=plan.step_contract,
+        address=plan.address,
+        canonical_parameters=plan.canonical_parameters,
+        role_labelled_bindings=tuple(resolved_bindings),
+        result_affecting_settings=plan.result_affecting_settings,
+        determinism_contract=plan.determinism_contract,
+        output_contract=plan.output_contract,
+    )
+    canonical_projection_json(projection)
+    return projection
+
+
+def _required_upstream_state(
+    requested_output: RequestedOutputCoordinate,
+    *,
+    upstream_states: Mapping[
+        RequestedOutputCoordinate,
+        RequestBundleProjectionState,
+    ],
+) -> RequestBundleProjectionState:
+    if not isinstance(requested_output, RequestedOutputCoordinate):
+        raise ValidationError(
+            "projection plan requested output must be a "
+            "RequestedOutputCoordinate"
+        )
+    try:
+        return upstream_states[requested_output]
+    except KeyError as exc:
+        raise ValidationError(
+            "projection plan references an unavailable upstream requested output: "
+            f"{requested_output.step_name}.{requested_output.output_name}"
+            f"[{requested_output.address}]"
+        ) from exc
+
+
+def _source_coordinate_sort_key(coordinate: SourceCoordinate) -> tuple[str, str]:
+    return coordinate.namespace, coordinate.path
 
 
 def canonical_projection_json(projection: RequestBundleProjectionV1) -> str:

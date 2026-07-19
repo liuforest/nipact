@@ -10,6 +10,7 @@ import nipact.registry as registry
 from nipact.cli import main
 from nipact.errors import ValidationError
 from nipact.execution import build_run_plan, execute_run_plan
+from nipact.projection import RegisteredSourceSnapshot, SourceCoordinate
 from nipact.registry import (
     REGISTRY_DB_PATH,
     _open_registry_read_session,
@@ -24,6 +25,7 @@ from nipact.registry import (
     read_current_published_artifact,
     read_manifest,
     read_published_outputs,
+    read_registered_source_snapshots,
     read_registry_summary,
     resolve_registered_artifact_path,
 )
@@ -152,6 +154,45 @@ def test_registry_reads_initialized_source_artifact(
             context="colors",
             artifact_path="data/../database/registry.db",
         )
+
+
+def test_registry_reads_source_snapshots_without_reading_live_bytes(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _project_dir, runtime_dir = _init_demo(tmp_path, capsys)
+    registry_path = runtime_dir / REGISTRY_DB_PATH
+    source_path = runtime_dir / "data/color_source.json"
+    artifact = read_artifact_by_path(
+        registry_path,
+        context="colors",
+        artifact_path="data/color_source.json",
+    )
+    source_path.write_text("changed outside the registry\n", encoding="utf-8")
+    monkeypatch.setattr(
+        registry,
+        "sha256_file_digest",
+        lambda *_args, **_kwargs: pytest.fail("source snapshot read hashed a file"),
+    )
+
+    snapshots = read_registered_source_snapshots(
+        registry_path,
+        context="colors",
+    )
+
+    assert snapshots == {
+        SourceCoordinate("colors", "data/color_source.json"):
+            RegisteredSourceSnapshot(
+                content_digest=artifact.content_digest,
+                file_size=artifact.file_size,
+                declared_extension=artifact.extension,
+            )
+    }
+    assert read_registered_source_snapshots(
+        registry_path,
+        context="missing",
+    ) == {}
 
 
 def test_registry_manifest_helpers_and_summary(

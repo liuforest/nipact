@@ -16,6 +16,7 @@ from .errors import ValidationError
 from .hashing import is_valid_digest, sha256_digest, sha256_file_digest, short_hash
 from .identity import validate_hash_alias, validate_path_token
 from .manifest import Manifest
+from .projection import RegisteredSourceSnapshot, SourceCoordinate
 
 REGISTRY_DB_PATH = "database/registry.db"
 REGISTRY_SCHEMA_VERSION = 14
@@ -704,6 +705,53 @@ def read_artifact_by_id_for_context(
     if row is None:
         raise ValidationError(f"unknown registry artifact id: {artifact_id}")
     return _registry_artifact_from_row(row)
+
+
+def read_registered_source_snapshots(
+    path: Path,
+    *,
+    context: str,
+) -> dict[SourceCoordinate, RegisteredSourceSnapshot]:
+    """Read authoritative source identity facts without touching source files."""
+    try:
+        with _connect_readonly_rows(path) as conn:
+            _validate_schema_version(conn)
+            rows = conn.execute(
+                """
+                SELECT path, content_digest, file_size, extension
+                FROM artifacts
+                WHERE context = ? AND origin = 'source'
+                ORDER BY path
+                """,
+                (context,),
+            ).fetchall()
+    except sqlite3.Error as exc:
+        raise ValidationError(f"registry.db is malformed: {exc}") from exc
+
+    snapshots: dict[SourceCoordinate, RegisteredSourceSnapshot] = {}
+    for row in rows:
+        source_path = _validate_registry_artifact_path(
+            str(row["path"]),
+            origin="source",
+        )
+        content_digest = row["content_digest"]
+        file_size = row["file_size"]
+        extension = row["extension"]
+        if not is_valid_digest(content_digest):
+            raise ValidationError("registry source artifact digest is malformed")
+        if type(file_size) is not int or file_size < 0:
+            raise ValidationError("registry source artifact size is malformed")
+        if type(extension) is not str or not extension:
+            raise ValidationError("registry source artifact extension is malformed")
+        coordinate = SourceCoordinate(namespace=context, path=source_path)
+        if coordinate in snapshots:
+            raise ValidationError("registry source artifact coordinate is duplicated")
+        snapshots[coordinate] = RegisteredSourceSnapshot(
+            content_digest=content_digest,
+            file_size=file_size,
+            declared_extension=extension,
+        )
+    return snapshots
 
 
 def read_artifact_by_path(
