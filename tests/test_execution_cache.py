@@ -783,35 +783,6 @@ def _latest_workflow_payload(
     return json.loads(artifact_path.read_text(encoding="utf-8"))
 
 
-def _compact_json(payload: dict[str, object]) -> str:
-    return json.dumps(
-        payload,
-        allow_nan=False,
-        sort_keys=True,
-        separators=(",", ":"),
-    )
-
-
-def _reuse_request_for_job(
-    run_plan: object,
-    *,
-    step_name: str,
-) -> registry_module.ReusableArtifactRequest:
-    job = _workflow_input_job(run_plan, step_name=step_name)
-    output = job._single_output()
-    return registry_module.ReusableArtifactRequest(
-        context=run_plan.context,
-        workflow_name=run_plan.workflow_name,
-        step_name=job.step_name,
-        output_name=output.output_name,
-        address=job.address,
-        extension=output.declared_extension,
-        callable_ref=job.callable_ref,
-        parameters_json=_compact_json(job.params),
-        input_records=job.input_records,
-    )
-
-
 def test_projection_planning_propagates_unregistered_source_state(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1037,6 +1008,108 @@ def test_projection_planning_covers_collection_cohort_and_sibling_outputs(
     ] == ["left_out", "right_out"]
     assert multi_job.output_ref("left_out").projection_plan is multi_job.projection_plan
     assert multi_job.output_ref("right_out").projection_state is multi_job.projection_state
+
+
+def test_dependency_free_workflow_output_remains_reusable_as_an_input(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project_dir, _runtime_dir, _log_path = _write_cache_project(tmp_path, monkeypatch)
+    _write_yaml(
+        project_dir / "steps/constant_value.yaml",
+        {
+            "step_name": "constant_value",
+            "pattern_kind": "pattern_a",
+            "execution_role": "transform",
+            "address_scope": "entity",
+            "callable": "cache_runtime:step_a_file",
+            "manifest_binding": {
+                "role": "source_population",
+                "manifest": "subjects",
+            },
+            "outputs": {
+                "constant_out": {
+                    "extension": ".json",
+                    "address_scope": "entity",
+                }
+            },
+        },
+    )
+    _write_yaml(
+        project_dir / "steps/use_constant.yaml",
+        {
+            "step_name": "use_constant",
+            "pattern_kind": "pattern_a",
+            "execution_role": "transform",
+            "address_scope": "entity",
+            "callable": "cache_runtime:step_b_file",
+            "inputs": {
+                "constant_input": {
+                    "artifact": "constant_value.constant_out",
+                    "dependency_role": "source_input",
+                }
+            },
+            "outputs": {
+                "used_out": {
+                    "extension": ".json",
+                    "address_scope": "entity",
+                }
+            },
+        },
+    )
+    config_path = project_dir / "nipact.yaml"
+    config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    config["workflows"]["constant_flow"] = "workflows/constant_flow.yaml"
+    _write_yaml(config_path, config)
+    _write_yaml(
+        project_dir / "workflows/constant_flow.yaml",
+        {
+            "workflow_name": "constant_flow",
+            "steps": [
+                {"step_name": "constant_value", "output_name": "constant_out"},
+                {"step_name": "use_constant", "output_name": "used_out"},
+            ],
+        },
+    )
+
+    def execute_synthetic(plan: object) -> int:
+        for job in plan.jobs:
+            for output in job.outputs.values():
+                output.staging_path.parent.mkdir(parents=True, exist_ok=True)
+                output.staging_path.write_text(
+                    json.dumps({"job_id": job.job_id}) + "\n",
+                    encoding="utf-8",
+                )
+        return 0
+
+    constant_plan = build_run_plan(
+        project_dir=project_dir,
+        context="cache",
+        workflow_name="constant_flow",
+        step_name="constant_value",
+        address="sub_001",
+    )
+    monkeypatch.setattr(
+        "nipact.execution._run_snakemake",
+        lambda *_args, **_kwargs: execute_synthetic(constant_plan),
+    )
+    assert execute_run_plan(constant_plan, cores=1).all_selected_published
+
+    consumer_plan = build_run_plan(
+        project_dir=project_dir,
+        context="cache",
+        workflow_name="constant_flow",
+        step_name="use_constant",
+        address="sub_001",
+    )
+    assert [ref.step_name for ref in consumer_plan.reused_outputs] == [
+        "constant_value"
+    ]
+    monkeypatch.setattr(
+        "nipact.execution._run_snakemake",
+        lambda *_args, **_kwargs: execute_synthetic(consumer_plan),
+    )
+    assert execute_run_plan(consumer_plan, cores=1).all_selected_published
 
 
 def test_cross_target_run_plan_reuses_upstream_from_registry(
@@ -1427,14 +1500,14 @@ def test_dry_run_maps_fresh_candidate_path_when_registered_path_moves(
     [
         ("delete", "registered reusable artifact file is missing"),
         ("resize", "registered reusable artifact file size mismatch"),
-        ("retract", "reusable artifact is no longer valid"),
+        ("delete_membership", None),
     ],
 )
 def test_dry_run_revalidates_reused_source_before_snakemake(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     change: str,
-    message: str,
+    message: str | None,
 ) -> None:
     project_dir, runtime_dir, _log_path = _write_cache_project(tmp_path, monkeypatch)
     b_plan = build_run_plan(
@@ -1481,11 +1554,153 @@ def test_dry_run_revalidates_reused_source_before_snakemake(
         return 0
 
     monkeypatch.setattr("nipact.execution._run_snakemake", record_run)
-    with pytest.raises(ValidationError, match=message):
+    if message is None:
+        assert execute_run_plan(c_plan, cores=1).published_count == 0
+        assert calls == [True]
+        assert c_plan.run_workspace.exists()
+    else:
+        with pytest.raises(ValidationError, match=message):
+            execute_run_plan(c_plan, cores=1)
+        assert calls == []
+        assert not c_plan.run_workspace.exists()
+    assert _registry_row_counts(runtime_dir) == counts_before
+
+
+def test_real_run_records_reused_dependency_without_current_membership(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project_dir, runtime_dir, _log_path = _write_cache_project(tmp_path, monkeypatch)
+    b_plan = build_run_plan(
+        project_dir=project_dir,
+        context="cache",
+        workflow_name="main",
+        step_name="b_transform",
+    )
+    assert execute_run_plan(b_plan, cores=1).published_count == len(
+        b_plan.published_outputs
+    )
+    c_plan = build_run_plan(
+        project_dir=project_dir,
+        context="cache",
+        workflow_name="main",
+        step_name="c_transform",
+    )
+    reused_id = c_plan.reused_outputs[0].source_artifact_id
+    with sqlite3.connect(runtime_dir / "database/registry.db") as conn:
+        conn.execute(
+            "DELETE FROM published_outputs WHERE artifact_id = ?",
+            (reused_id,),
+        )
+
+    assert execute_run_plan(c_plan, cores=1).all_selected_published
+    c_id = _latest_workflow_artifact_id(
+        runtime_dir,
+        step_name="c_transform",
+        output_name="c_out",
+        address="sub_001",
+    )
+    with sqlite3.connect(runtime_dir / "database/registry.db") as conn:
+        assert conn.execute(
+            """
+            SELECT source_artifact_id
+            FROM artifact_dependencies
+            WHERE dependent_artifact_id = ?
+              AND source_step_name = 'b_transform'
+            """,
+            (c_id,),
+        ).fetchone() == (reused_id,)
+
+
+def test_execution_reresolution_rejects_retracted_artifact_before_snakemake(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project_dir, runtime_dir, _log_path = _write_cache_project(tmp_path, monkeypatch)
+    b_plan = build_run_plan(
+        project_dir=project_dir,
+        context="cache",
+        workflow_name="main",
+        step_name="b_transform",
+    )
+    assert execute_run_plan(b_plan, cores=1).published_count == len(
+        b_plan.published_outputs
+    )
+    c_plan = build_run_plan(
+        project_dir=project_dir,
+        context="cache",
+        workflow_name="main",
+        step_name="c_transform",
+    )
+    with sqlite3.connect(runtime_dir / "database/registry.db") as conn:
+        conn.execute(
+            "UPDATE artifacts SET is_published = 0 WHERE artifact_id = ?",
+            (c_plan.reused_outputs[0].source_artifact_id,),
+        )
+    calls: list[bool] = []
+    monkeypatch.setattr(
+        "nipact.execution._run_snakemake",
+        lambda *_args, **_kwargs: calls.append(True) or 0,
+    )
+
+    with pytest.raises(
+        ValidationError,
+        match="reusable artifact bundle is no longer valid",
+    ):
         execute_run_plan(c_plan, cores=1)
     assert calls == []
-    assert not c_plan.run_workspace.exists()
-    assert _registry_row_counts(runtime_dir) == counts_before
+
+
+def test_real_hydration_reads_freshly_reresolved_registered_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project_dir, runtime_dir, _log_path = _write_cache_project(tmp_path, monkeypatch)
+    b_plan = build_run_plan(
+        project_dir=project_dir,
+        context="cache",
+        workflow_name="main",
+        step_name="b_transform",
+    )
+    assert execute_run_plan(b_plan, cores=1).published_count == len(
+        b_plan.published_outputs
+    )
+    c_plan = build_run_plan(
+        project_dir=project_dir,
+        context="cache",
+        workflow_name="main",
+        step_name="c_transform",
+    )
+    reused = c_plan.reused_outputs[0]
+    old_path = reused.source_path
+    new_rel = (
+        "outputs/cache/main/b_transform/b_out/relocated/"
+        f"{old_path.name}"
+    )
+    new_path = runtime_dir / new_rel
+    new_path.parent.mkdir(parents=True, exist_ok=True)
+    new_path.write_bytes(old_path.read_bytes())
+    with sqlite3.connect(runtime_dir / "database/registry.db") as conn:
+        conn.execute(
+            """
+            UPDATE artifacts
+            SET path = ?, published_path = ?
+            WHERE artifact_id = ?
+            """,
+            (new_rel, new_rel, reused.source_artifact_id),
+        )
+
+    original_digest = execution_module.sha256_file_digest
+    hashed_paths: list[Path] = []
+
+    def recording_digest(path: Path) -> str:
+        hashed_paths.append(Path(path))
+        return original_digest(path)
+
+    monkeypatch.setattr(execution_module, "sha256_file_digest", recording_digest)
+    assert execute_run_plan(c_plan, cores=1).all_selected_published
+    assert new_path in hashed_paths
+    assert old_path not in hashed_paths
 
 
 def test_dry_run_accepts_same_size_corruption_real_run_rejects_it(
@@ -1882,6 +2097,40 @@ def test_multi_output_dry_run_maps_consumed_reused_sibling(
     assert log_path.read_text(encoding="utf-8") == log_before
     assert _registry_row_counts(runtime_dir) == counts_before
 
+    invalidated_plan = build_run_plan(
+        project_dir=project_dir,
+        context="cache",
+        workflow_name="main",
+        step_name="use_multi",
+        dry_run=True,
+    )
+    with sqlite3.connect(runtime_dir / "database/registry.db") as conn:
+        right_path = conn.execute(
+            """
+            SELECT path
+            FROM artifacts
+            WHERE context = 'cache'
+              AND step_name = 'multi_transform'
+              AND output_name = 'right_out'
+              AND address = 'sub_001'
+              AND is_published = 1
+            ORDER BY run_id
+            LIMIT 1
+            """
+        ).fetchone()[0]
+    (runtime_dir / str(right_path)).unlink()
+    calls: list[bool] = []
+    monkeypatch.setattr(
+        "nipact.execution._run_snakemake",
+        lambda *_args, **_kwargs: calls.append(True) or 0,
+    )
+    with pytest.raises(
+        ValidationError,
+        match="registered reusable artifact file is missing",
+    ):
+        execute_run_plan(invalidated_plan, cores=1)
+    assert calls == []
+
 
 def test_targeted_multi_output_run_publishes_both_siblings_for_one_entity(
     tmp_path: Path,
@@ -2049,18 +2298,24 @@ def test_published_artifact_from_another_context_is_not_reused(
         step_name="b_transform",
     )
     assert execute_run_plan(b_plan, cores=1).published_count == len(b_plan.published_outputs)
-    request = _reuse_request_for_job(b_plan, step_name="b_transform")
+    probe_plan = build_run_plan(
+        project_dir=project_dir,
+        context="cache",
+        workflow_name="main",
+        step_name="c_transform",
+    )
+    request = probe_plan.reused_outputs[0].reuse_request
 
     # Runtime roots are separate in normal projects, but the registry resolver
     # still needs an explicit context predicate. Without it, a valid selected
     # output from another context in the same registry could be hydrated into the
     # wrong workflow declaration.
-    foreign_context_request = registry_module.ReusableArtifactRequest(
+    foreign_context_request = registry_module.ReusableArtifactBundleRequest(
         **{**request.__dict__, "context": "other_context"}
     )
 
     assert (
-        registry_module.resolve_reusable_artifact(
+        registry_module.resolve_reusable_artifact_bundle(
             runtime_dir / "database/registry.db",
             runtime_root=runtime_dir,
             request=foreign_context_request,
@@ -2247,9 +2502,8 @@ def test_sibling_workflow_reuses_upstream_across_base_chain_boundary(
         address="sub_001",
     )
 
-    # `derivative` has no base_workflow, so before this change its reuse set was
-    # just itself and it recomputed b. Reuse now spans the whole context, so it
-    # hydrates main's published b across the sibling boundary.
+    # Reuse is artifact-direct and independent of workflow membership, so the
+    # derivative hydrates main's compatible published b.
     derivative_c_plan = build_run_plan(
         project_dir=project_dir,
         context="cache",
@@ -2298,10 +2552,9 @@ def test_sibling_does_not_reuse_when_computation_diverges(
         main_b_plan.published_outputs
     )
 
-    # The global step `b_transform` changes computation after main published. The
-    # sibling now *considers* main's b (the base-chain gate is gone) but the
-    # content match in resolve_reusable_artifact rejects it on the diverging
-    # predicate, so b is recomputed; only the unchanged a_source prefix is reused.
+    # The global step `b_transform` changes computation after main published.
+    # Exact request-projection equality rejects main's prior b, so b is recomputed;
+    # only the unchanged a_source prefix is reused.
     b_step_path = project_dir / "steps/b_transform.yaml"
     b_step = yaml.safe_load(b_step_path.read_text(encoding="utf-8"))
     if change == "params":
@@ -2608,8 +2861,8 @@ def test_sibling_cohort_collection_mixes_sources(
     )
 
     # main's fit over {sub_001, sub_002} collects a mixed-source cohort:
-    # sub_001's b from main (base chain wins), sub_002's b from the sibling (the
-    # only holder). fit itself recomputes since no single workflow published it.
+    # sub_001's oldest valid b is main's, while sub_002's only candidate is the
+    # sibling's. fit itself recomputes because no compatible fit bundle exists.
     main_fit_plan = build_run_plan(
         project_dir=project_dir,
         context="cache",
@@ -3349,6 +3602,246 @@ def test_targeted_rerun_with_identical_bytes_revalidates_published_file(
         runtime_dir,
         artifact_id=row_after[0],
     )
+
+
+def test_bundle_reresolution_records_the_equivalent_artifact_actually_consumed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project_dir, runtime_dir, _log_path = _write_cache_project(
+        tmp_path,
+        monkeypatch,
+        entities=("sub_001",),
+    )
+    first_plan = build_run_plan(
+        project_dir=project_dir,
+        context="cache",
+        workflow_name="main",
+        step_name="b_transform",
+        address="sub_001",
+    )
+    assert execute_run_plan(first_plan, cores=1).all_selected_published
+
+    first_c_plan = build_run_plan(
+        project_dir=project_dir,
+        context="cache",
+        workflow_name="main",
+        step_name="c_transform",
+        address="sub_001",
+    )
+    older_id = first_c_plan.reused_outputs[0].source_artifact_id
+
+    # Insert an equivalent bundle after planning. Execution must preserve the
+    # still-valid planned bundle rather than silently changing retrospective
+    # lineage to the newly inserted entity.
+    second_plan = build_run_plan(
+        project_dir=project_dir,
+        context="cache",
+        workflow_name="main",
+        step_name="b_transform",
+        address="sub_001",
+    )
+    assert execute_run_plan(second_plan, cores=1).all_selected_published
+
+    with sqlite3.connect(runtime_dir / "database/registry.db") as conn:
+        artifact_ids = [
+            int(row[0])
+            for row in conn.execute(
+                """
+                SELECT artifact_id
+                FROM artifacts
+                WHERE context = 'cache'
+                  AND step_name = 'b_transform'
+                  AND output_name = 'b_out'
+                  AND address = 'sub_001'
+                ORDER BY run_id
+                """
+            ).fetchall()
+        ]
+    assert len(artifact_ids) == 2
+    assert artifact_ids[0] == older_id
+    newer_id = artifact_ids[1]
+
+    assert first_c_plan.reused_outputs[0].source_artifact_id == older_id
+    assert execute_run_plan(first_c_plan, cores=1).all_selected_published
+    first_c_id = _latest_workflow_artifact_id(
+        runtime_dir,
+        step_name="c_transform",
+        output_name="c_out",
+        address="sub_001",
+    )
+    with sqlite3.connect(runtime_dir / "database/registry.db") as conn:
+        assert conn.execute(
+            """
+            SELECT source_artifact_id
+            FROM artifact_dependencies
+            WHERE dependent_artifact_id = ?
+              AND source_step_name = 'b_transform'
+            """,
+            (first_c_id,),
+        ).fetchone() == (older_id,)
+
+    second_c_plan = build_run_plan(
+        project_dir=project_dir,
+        context="cache",
+        workflow_name="main",
+        step_name="c_transform",
+        address="sub_001",
+    )
+    assert second_c_plan.reused_outputs[0].source_artifact_id == older_id
+    with sqlite3.connect(runtime_dir / "database/registry.db") as conn:
+        conn.execute(
+            """
+            UPDATE artifacts
+            SET path = ?, published_path = ?
+            WHERE artifact_id = ?
+            """,
+            (
+                "outputs/cache/main/b_transform/b_out/missing.json",
+                "outputs/cache/main/b_transform/b_out/missing.json",
+                older_id,
+            ),
+        )
+
+    assert execute_run_plan(second_c_plan, cores=1).all_selected_published
+    second_c_id = _latest_workflow_artifact_id(
+        runtime_dir,
+        step_name="c_transform",
+        output_name="c_out",
+        address="sub_001",
+    )
+    with sqlite3.connect(runtime_dir / "database/registry.db") as conn:
+        assert conn.execute(
+            """
+            SELECT source_artifact_id
+            FROM artifact_dependencies
+            WHERE dependent_artifact_id = ?
+              AND source_step_name = 'b_transform'
+            """,
+            (second_c_id,),
+        ).fetchone() == (newer_id,)
+
+
+def test_bundle_resolver_reports_recorded_divergence_before_missing_files(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project_dir, runtime_dir, _log_path = _write_cache_project(
+        tmp_path,
+        monkeypatch,
+        entities=("sub_001",),
+    )
+    for _ in range(2):
+        plan = build_run_plan(
+            project_dir=project_dir,
+            context="cache",
+            workflow_name="main",
+            step_name="b_transform",
+            address="sub_001",
+        )
+        assert execute_run_plan(plan, cores=1).all_selected_published
+
+    with sqlite3.connect(runtime_dir / "database/registry.db") as conn:
+        rows = conn.execute(
+            """
+            SELECT artifact_id, path
+            FROM artifacts
+            WHERE context = 'cache'
+              AND step_name = 'b_transform'
+              AND output_name = 'b_out'
+              AND address = 'sub_001'
+            ORDER BY run_id
+            """
+        ).fetchall()
+        assert len(rows) == 2
+        conn.execute(
+            "UPDATE artifacts SET content_digest = ? WHERE artifact_id = ?",
+            ("f" * 64, int(rows[1][0])),
+        )
+    (runtime_dir / str(rows[0][1])).unlink()
+
+    with pytest.raises(
+        ValidationError,
+        match="divergent reusable artifact bundles",
+    ):
+        build_run_plan(
+            project_dir=project_dir,
+            context="cache",
+            workflow_name="main",
+            step_name="c_transform",
+            address="sub_001",
+        )
+
+
+def test_execution_rechecks_divergence_in_transitive_reused_closure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project_dir, runtime_dir, _log_path = _write_cache_project(
+        tmp_path,
+        monkeypatch,
+        entities=("sub_001",),
+    )
+    b_plan = build_run_plan(
+        project_dir=project_dir,
+        context="cache",
+        workflow_name="main",
+        step_name="b_transform",
+        address="sub_001",
+    )
+    assert execute_run_plan(b_plan, cores=1).all_selected_published
+    c_plan = build_run_plan(
+        project_dir=project_dir,
+        context="cache",
+        workflow_name="main",
+        step_name="c_transform",
+        address="sub_001",
+    )
+    assert [ref.step_name for ref in c_plan.reused_outputs] == ["b_transform"]
+    assert {ref.step_name for ref in c_plan.reused_validation_outputs} == {
+        "a_source",
+        "b_transform",
+    }
+
+    # A is not copied into C's workspace because B is the reuse boundary, but
+    # its requested bundle remains part of the transitive validation closure.
+    second_a_plan = build_run_plan(
+        project_dir=project_dir,
+        context="cache",
+        workflow_name="main",
+        step_name="a_source",
+        address="sub_001",
+    )
+    assert execute_run_plan(second_a_plan, cores=1).all_selected_published
+    with sqlite3.connect(runtime_dir / "database/registry.db") as conn:
+        newest_a_id = conn.execute(
+            """
+            SELECT artifact_id
+            FROM artifacts
+            WHERE context = 'cache'
+              AND step_name = 'a_source'
+              AND output_name = 'a_out'
+              AND address = 'sub_001'
+            ORDER BY run_id DESC
+            LIMIT 1
+            """
+        ).fetchone()[0]
+        conn.execute(
+            "UPDATE artifacts SET content_digest = ? WHERE artifact_id = ?",
+            ("f" * 64, int(newest_a_id)),
+        )
+
+    calls: list[bool] = []
+    monkeypatch.setattr(
+        "nipact.execution._run_snakemake",
+        lambda *_args, **_kwargs: calls.append(True) or 0,
+    )
+    with pytest.raises(
+        ValidationError,
+        match="divergent reusable artifact bundles",
+    ):
+        execute_run_plan(c_plan, cores=1)
+    assert calls == []
 
 
 def test_targeted_rerun_rejects_divergent_deterministic_output_and_rolls_back(

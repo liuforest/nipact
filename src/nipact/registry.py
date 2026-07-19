@@ -194,17 +194,14 @@ class RegistryDependency:
 
 
 @dataclass(frozen=True)
-class ReusableArtifactRequest:
+class ReusableArtifactBundleRequest:
     context: str
-    workflow_name: str
     step_name: str
-    output_name: str
     address: str
-    extension: str
-    callable_ref: str
-    parameters_json: str
+    identity_contract_version: int
+    request_bundle_projection_json: str
+    sibling_outputs: tuple[tuple[str, str], ...]
     input_records: tuple[ArtifactInputRow, ...]
-    allowed_workflow_names: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -212,6 +209,7 @@ class ReusableArtifactCandidate:
     artifact_id: int
     run_id: int
     path: str
+    published_path: str | None
     content_digest: str
     file_size: int
     extension: str
@@ -219,10 +217,23 @@ class ReusableArtifactCandidate:
     step_name: str
     output_name: str
     address: str
-    parameter_digest: str
-    parameters_json: str
-    callable_ref: str
+    identity_contract_version: int
+    request_bundle_projection_json: str
     dependencies: tuple[RegistryDependency, ...]
+
+
+@dataclass(frozen=True)
+class ReusableArtifactBundleCandidate:
+    run_id: int
+    outputs: tuple[ReusableArtifactCandidate, ...]
+
+    def output(self, output_name: str) -> ReusableArtifactCandidate:
+        for candidate in self.outputs:
+            if candidate.output_name == output_name:
+                return candidate
+        raise ValidationError(
+            f"reusable artifact bundle is missing output {output_name!r}"
+        )
 
 
 @dataclass(frozen=True)
@@ -583,7 +594,6 @@ def record_workflow_run(
     environment_observation: EnvironmentObservationV1,
     manifest_bindings: Iterable[RunManifestBindingRow],
     membership_intents: Iterable[MembershipIntent],
-    allowed_reused_workflow_names: Iterable[str] | None = None,
     base_workflow_name: str | None = None,
 ) -> int:
     """Record one run, superseding current rows while retaining history."""
@@ -593,7 +603,6 @@ def record_workflow_run(
     selected_resolution_rows = tuple(selected_resolution_intents)
     manifest_binding_rows = tuple(manifest_bindings)
     membership_rows = tuple(membership_intents)
-    allowed_reused_workflows = tuple(allowed_reused_workflow_names or (workflow_name,))
     if any(
         row.context != context or row.workflow_name != workflow_name
         for row in selected_resolution_rows
@@ -648,6 +657,10 @@ def record_workflow_run(
                 projection_recipes=projection_recipe_rows,
                 reused_projection_seeds=reused_projection_seed_rows,
             )
+            reused_projection_identities = _reused_projection_identities(
+                context=context,
+                seeds=reused_projection_seed_rows,
+            )
             _validate_no_divergent_fresh_bundles(
                 conn,
                 context=context,
@@ -678,8 +691,7 @@ def record_workflow_run(
                 conn,
                 runtime_root=runtime_root,
                 context=context,
-                workflow_name=workflow_name,
-                allowed_reused_workflow_names=allowed_reused_workflows,
+                reused_projection_identities=reused_projection_identities,
                 artifact_rows=artifact_rows,
                 artifact_ids=artifact_ids,
             )
@@ -1114,116 +1126,166 @@ def list_artifact_group_counts(
     ]
 
 
-def resolve_reusable_artifact(
+def resolve_reusable_artifact_bundle(
     path: Path,
     *,
     runtime_root: Path,
-    request: ReusableArtifactRequest,
-) -> ReusableArtifactCandidate | None:
-    """Return one validated reusable workflow artifact, or None if none exists."""
+    request: ReusableArtifactBundleRequest,
+    preferred_artifact_ids: tuple[int, ...] | None = None,
+) -> ReusableArtifactBundleCandidate | None:
+    """Resolve one coherent reusable bundle independently of workflow membership."""
+    declared_outputs = dict(request.sibling_outputs)
+    if len(declared_outputs) != len(request.sibling_outputs):
+        raise ValidationError("reusable bundle request has duplicate sibling outputs")
     try:
         with _connect_readonly_rows(path) as conn:
             _validate_schema_version(conn)
             rows = conn.execute(
-                f"""
-                SELECT {_ARTIFACT_SELECT_COLUMNS}
-                FROM published_outputs po
-                JOIN artifacts a ON po.artifact_id = a.artifact_id
-                LEFT JOIN parameters p ON a.parameter_id = p.parameter_id
-                WHERE po.context = ?
-                  AND a.context = po.context
-                  AND a.origin = 'workflow_output'
-                  AND a.is_published = 1
-                  AND po.workflow_name = ?
-                  AND po.step_name = ?
-                  AND po.output_name = ?
-                  AND po.address = ?
-                  AND a.workflow_name = po.workflow_name
-                  AND a.step_name = po.step_name
-                  AND a.output_name = po.output_name
-                  AND a.address = po.address
-                  AND a.published_path = po.path
-                  AND a.content_digest = po.output_digest
-                  AND a.extension = ?
-                  AND a.callable_ref = ?
-                  AND p.parameters_json = ?
-                ORDER BY a.artifact_id
+                """
+                SELECT artifact_id, run_id, path, published_path,
+                       content_digest, file_size,
+                       extension, workflow_name, step_name, output_name, address,
+                       identity_contract_version, request_bundle_projection_json
+                FROM artifacts
+                WHERE context = ?
+                  AND origin = 'workflow_output'
+                  AND is_published = 1
+                  AND step_name = ?
+                  AND address = ?
+                  AND identity_contract_version = ?
+                  AND request_bundle_projection_json = ?
+                ORDER BY run_id, artifact_id
                 """,
                 (
                     request.context,
-                    request.workflow_name,
                     request.step_name,
-                    request.output_name,
                     request.address,
-                    request.extension,
-                    request.callable_ref,
-                    request.parameters_json,
+                    request.identity_contract_version,
+                    request.request_bundle_projection_json,
                 ),
             ).fetchall()
-            valid: list[ReusableArtifactCandidate] = []
+            candidates_by_run: dict[int, dict[str, ReusableArtifactCandidate]] = {}
             for row in rows:
-                artifact = _registry_artifact_from_row(row)
-                dependencies = _dependencies_for_artifact(conn, artifact.artifact_id)
-                if not _dependencies_match_request(
-                    conn,
-                    dependencies=dependencies,
-                    input_records=request.input_records,
-                    allowed_workflow_names=_request_allowed_workflow_names(request),
-                ):
-                    continue
-                _validate_reusable_artifact_file(
-                    runtime_root=runtime_root,
-                    artifact=artifact,
-                )
                 if (
-                    artifact.parameter_digest is None
-                    or artifact.parameters_json is None
-                    or artifact.callable_ref is None
-                    or artifact.workflow_name is None
-                    or artifact.step_name is None
-                    or artifact.output_name is None
-                    or artifact.address is None
-                    or artifact.run_id is None
+                    row["run_id"] is None
+                    or row["workflow_name"] is None
+                    or row["step_name"] is None
+                    or row["output_name"] is None
+                    or row["address"] is None
+                    or row["identity_contract_version"] is None
+                    or row["request_bundle_projection_json"] is None
                 ):
                     raise ValidationError("registry reusable artifact row is incomplete")
-                valid.append(
-                    ReusableArtifactCandidate(
-                        artifact_id=artifact.artifact_id,
-                        run_id=artifact.run_id,
-                        path=artifact.path,
-                        content_digest=artifact.content_digest,
-                        file_size=artifact.file_size,
-                        extension=artifact.extension,
-                        workflow_name=artifact.workflow_name,
-                        step_name=artifact.step_name,
-                        output_name=artifact.output_name,
-                        address=artifact.address,
-                        parameter_digest=artifact.parameter_digest,
-                        parameters_json=artifact.parameters_json,
-                        callable_ref=artifact.callable_ref,
-                        dependencies=tuple(dependencies),
+                run_id = int(row["run_id"])
+                output_name = str(row["output_name"])
+                run_outputs = candidates_by_run.setdefault(run_id, {})
+                if output_name in run_outputs:
+                    raise ValidationError(
+                        "registry reusable artifact bundle has duplicate sibling output: "
+                        f"run_id={run_id}, output={output_name!r}"
                     )
+                artifact_id = int(row["artifact_id"])
+                run_outputs[output_name] = ReusableArtifactCandidate(
+                    artifact_id=artifact_id,
+                    run_id=run_id,
+                    path=str(row["path"]),
+                    published_path=row["published_path"],
+                    content_digest=str(row["content_digest"]),
+                    file_size=int(row["file_size"]),
+                    extension=str(row["extension"]),
+                    workflow_name=str(row["workflow_name"]),
+                    step_name=str(row["step_name"]),
+                    output_name=output_name,
+                    address=str(row["address"]),
+                    identity_contract_version=int(row["identity_contract_version"]),
+                    request_bundle_projection_json=str(
+                        row["request_bundle_projection_json"]
+                    ),
+                    dependencies=tuple(_dependencies_for_artifact(conn, artifact_id)),
                 )
+
+            complete = [
+                ReusableArtifactBundleCandidate(
+                    run_id=run_id,
+                    outputs=tuple(run_outputs[name] for name in sorted(run_outputs)),
+                )
+                for run_id, run_outputs in candidates_by_run.items()
+                if set(run_outputs) == set(declared_outputs)
+            ]
+            if not complete:
+                return None
+
+            signatures = {
+                tuple(
+                    (candidate.output_name, candidate.content_digest)
+                    for candidate in bundle.outputs
+                )
+                for bundle in complete
+            }
+            if len(signatures) > 1:
+                conflicts = "; ".join(
+                    "run_id="
+                    f"{bundle.run_id}, artifact_ids="
+                    f"{tuple(candidate.artifact_id for candidate in bundle.outputs)}"
+                    for bundle in complete
+                )
+                raise ValidationError(
+                    "divergent reusable artifact bundles for one deterministic "
+                    f"request: {conflicts}"
+                )
+
+            lineage_compatible = [
+                bundle
+                for bundle in complete
+                if all(
+                    _dependencies_match_request(
+                        conn,
+                        context=request.context,
+                        dependencies=list(candidate.dependencies),
+                        input_records=request.input_records,
+                    )
+                    for candidate in bundle.outputs
+                )
+            ]
+            if not lineage_compatible:
+                return None
+
+            valid: list[ReusableArtifactBundleCandidate] = []
+            invalid_reasons: list[str] = []
+            for bundle in lineage_compatible:
+                reasons = [
+                    reason
+                    for candidate in bundle.outputs
+                    if (
+                        reason := _reusable_artifact_occurrence_error(
+                            runtime_root=runtime_root,
+                            candidate=candidate,
+                            declared_extension=declared_outputs[candidate.output_name],
+                        )
+                    )
+                    is not None
+                ]
+                if reasons:
+                    invalid_reasons.extend(reasons)
+                else:
+                    valid.append(bundle)
     except sqlite3.Error as exc:
         raise ValidationError(f"registry.db is malformed: {exc}") from exc
     if not valid:
-        return None
-    if len(valid) > 1:
-        raise ValidationError("ambiguous reusable artifact candidates")
-    return valid[0]
-
-
-def _request_allowed_workflow_names(
-    request: ReusableArtifactRequest,
-) -> tuple[str, ...]:
-    return request.allowed_workflow_names or (request.workflow_name,)
+        raise ValidationError(invalid_reasons[0])
+    if preferred_artifact_ids is not None:
+        preferred = set(preferred_artifact_ids)
+        for bundle in valid:
+            if {candidate.artifact_id for candidate in bundle.outputs} == preferred:
+                return bundle
+    return min(valid, key=lambda bundle: bundle.run_id)
 
 
 def _dependencies_for_artifact(
     conn: sqlite3.Connection,
     artifact_id: int,
 ) -> list[RegistryDependency]:
-    rows = conn.execute(
+    cursor = conn.execute(
         """
         SELECT dependent_artifact_id, source_artifact_id,
                source_content_digest, source_file_size, source_extension, input_path,
@@ -1235,16 +1297,23 @@ def _dependencies_for_artifact(
         ORDER BY binding_name, input_path, source_artifact_id
         """,
         (artifact_id,),
-    ).fetchall()
-    return [_registry_dependency_from_row(row) for row in rows]
+    )
+    rows = cursor.fetchall()
+    if not rows or isinstance(rows[0], sqlite3.Row):
+        return [_registry_dependency_from_row(row) for row in rows]
+    names = [str(description[0]) for description in cursor.description]
+    return [
+        _registry_dependency_from_row(dict(zip(names, row)))  # type: ignore[arg-type]
+        for row in rows
+    ]
 
 
 def _dependencies_match_request(
     conn: sqlite3.Connection,
     *,
+    context: str,
     dependencies: list[RegistryDependency],
     input_records: tuple[ArtifactInputRow, ...],
-    allowed_workflow_names: tuple[str, ...],
 ) -> bool:
     if len(dependencies) != len(input_records):
         return False
@@ -1252,9 +1321,9 @@ def _dependencies_match_request(
     for input_record in input_records:
         match_index = _find_matching_dependency_index(
             conn,
+            context=context,
             dependencies=unused,
             input_record=input_record,
-            allowed_workflow_names=allowed_workflow_names,
         )
         if match_index is None:
             return False
@@ -1265,9 +1334,9 @@ def _dependencies_match_request(
 def _find_matching_dependency_index(
     conn: sqlite3.Connection,
     *,
+    context: str,
     dependencies: list[RegistryDependency],
     input_record: ArtifactInputRow,
-    allowed_workflow_names: tuple[str, ...],
 ) -> int | None:
     for index, dependency in enumerate(dependencies):
         if not _dependency_common_fields_match(dependency, input_record):
@@ -1275,6 +1344,7 @@ def _find_matching_dependency_index(
         source = _dependency_source_artifact(conn, dependency.source_artifact_id)
         if input_record.origin == "source":
             if not _source_dependency_matches_current_input(
+                context=context,
                 dependency=dependency,
                 source=source,
                 input_record=input_record,
@@ -1287,7 +1357,6 @@ def _find_matching_dependency_index(
                 dependency=dependency,
                 source=source,
                 input_record=input_record,
-                allowed_workflow_names=allowed_workflow_names,
             ):
                 continue
             return index
@@ -1309,11 +1378,12 @@ def _dependency_common_fields_match(
 
 def _source_dependency_matches_current_input(
     *,
+    context: str,
     dependency: RegistryDependency,
     source: RegistryArtifact,
     input_record: ArtifactInputRow,
 ) -> bool:
-    if source.origin != "source":
+    if source.origin != "source" or source.context != context:
         return False
     if input_record.source_artifact_path is None:
         raise ValidationError("source dependency is missing source artifact path")
@@ -1332,49 +1402,22 @@ def _workflow_dependency_matches_input(
     dependency: RegistryDependency,
     source: RegistryArtifact,
     input_record: ArtifactInputRow,
-    allowed_workflow_names: tuple[str, ...],
 ) -> bool:
     if source.origin != "workflow_output":
         return False
-    if (
-        input_record.source_callable_ref is not None
-        and source.callable_ref != input_record.source_callable_ref
-    ):
+    if input_record.registry_source_artifact_id is None:
         return False
-    if (
-        input_record.source_parameters_json is not None
-        and source.parameters_json != input_record.source_parameters_json
-    ):
-        return False
-    if (
-        input_record.source_extension is not None
-        and source.extension != input_record.source_extension
-    ):
-        return False
-    if not _workflow_dependency_source_matches_registry_source(
+    requested = _dependency_source_artifact(
         conn,
-        dependency=dependency,
-        source=source,
-        input_record=input_record,
-        allowed_workflow_names=allowed_workflow_names,
-    ):
+        input_record.registry_source_artifact_id,
+    )
+    if not _workflow_artifacts_are_equivalent(source, requested):
         return False
     _validate_workflow_dependency_snapshot(dependency=dependency, source=source)
-    if input_record.source_is_reused is False:
-        if input_record.source_execution_role != "source_import":
-            return False
-        if not input_record.source_input_records:
-            return False
-        if not _dependencies_match_request(
-            conn,
-            dependencies=_dependencies_for_artifact(conn, source.artifact_id),
-            input_records=input_record.source_input_records,
-            allowed_workflow_names=allowed_workflow_names,
-        ):
-            return False
-    elif not _workflow_artifact_dependencies_match_registry(
+    if not _workflow_artifact_dependencies_match_registry(
         conn,
         artifact_id=source.artifact_id,
+        expected_context=source.context,
         visited=set(),
     ):
         return False
@@ -1388,48 +1431,31 @@ def _workflow_dependency_matches_input(
     )
 
 
-def _workflow_dependency_source_matches_registry_source(
-    conn: sqlite3.Connection,
-    *,
-    dependency: RegistryDependency,
+def _workflow_artifacts_are_equivalent(
     source: RegistryArtifact,
-    input_record: ArtifactInputRow,
-    allowed_workflow_names: tuple[str, ...],
+    requested: RegistryArtifact,
 ) -> bool:
-    if input_record.registry_source_artifact_id is None:
-        return True
-    if dependency.source_artifact_id == input_record.registry_source_artifact_id:
-        return True
-    requested = _dependency_source_artifact(
-        conn,
-        input_record.registry_source_artifact_id,
+    return (
+        source.origin == "workflow_output"
+        and requested.origin == "workflow_output"
+        and source.context == requested.context
+        and source.step_name == requested.step_name
+        and source.output_name == requested.output_name
+        and source.address == requested.address
+        and source.identity_contract_version == requested.identity_contract_version
+        and source.request_bundle_projection_json
+        == requested.request_bundle_projection_json
+        and source.content_digest == requested.content_digest
+        and source.file_size == requested.file_size
+        and source.extension == requested.extension
     )
-    if requested.origin != "workflow_output":
-        return False
-    if source.workflow_name != requested.workflow_name and not (
-        source.workflow_name in allowed_workflow_names
-        and requested.workflow_name in allowed_workflow_names
-    ):
-        return False
-    if (
-        source.context != requested.context
-        or source.step_name != requested.step_name
-        or source.output_name != requested.output_name
-        or source.address != requested.address
-        or source.callable_ref != requested.callable_ref
-        or source.parameters_json != requested.parameters_json
-        or source.content_digest != requested.content_digest
-        or source.file_size != requested.file_size
-        or source.extension != requested.extension
-    ):
-        return False
-    return True
 
 
 def _workflow_artifact_dependencies_match_registry(
     conn: sqlite3.Connection,
     *,
     artifact_id: int,
+    expected_context: str,
     visited: set[int],
 ) -> bool:
     if artifact_id in visited:
@@ -1438,9 +1464,13 @@ def _workflow_artifact_dependencies_match_registry(
     dependencies = _dependencies_for_artifact(conn, artifact_id)
     if not dependencies:
         visited.remove(artifact_id)
-        return False
+        artifact = _dependency_source_artifact(conn, artifact_id)
+        return _artifact_projection_declares_no_bindings(artifact)
     for dependency in dependencies:
         source = _dependency_source_artifact(conn, dependency.source_artifact_id)
+        if source.context != expected_context:
+            visited.remove(artifact_id)
+            return False
         if source.origin == "source":
             if (
                 dependency.source_content_digest != source.content_digest
@@ -1458,6 +1488,7 @@ def _workflow_artifact_dependencies_match_registry(
             if not _workflow_artifact_dependencies_match_registry(
                 conn,
                 artifact_id=source.artifact_id,
+                expected_context=expected_context,
                 visited=visited,
             ):
                 visited.remove(artifact_id)
@@ -1467,6 +1498,24 @@ def _workflow_artifact_dependencies_match_registry(
         return False
     visited.remove(artifact_id)
     return True
+
+
+def _artifact_projection_declares_no_bindings(artifact: RegistryArtifact) -> bool:
+    raw_projection = artifact.request_bundle_projection_json
+    if raw_projection is None:
+        return False
+    try:
+        payload = json.loads(raw_projection)
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise ValidationError("registry artifact request projection is malformed") from exc
+    if not isinstance(payload, dict):
+        raise ValidationError("registry artifact request projection must be an object")
+    bindings = payload.get("role_labelled_bindings")
+    if not isinstance(bindings, list):
+        raise ValidationError(
+            "registry artifact request projection bindings are malformed"
+        )
+    return not bindings
 
 
 def _validate_workflow_dependency_snapshot(
@@ -1486,7 +1535,7 @@ def _dependency_source_artifact(
     conn: sqlite3.Connection,
     artifact_id: int,
 ) -> RegistryArtifact:
-    row = conn.execute(
+    cursor = conn.execute(
         f"""
         SELECT {_ARTIFACT_SELECT_COLUMNS}
         FROM artifacts a
@@ -1494,27 +1543,47 @@ def _dependency_source_artifact(
         WHERE a.artifact_id = ?
         """,
         (artifact_id,),
-    ).fetchone()
+    )
+    row = cursor.fetchone()
     if row is None:
         raise ValidationError("registry dependency source artifact is missing")
-    return _registry_artifact_from_row(row)
+    if isinstance(row, sqlite3.Row):
+        return _registry_artifact_from_row(row)
+    names = [str(description[0]) for description in cursor.description]
+    return _registry_artifact_from_row(dict(zip(names, row)))  # type: ignore[arg-type]
 
 
-def _validate_reusable_artifact_file(
+def _reusable_artifact_occurrence_error(
     *,
     runtime_root: Path,
-    artifact: RegistryArtifact,
-) -> None:
-    artifact_path = _runtime_relative_file_path(runtime_root, artifact.path)
+    candidate: ReusableArtifactCandidate,
+    declared_extension: str,
+) -> str | None:
+    if candidate.published_path != candidate.path:
+        raise ValidationError(
+            "registered reusable artifact publication path is inconsistent"
+        )
+    if candidate.extension != declared_extension:
+        raise ValidationError(
+            "registered reusable artifact extension does not match its output contract"
+        )
+    if not candidate.path.endswith(declared_extension):
+        raise ValidationError(
+            "registered reusable artifact path does not match its declared extension"
+        )
+    if not is_valid_digest(candidate.content_digest):
+        raise ValidationError("registered reusable artifact digest is invalid")
+    artifact_path = _runtime_relative_file_path(runtime_root, candidate.path)
     outputs_root = (runtime_root / "outputs").resolve()
     if not _path_contains_or_same(outputs_root, artifact_path):
         raise ValidationError(
             "registered reusable artifact path must stay inside outputs/"
         )
     if not artifact_path.is_file():
-        raise ValidationError("registered reusable artifact file is missing")
-    if artifact_path.stat().st_size != artifact.file_size:
-        raise ValidationError("registered reusable artifact file size mismatch")
+        return "registered reusable artifact file is missing"
+    if artifact_path.stat().st_size != candidate.file_size:
+        return "registered reusable artifact file size mismatch"
+    return None
 
 
 def _runtime_relative_file_path(runtime_root: Path, artifact_path: str) -> Path:
@@ -2186,6 +2255,24 @@ def _finalize_retained_job_projections(
     return finalized
 
 
+def _reused_projection_identities(
+    *,
+    context: str,
+    seeds: tuple[ReusedProjectionSeed, ...],
+) -> dict[RequestedOutputCoordinate, tuple[int, str]]:
+    identities: dict[RequestedOutputCoordinate, tuple[int, str]] = {}
+    for seed in seeds:
+        if seed.requested_output.namespace != context:
+            raise ValidationError("reused projection seed belongs to another context")
+        if seed.requested_output in identities:
+            raise ValidationError("reused projection seed coordinate is duplicated")
+        identities[seed.requested_output] = (
+            seed.projection.identity_contract_version,
+            canonical_projection_json(seed.projection),
+        )
+    return identities
+
+
 def _upsert_source_artifacts_for_inputs(
     conn: sqlite3.Connection,
     *,
@@ -2255,8 +2342,10 @@ def _insert_artifact_dependencies(
     *,
     runtime_root: Path,
     context: str,
-    workflow_name: str,
-    allowed_reused_workflow_names: tuple[str, ...],
+    reused_projection_identities: dict[
+        RequestedOutputCoordinate,
+        tuple[int, str],
+    ],
     artifact_rows: tuple[WorkflowOutputArtifactRow, ...],
     artifact_ids: dict[tuple[str, str, str], int],
 ) -> None:
@@ -2267,8 +2356,7 @@ def _insert_artifact_dependencies(
                 conn,
                 runtime_root=runtime_root,
                 context=context,
-                workflow_name=workflow_name,
-                allowed_reused_workflow_names=allowed_reused_workflow_names,
+                reused_projection_identities=reused_projection_identities,
                 input_record=input_record,
                 artifact_ids=artifact_ids,
             )
@@ -2309,8 +2397,10 @@ def _dependency_source_artifact_id(
     *,
     runtime_root: Path,
     context: str,
-    workflow_name: str,
-    allowed_reused_workflow_names: tuple[str, ...],
+    reused_projection_identities: dict[
+        RequestedOutputCoordinate,
+        tuple[int, str],
+    ],
     input_record: ArtifactInputRow,
     artifact_ids: dict[tuple[str, str, str], int],
 ) -> int:
@@ -2340,8 +2430,7 @@ def _dependency_source_artifact_id(
                 conn,
                 runtime_root=runtime_root,
                 context=context,
-                workflow_name=workflow_name,
-                allowed_reused_workflow_names=allowed_reused_workflow_names,
+                reused_projection_identities=reused_projection_identities,
                 input_record=input_record,
             )
             return input_record.registry_source_artifact_id
@@ -2363,71 +2452,79 @@ def _validate_reused_dependency_source(
     *,
     runtime_root: Path,
     context: str,
-    workflow_name: str,
-    allowed_reused_workflow_names: tuple[str, ...],
+    reused_projection_identities: dict[
+        RequestedOutputCoordinate,
+        tuple[int, str],
+    ],
     input_record: ArtifactInputRow,
 ) -> None:
     if input_record.registry_source_artifact_id is None:
         raise ValidationError("reused workflow dependency source artifact is missing")
-    if workflow_name not in allowed_reused_workflow_names:
-        raise ValidationError("current workflow is outside allowed reuse ancestry")
-    if (
-        input_record.source_callable_ref is None
-        or input_record.source_parameters_json is None
-        or input_record.source_extension is None
-    ):
+    if input_record.source_extension is None:
         raise ValidationError("reused workflow dependency source metadata is incomplete")
-    row = conn.execute(
-        """
-        SELECT a.context, a.origin, a.workflow_name, a.step_name, a.output_name,
-               a.address, a.callable_ref, p.parameters_json, a.extension,
-               a.is_published, a.path, a.published_path, a.content_digest,
-               a.file_size, po.path, po.output_digest, po.context,
-               po.workflow_name, po.step_name, po.output_name, po.address
-        FROM artifacts a
-        LEFT JOIN parameters p ON a.parameter_id = p.parameter_id
-        LEFT JOIN published_outputs po ON po.artifact_id = a.artifact_id
-        WHERE a.artifact_id = ?
-        """,
-        (input_record.registry_source_artifact_id,),
-    ).fetchone()
-    if row is None:
-        raise ValidationError("reused workflow dependency source artifact is unknown")
-    if row[0] != context:
-        raise ValidationError("reused workflow dependency source context mismatch")
-    if row[1] != "workflow_output":
-        raise ValidationError("reused workflow dependency source is not a workflow output")
-    if row[2] not in allowed_reused_workflow_names:
-        raise ValidationError("reused workflow dependency source is outside allowed ancestry")
     if (
-        row[3] != input_record.source_step_name
-        or row[4] != input_record.source_output_name
-        or row[5] != input_record.source_address
+        input_record.source_step_name is None
+        or input_record.source_output_name is None
+        or input_record.source_address is None
+    ):
+        raise ValidationError("reused workflow dependency source coordinates are incomplete")
+    coordinate = RequestedOutputCoordinate(
+        namespace=context,
+        step_name=input_record.source_step_name,
+        output_name=input_record.source_output_name,
+        address=input_record.source_address,
+    )
+    try:
+        expected_identity_version, expected_projection_json = (
+            reused_projection_identities[coordinate]
+        )
+    except KeyError as exc:
+        raise ValidationError(
+            "reused workflow dependency source projection is missing"
+        ) from exc
+    artifact = _dependency_source_artifact(
+        conn,
+        input_record.registry_source_artifact_id,
+    )
+    if artifact.context != context:
+        raise ValidationError("reused workflow dependency source context mismatch")
+    if artifact.origin != "workflow_output":
+        raise ValidationError("reused workflow dependency source is not a workflow output")
+    if (
+        artifact.step_name != input_record.source_step_name
+        or artifact.output_name != input_record.source_output_name
+        or artifact.address != input_record.source_address
     ):
         raise ValidationError("reused workflow dependency source coordinates mismatch")
     if (
-        row[6] != input_record.source_callable_ref
-        or row[7] != input_record.source_parameters_json
-        or row[8] != input_record.source_extension
+        artifact.identity_contract_version != expected_identity_version
+        or artifact.request_bundle_projection_json != expected_projection_json
+        or artifact.extension != input_record.source_extension
     ):
         raise ValidationError("reused workflow dependency source identity mismatch")
-    if not row[9] or row[14] is None:
-        raise ValidationError("reused workflow dependency source is not current published output")
-    if (
-        row[16] != row[0]
-        or row[17] != row[2]
-        or row[18] != row[3]
-        or row[19] != row[4]
-        or row[20] != row[5]
-    ):
+    if not artifact.is_published or artifact.published_path != artifact.path:
         raise ValidationError("reused workflow dependency source publication mismatch")
-    if row[10] != row[14] or row[11] != row[14] or row[12] != row[15]:
-        raise ValidationError("reused workflow dependency source publication mismatch")
-    source_path = runtime_root / str(row[10])
+    if not artifact.path.endswith(artifact.extension):
+        raise ValidationError("reused workflow dependency source path extension mismatch")
+    if not is_valid_digest(artifact.content_digest):
+        raise ValidationError("reused workflow dependency source digest is invalid")
+    source_path = _runtime_relative_file_path(runtime_root, artifact.path)
+    outputs_root = (runtime_root / "outputs").resolve()
+    if not _path_contains_or_same(outputs_root, source_path):
+        raise ValidationError(
+            "reused workflow dependency source path must stay inside outputs/"
+        )
     if not source_path.is_file():
         raise ValidationError("reused workflow dependency source file is missing")
-    if source_path.stat().st_size != int(row[13]):
+    if source_path.stat().st_size != artifact.file_size:
         raise ValidationError("reused workflow dependency source file size mismatch")
+    if not _workflow_artifact_dependencies_match_registry(
+        conn,
+        artifact_id=artifact.artifact_id,
+        expected_context=context,
+        visited=set(),
+    ):
+        raise ValidationError("reused workflow dependency source lineage is stale")
 
 
 def _source_artifact_snapshot(
@@ -2921,6 +3018,11 @@ def _create_schema(conn: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS artifacts_selected_lookup_idx
             ON artifacts(context, workflow_name, step_name, output_name, address)
             WHERE is_selected_output = 1;
+        CREATE INDEX IF NOT EXISTS artifacts_reuse_lookup_idx
+            ON artifacts(
+                context, step_name, address, identity_contract_version, run_id
+            )
+            WHERE origin = 'workflow_output' AND is_published = 1;
 
         CREATE TABLE IF NOT EXISTS artifact_dependencies (
             dependent_artifact_id INTEGER NOT NULL
