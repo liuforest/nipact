@@ -10,7 +10,7 @@ import shlex
 import shutil
 import subprocess
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Callable
 
@@ -34,6 +34,7 @@ from .projection import (
     SourceCoordinate,
     StepContract,
     UpstreamRequestedOutputBindingPlan,
+    canonical_projection_json,
     resolve_request_bundle_projection_plan,
 )
 from .registry import (
@@ -43,15 +44,16 @@ from .registry import (
     PublishedOutputRow,
     REGISTRY_DB_PATH,
     RetainedJobProjectionRecipe,
+    ReusableArtifactBundleCandidate,
+    ReusableArtifactBundleRequest,
     ReusableArtifactCandidate,
-    ReusableArtifactRequest,
     ReusedProjectionSeed,
     RunManifestBindingRow,
     SelectedOutputResolutionIntent,
     WorkflowOutputArtifactRow,
     record_workflow_run,
     read_registered_source_snapshots,
-    resolve_reusable_artifact,
+    resolve_reusable_artifact_bundle,
 )
 from .workflow import (
     LoadedWorkflowProject,
@@ -219,9 +221,10 @@ class ReusedRunJobOutputRef:
     source_artifact_id: int
     source_workflow_name: str
     source_run_id: int
+    source_bundle_artifact_ids: tuple[int, ...]
     content_digest: str
     file_size: int
-    reuse_request: ReusableArtifactRequest
+    reuse_request: ReusableArtifactBundleRequest
     projection_plan: RequestBundleProjectionPlanV1
     projection_state: RequestBundleProjectionState
 
@@ -244,7 +247,7 @@ class RunPlan:
     selected_jobs: tuple[RunJob, ...]
     selected_output_refs: tuple[RunJobOutputRef, ...]
     reused_outputs: tuple[ReusedRunJobOutputRef, ...]
-    reuse_workflow_names: tuple[str, ...]
+    reused_validation_outputs: tuple[ReusedRunJobOutputRef, ...]
     # Reporting statistic: fresh jobs in the selected targets' reachable
     # closure. jobs stays population-wide; this is the executed forecast.
     reachable_job_count: int
@@ -323,6 +326,10 @@ def build_run_plan(
         jobs=tuple(job for job in jobs if job.job_id in reachable_job_ids),
         reused_outputs_by_artifact=reused_outputs_by_artifact,
     )
+    reused_validation_outputs = _reused_validation_outputs(
+        jobs=tuple(job for job in jobs if job.job_id in reachable_job_ids),
+        reused_outputs_by_artifact=reused_outputs_by_artifact,
+    )
     published_outputs = _published_output_specs(
         loaded=loaded,
         plan=plan,
@@ -346,7 +353,7 @@ def build_run_plan(
         selected_jobs=selected_jobs,
         selected_output_refs=selected_output_refs,
         reused_outputs=reused_outputs,
-        reuse_workflow_names=_reuse_workflow_names(loaded, plan.workflow_name),
+        reused_validation_outputs=reused_validation_outputs,
         reachable_job_count=len(reachable_job_ids),
     )
 
@@ -368,6 +375,7 @@ def execute_run_plan(
     if cores <= 0:
         raise ValidationError("cores must be a positive integer")
     _emit_status(status_callback, "building_workspace")
+    actual_reused_artifacts: dict[int, ReusableArtifactCandidate] = {}
     if run_plan.dry_run:
         # Dry runs never copy reused artifacts into staging: the generated
         # Snakefile points reused inputs at the freshly re-resolved registered
@@ -377,7 +385,7 @@ def execute_run_plan(
         _write_run_workspace(run_plan, reused_input_paths=reused_input_paths)
     else:
         _write_run_workspace(run_plan)
-        _hydrate_reused_outputs(run_plan)
+        actual_reused_artifacts = _hydrate_reused_outputs(run_plan)
         _remove_expected_staged_outputs(run_plan)
     _emit_status(status_callback, "starting_snakemake")
     returncode = _run_snakemake(run_plan, cores=cores, dry_run=run_plan.dry_run)
@@ -411,6 +419,7 @@ def execute_run_plan(
         artifact_rows = _workflow_output_artifact_rows(
             run_plan,
             published_rows=published_rows,
+            actual_reused_artifacts=actual_reused_artifacts,
         )
         projection_recipes = _retained_projection_recipes(
             run_plan,
@@ -447,7 +456,6 @@ def execute_run_plan(
             membership_intents=tuple(
                 MembershipIntent(row=row) for row in published_rows
             ),
-            allowed_reused_workflow_names=run_plan.reuse_workflow_names,
         )
         _emit_status(status_callback, "registry_updated")
         selected_addresses = {
@@ -730,15 +738,10 @@ def _dry_run_reused_input_paths(run_plan: RunPlan) -> dict[str, str]:
     Resolution re-checks identity, dependencies, outputs/ containment,
     existence, and size without hashing bytes.
     """
+    candidates = _reresolve_reused_bundles(run_plan)
     mapping: dict[str, str] = {}
     for output_ref in run_plan.reused_outputs:
-        candidate = resolve_reusable_artifact(
-            run_plan.runtime_root / REGISTRY_DB_PATH,
-            runtime_root=run_plan.runtime_root,
-            request=output_ref.reuse_request,
-        )
-        if candidate is None or candidate.artifact_id != output_ref.source_artifact_id:
-            raise ValidationError("reusable artifact is no longer valid")
+        candidate = candidates[output_ref.source_artifact_id]
         mapping[output_ref.staging_path_relative] = os.path.relpath(
             run_plan.runtime_root / candidate.path,
             run_plan.run_workspace,
@@ -746,30 +749,65 @@ def _dry_run_reused_input_paths(run_plan: RunPlan) -> dict[str, str]:
     return mapping
 
 
-def _hydrate_reused_outputs(run_plan: RunPlan) -> None:
+def _hydrate_reused_outputs(
+    run_plan: RunPlan,
+) -> dict[int, ReusableArtifactCandidate]:
+    candidates = _reresolve_reused_bundles(run_plan)
     for output_ref in run_plan.reused_outputs:
-        candidate = resolve_reusable_artifact(
-            run_plan.runtime_root / REGISTRY_DB_PATH,
-            runtime_root=run_plan.runtime_root,
-            request=output_ref.reuse_request,
-        )
-        if candidate is None or candidate.artifact_id != output_ref.source_artifact_id:
-            raise ValidationError("reusable artifact is no longer valid")
-        source_path = output_ref.source_path
+        candidate = candidates[output_ref.source_artifact_id]
+        source_path = run_plan.runtime_root / candidate.path
         if not source_path.is_file():
             raise ValidationError(
-                f"missing reusable artifact file: {output_ref.source_path_relative}"
+                f"missing reusable artifact file: {candidate.path}"
             )
-        if source_path.stat().st_size != output_ref.file_size:
+        if source_path.stat().st_size != candidate.file_size:
             raise ValidationError("reusable artifact file size mismatch during hydration")
-        if sha256_file_digest(source_path) != output_ref.content_digest:
+        if sha256_file_digest(source_path) != candidate.content_digest:
             raise ValidationError("reusable artifact digest mismatch during hydration")
         output_ref.staging_path.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(source_path, output_ref.staging_path)
-        if output_ref.staging_path.stat().st_size != output_ref.file_size:
+        if output_ref.staging_path.stat().st_size != candidate.file_size:
             raise ValidationError("hydrated artifact file size mismatch")
-        if sha256_file_digest(output_ref.staging_path) != output_ref.content_digest:
+        if sha256_file_digest(output_ref.staging_path) != candidate.content_digest:
             raise ValidationError("hydrated artifact digest mismatch")
+    return candidates
+
+
+def _reresolve_reused_bundles(
+    run_plan: RunPlan,
+) -> dict[int, ReusableArtifactCandidate]:
+    refs_by_request: dict[
+        ReusableArtifactBundleRequest,
+        list[ReusedRunJobOutputRef],
+    ] = {}
+    for output_ref in run_plan.reused_validation_outputs:
+        refs_by_request.setdefault(output_ref.reuse_request, []).append(output_ref)
+
+    bundles: dict[
+        ReusableArtifactBundleRequest,
+        ReusableArtifactBundleCandidate,
+    ] = {}
+    for request, output_refs in refs_by_request.items():
+        preferred_artifact_ids = output_refs[0].source_bundle_artifact_ids
+        if any(
+            output_ref.source_bundle_artifact_ids != preferred_artifact_ids
+            for output_ref in output_refs[1:]
+        ):
+            raise ValidationError("reused outputs disagree on their planned bundle")
+        bundle = resolve_reusable_artifact_bundle(
+            run_plan.runtime_root / REGISTRY_DB_PATH,
+            runtime_root=run_plan.runtime_root,
+            request=request,
+            preferred_artifact_ids=preferred_artifact_ids,
+        )
+        if bundle is None:
+            raise ValidationError("reusable artifact bundle is no longer valid")
+        bundles[request] = bundle
+    resolved: dict[int, ReusableArtifactCandidate] = {}
+    for output_ref in run_plan.reused_outputs:
+        candidate = bundles[output_ref.reuse_request].output(output_ref.output_name)
+        resolved[output_ref.source_artifact_id] = candidate
+    return resolved
 
 
 def _run_snakemake(run_plan: RunPlan, *, cores: int, dry_run: bool) -> int:
@@ -961,6 +999,7 @@ def _workflow_output_artifact_rows(
     run_plan: RunPlan,
     *,
     published_rows: tuple[PublishedOutputRow, ...],
+    actual_reused_artifacts: dict[int, ReusableArtifactCandidate],
 ) -> tuple[WorkflowOutputArtifactRow, ...]:
     published_by_key = {
         (row.step_name, row.output_name, row.address): row
@@ -1009,10 +1048,37 @@ def _workflow_output_artifact_rows(
                     callable_ref=output_ref.callable_ref,
                     is_selected_output=key in selected_output_keys,
                     is_published=True,
-                    input_records=output_ref.input_records,
+                    input_records=tuple(
+                        _actual_input_record(record, actual_reused_artifacts)
+                        for record in output_ref.input_records
+                    ),
                 )
             )
     return tuple(rows)
+
+
+def _actual_input_record(
+    record: ArtifactInputRow,
+    actual_reused_artifacts: dict[int, ReusableArtifactCandidate],
+) -> ArtifactInputRow:
+    nested = tuple(
+        _actual_input_record(source_record, actual_reused_artifacts)
+        for source_record in record.source_input_records
+    )
+    artifact_id = record.registry_source_artifact_id
+    if artifact_id is None:
+        return replace(record, source_input_records=nested)
+    candidate = actual_reused_artifacts.get(artifact_id)
+    if candidate is None:
+        raise ValidationError(
+            "executed run is missing a re-resolved reused artifact dependency"
+        )
+    return replace(
+        record,
+        registry_source_artifact_id=candidate.artifact_id,
+        source_extension=candidate.extension,
+        source_input_records=nested,
+    )
 
 
 def _retained_projection_recipes(
@@ -1343,8 +1409,6 @@ def _build_jobs(
             ):
                 reused_refs = _reusable_output_refs_for_job(
                     loaded=loaded,
-                    plan=plan,
-                    run_workspace=run_workspace,
                     job=job,
                 )
             if reused_refs is not None:
@@ -1538,52 +1602,43 @@ def _run_job_outputs(
 def _reusable_output_refs_for_job(
     *,
     loaded: LoadedWorkflowProject,
-    plan: WorkflowPlan,
-    run_workspace: Path,
     job: RunJob,
 ) -> dict[str, ReusedRunJobOutputRef] | None:
+    if not isinstance(job.projection_state, RequestBundleProjectionV1):
+        return None
     registry_path = loaded.runtime_root / REGISTRY_DB_PATH
-    reuse_workflow_names = _reuse_workflow_names(loaded, plan.workflow_name)
-    for workflow_name in reuse_workflow_names:
-        candidates: dict[str, ReusableArtifactCandidate] = {}
-        requests: dict[str, ReusableArtifactRequest] = {}
-        for output_name, output in job.outputs.items():
-            request = ReusableArtifactRequest(
-                context=loaded.context,
-                workflow_name=workflow_name,
-                step_name=job.step_name,
-                output_name=output_name,
-                address=job.address,
-                extension=output.declared_extension,
-                callable_ref=job.callable_ref,
-                parameters_json=_compact_json(job.params),
-                input_records=job.input_records,
-                allowed_workflow_names=reuse_workflow_names,
+    request = ReusableArtifactBundleRequest(
+        context=loaded.context,
+        step_name=job.step_name,
+        address=job.address,
+        identity_contract_version=job.projection_state.identity_contract_version,
+        request_bundle_projection_json=canonical_projection_json(job.projection_state),
+        sibling_outputs=tuple(
+            sorted(
+                (output_name, output.declared_extension)
+                for output_name, output in job.outputs.items()
             )
-            candidate = resolve_reusable_artifact(
-                registry_path,
-                runtime_root=loaded.runtime_root,
-                request=request,
-            )
-            if candidate is None:
-                break
-            candidates[output_name] = candidate
-            requests[output_name] = request
-        if len(candidates) != len(job.outputs):
-            continue
-        if len({candidate.run_id for candidate in candidates.values()}) > 1:
-            continue
-        return {
-            output_name: _reused_output_ref(
-                runtime_root=loaded.runtime_root,
-                output=job.outputs[output_name],
-                job=job,
-                candidate=candidate,
-                request=requests[output_name],
-            )
-            for output_name, candidate in candidates.items()
-        }
-    return None
+        ),
+        input_records=job.input_records,
+    )
+    bundle = resolve_reusable_artifact_bundle(
+        registry_path,
+        runtime_root=loaded.runtime_root,
+        request=request,
+    )
+    if bundle is None:
+        return None
+    return {
+        output_name: _reused_output_ref(
+            runtime_root=loaded.runtime_root,
+            output=output,
+            job=job,
+            candidate=bundle.output(output_name),
+            bundle=bundle,
+            request=request,
+        )
+        for output_name, output in job.outputs.items()
+    }
 
 
 def _reused_output_ref(
@@ -1592,7 +1647,8 @@ def _reused_output_ref(
     output: RunJobOutput,
     job: RunJob,
     candidate: ReusableArtifactCandidate,
-    request: ReusableArtifactRequest,
+    bundle: ReusableArtifactBundleCandidate,
+    request: ReusableArtifactBundleRequest,
 ) -> ReusedRunJobOutputRef:
     source_path = runtime_root / candidate.path
     return ReusedRunJobOutputRef(
@@ -1610,31 +1666,15 @@ def _reused_output_ref(
         source_artifact_id=candidate.artifact_id,
         source_workflow_name=candidate.workflow_name,
         source_run_id=candidate.run_id,
+        source_bundle_artifact_ids=tuple(
+            output.artifact_id for output in bundle.outputs
+        ),
         content_digest=candidate.content_digest,
         file_size=candidate.file_size,
         reuse_request=request,
         projection_plan=job.projection_plan,
         projection_state=job.projection_state,
     )
-
-
-def _reuse_workflow_names(
-    loaded: LoadedWorkflowProject,
-    workflow_name: str,
-) -> tuple[str, ...]:
-    # Reuse candidates are every workflow in the context, not just the base
-    # chain: identity is content/lineage-addressed (callable_ref + params +
-    # recursive input digests), so a byte-identical artifact from a sibling
-    # workflow is as valid to reuse as one from an ancestor. The base chain
-    # (self + ancestors) stays first so its existing matches and tie-breaks are
-    # preserved exactly; siblings only fill in as a sorted fallback.
-    base_chain: list[str] = []
-    current: str | None = workflow_name
-    while current is not None:
-        base_chain.append(current)
-        current = loaded.workflows[current].base_workflow
-    siblings = sorted(set(loaded.workflows) - set(base_chain))
-    return (*base_chain, *siblings)
 
 
 def _used_reused_outputs(
@@ -1653,6 +1693,43 @@ def _used_reused_outputs(
         for output_ref in reused_outputs_by_artifact.values()
         if output_ref.source_artifact_id in used_ids
     )
+
+
+def _reused_validation_outputs(
+    *,
+    jobs: tuple[RunJob, ...],
+    reused_outputs_by_artifact: dict[tuple[str, str, str], ReusedRunJobOutputRef],
+) -> tuple[ReusedRunJobOutputRef, ...]:
+    refs_by_id = {
+        output_ref.source_artifact_id: output_ref
+        for output_ref in reused_outputs_by_artifact.values()
+    }
+    pending = [
+        record.registry_source_artifact_id
+        for job in jobs
+        for record in job.input_records
+        if record.registry_source_artifact_id is not None
+    ]
+    seen_requests: set[ReusableArtifactBundleRequest] = set()
+    validation_refs: list[ReusedRunJobOutputRef] = []
+    while pending:
+        artifact_id = pending.pop()
+        try:
+            output_ref = refs_by_id[artifact_id]
+        except KeyError as exc:
+            raise ValidationError(
+                "reachable reused dependency is missing its planned bundle"
+            ) from exc
+        if output_ref.reuse_request in seen_requests:
+            continue
+        seen_requests.add(output_ref.reuse_request)
+        validation_refs.append(output_ref)
+        pending.extend(
+            record.registry_source_artifact_id
+            for record in output_ref.reuse_request.input_records
+            if record.registry_source_artifact_id is not None
+        )
+    return tuple(validation_refs)
 
 
 def _output_refs_by_key(
