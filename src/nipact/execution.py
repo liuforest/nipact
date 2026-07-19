@@ -16,6 +16,23 @@ from .artifacts import output_filename
 from .errors import ValidationError
 from .hashing import sha256_file_digest, short_hash
 from .identity import validate_path_token
+from .projection import (
+    IDENTITY_CONTRACT_VERSION,
+    OUTPUT_CONTRACT_VERSION,
+    RUNNER_CONTRACT_VERSION,
+    CollectionBindingPlan,
+    OutputContract,
+    RequestBundleProjectionPlanV1,
+    RequestBundleProjectionState,
+    RequestBundleProjectionV1,
+    RequestedOutputCoordinate,
+    SiblingOutput,
+    SourceBindingPlan,
+    SourceCoordinate,
+    StepContract,
+    UpstreamRequestedOutputBindingPlan,
+    resolve_request_bundle_projection_plan,
+)
 from .registry import (
     ArtifactInputRow,
     PublishedOutputRow,
@@ -25,6 +42,7 @@ from .registry import (
     RunManifestBindingRow,
     WorkflowOutputArtifactRow,
     record_workflow_run,
+    read_registered_source_snapshots,
     resolve_reusable_artifact,
 )
 from .workflow import (
@@ -77,6 +95,8 @@ class RunJob:
     inputs: dict[str, tuple[str, ...]]
     input_records: tuple[ArtifactInputRow, ...]
     params: dict[str, object]
+    projection_plan: RequestBundleProjectionPlanV1
+    projection_state: RequestBundleProjectionState
 
     @property
     def output_name(self) -> str:
@@ -166,6 +186,14 @@ class RunJobOutputRef:
     def params(self) -> dict[str, object]:
         return self.job.params
 
+    @property
+    def projection_plan(self) -> RequestBundleProjectionPlanV1:
+        return self.job.projection_plan
+
+    @property
+    def projection_state(self) -> RequestBundleProjectionState:
+        return self.job.projection_state
+
 
 @dataclass(frozen=True)
 class ReusedRunJobOutputRef:
@@ -186,6 +214,8 @@ class ReusedRunJobOutputRef:
     content_digest: str
     file_size: int
     reuse_request: ReusableArtifactRequest
+    projection_plan: RequestBundleProjectionPlanV1
+    projection_state: RequestBundleProjectionState
 
 
 @dataclass(frozen=True)
@@ -1105,6 +1135,14 @@ def _build_jobs(
     selected_addresses: tuple[str, ...],
 ) -> tuple[tuple[RunJob, ...], dict[tuple[str, str, str], ReusedRunJobOutputRef]]:
     jobs: list[RunJob] = []
+    source_snapshots = read_registered_source_snapshots(
+        loaded.runtime_root / REGISTRY_DB_PATH,
+        context=loaded.context,
+    )
+    projection_states_by_output: dict[
+        RequestedOutputCoordinate,
+        RequestBundleProjectionState,
+    ] = {}
     outputs_by_artifact: dict[
         tuple[str, str, str],
         RunJobOutputRef | ReusedRunJobOutputRef,
@@ -1132,6 +1170,18 @@ def _build_jobs(
                 outputs=outputs,
                 address=address,
             )
+            projection_plan = _request_projection_plan(
+                context=loaded.context,
+                step=step,
+                address=address,
+                outputs=outputs,
+                input_records=input_records,
+            )
+            projection_state = resolve_request_bundle_projection_plan(
+                projection_plan,
+                source_snapshots=source_snapshots,
+                upstream_states=projection_states_by_output,
+            )
             job = RunJob(
                 job_id=_job_id(step.step_name, address, outputs),
                 step_name=step.step_name,
@@ -1142,13 +1192,27 @@ def _build_jobs(
                 inputs=input_paths,
                 input_records=input_records,
                 params=dict(step.params),
+                projection_plan=projection_plan,
+                projection_state=projection_state,
             )
             job_keys = {
                 (step.step_name, output_name, address)
                 for output_name in outputs
             }
+            for output_name in outputs:
+                projection_states_by_output[
+                    RequestedOutputCoordinate(
+                        namespace=loaded.context,
+                        step_name=step.step_name,
+                        output_name=output_name,
+                        address=address,
+                    )
+                ] = projection_state
             reused_refs: dict[str, ReusedRunJobOutputRef] | None = None
-            if not job_keys.intersection(selected_keys):
+            if (
+                isinstance(projection_state, RequestBundleProjectionV1)
+                and not job_keys.intersection(selected_keys)
+            ):
                 reused_refs = _reusable_output_refs_for_job(
                     loaded=loaded,
                     plan=plan,
@@ -1171,6 +1235,150 @@ def _build_jobs(
     if missing_selected:
         raise ValidationError("run plan is missing selected job(s)")
     return tuple(jobs), reused_outputs_by_artifact
+
+
+def _request_projection_plan(
+    *,
+    context: str,
+    step: WorkflowPlanStep,
+    address: str,
+    outputs: dict[str, Any],
+    input_records: tuple[ArtifactInputRow, ...],
+) -> RequestBundleProjectionPlanV1:
+    return RequestBundleProjectionPlanV1(
+        identity_contract_version=IDENTITY_CONTRACT_VERSION,
+        namespace=context,
+        step_contract=StepContract(
+            step_contract_id=step.step_name,
+            step_contract_version=step.step_contract_version,
+            callable_ref=step.callable_ref,
+            runner_contract_version=RUNNER_CONTRACT_VERSION,
+        ),
+        address=address,
+        canonical_parameters=dict(step.params),
+        role_labelled_binding_plans=_projection_binding_plans(
+            context=context,
+            input_records=input_records,
+        ),
+        result_affecting_settings={},
+        determinism_contract="deterministic",
+        output_contract=OutputContract(
+            output_contract_version=OUTPUT_CONTRACT_VERSION,
+            sibling_outputs=tuple(
+                SiblingOutput(
+                    output_name=output_name,
+                    declared_extension=output.extension,
+                )
+                for output_name, output in outputs.items()
+            ),
+        ),
+    )
+
+
+def _projection_binding_plans(
+    *,
+    context: str,
+    input_records: tuple[ArtifactInputRow, ...],
+) -> tuple[
+    SourceBindingPlan
+    | UpstreamRequestedOutputBindingPlan
+    | CollectionBindingPlan,
+    ...,
+]:
+    records_by_binding: dict[str, list[ArtifactInputRow]] = {}
+    for record in input_records:
+        records_by_binding.setdefault(record.binding_name, []).append(record)
+
+    binding_plans: list[
+        SourceBindingPlan
+        | UpstreamRequestedOutputBindingPlan
+        | CollectionBindingPlan
+    ] = []
+    for binding_name, records in records_by_binding.items():
+        origins = {record.origin for record in records}
+        dependency_roles = {record.dependency_role for record in records}
+        if len(origins) != 1 or len(dependency_roles) != 1:
+            raise ValidationError(
+                f"input binding {binding_name!r} has inconsistent dependency records"
+            )
+        origin = next(iter(origins))
+        dependency_role = next(iter(dependency_roles))
+        if origin == "source":
+            if len(records) != 1 or records[0].source_artifact_path is None:
+                raise ValidationError(
+                    f"source input binding {binding_name!r} is malformed"
+                )
+            binding_plans.append(
+                SourceBindingPlan(
+                    role=binding_name,
+                    source_coordinate=SourceCoordinate(
+                        namespace=context,
+                        path=records[0].source_artifact_path,
+                    ),
+                )
+            )
+            continue
+        if origin != "workflow_output":
+            raise ValidationError(
+                f"input binding {binding_name!r} has unsupported origin {origin!r}"
+            )
+
+        requested_outputs = tuple(
+            _requested_output_coordinate(context=context, record=record)
+            for record in records
+        )
+        if dependency_role in {"source_input", "apply_input", "collective_fit"}:
+            if len(requested_outputs) != 1:
+                raise ValidationError(
+                    f"scalar input binding {binding_name!r} must have one source"
+                )
+            binding_plans.append(
+                UpstreamRequestedOutputBindingPlan(
+                    role=binding_name,
+                    requested_output=requested_outputs[0],
+                )
+            )
+            continue
+        if dependency_role in {"fit_input", "analysis_input"}:
+            manifest_digests = {record.manifest_digest for record in records}
+            if len(manifest_digests) != 1:
+                raise ValidationError(
+                    f"collection input binding {binding_name!r} has inconsistent manifests"
+                )
+            binding_plans.append(
+                CollectionBindingPlan(
+                    role=binding_name,
+                    collection_semantics="coordinate_set_v1",
+                    manifest_digest=next(iter(manifest_digests)),
+                    members=requested_outputs,
+                )
+            )
+            continue
+        raise ValidationError(
+            f"unsupported dependency role for projection: {dependency_role}"
+        )
+    return tuple(binding_plans)
+
+
+def _requested_output_coordinate(
+    *,
+    context: str,
+    record: ArtifactInputRow,
+) -> RequestedOutputCoordinate:
+    if (
+        record.source_step_name is None
+        or record.source_output_name is None
+        or record.source_address is None
+    ):
+        raise ValidationError(
+            f"workflow input binding {record.binding_name!r} is missing its coordinate"
+        )
+    return RequestedOutputCoordinate(
+        namespace=context,
+        step_name=record.source_step_name,
+        output_name=record.source_output_name,
+        address=record.source_address,
+    )
 
 
 def _run_job_outputs(
@@ -1277,6 +1485,8 @@ def _reused_output_ref(
         content_digest=candidate.content_digest,
         file_size=candidate.file_size,
         reuse_request=request,
+        projection_plan=job.projection_plan,
+        projection_state=job.projection_state,
     )
 
 

@@ -7,11 +7,20 @@ from pathlib import Path
 import pytest
 import yaml
 
+import nipact.execution as execution_module
 import nipact.registry as registry_module
 from nipact.cli import main
 from nipact.errors import ValidationError
 from nipact.execution import RunOutcome, build_run_plan, execute_run_plan
 from nipact.hashing import sha256_file_digest
+from nipact.projection import (
+    CollectionBinding,
+    RequestBundleProjectionV1,
+    SourceCoordinate,
+    UnresolvedRequestBundleProjection,
+    UpstreamRequestedOutputBinding,
+    canonical_projection_json,
+)
 from nipact.trace import build_trace_graph_for_workflow_coordinate
 
 
@@ -801,6 +810,233 @@ def _reuse_request_for_job(
         parameters_json=_compact_json(job.params),
         input_records=job.input_records,
     )
+
+
+def test_projection_planning_propagates_unregistered_source_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project_dir, _runtime_dir, _log_path = _write_cache_project(
+        tmp_path,
+        monkeypatch,
+    )
+    snapshot_reads = 0
+    original_read = execution_module.read_registered_source_snapshots
+
+    def count_snapshot_read(*args: object, **kwargs: object) -> object:
+        nonlocal snapshot_reads
+        snapshot_reads += 1
+        return original_read(*args, **kwargs)
+
+    monkeypatch.setattr(
+        execution_module,
+        "read_registered_source_snapshots",
+        count_snapshot_read,
+    )
+
+    run_plan = build_run_plan(
+        project_dir=project_dir,
+        context="cache",
+        workflow_name="main",
+        step_name="b_transform",
+    )
+
+    expected = UnresolvedRequestBundleProjection(
+        (SourceCoordinate("cache", "data/source/sub_001.txt"),)
+    )
+    assert {job.step_name for job in run_plan.jobs} == {"a_source", "b_transform"}
+    assert all(job.projection_state == expected for job in run_plan.jobs)
+    assert run_plan.selected_jobs[0].projection_state == expected
+    assert run_plan.reused_outputs == ()
+    assert snapshot_reads == 1
+
+
+def test_projection_planning_uses_prospective_upstream_request_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project_dir, runtime_dir, _log_path = _write_cache_project(
+        tmp_path,
+        monkeypatch,
+    )
+    first_plan = build_run_plan(
+        project_dir=project_dir,
+        context="cache",
+        workflow_name="main",
+        step_name="b_transform",
+    )
+    assert execute_run_plan(first_plan, cores=1).published_count == len(
+        first_plan.published_outputs
+    )
+
+    fresh_b_plan = build_run_plan(
+        project_dir=project_dir,
+        context="cache",
+        workflow_name="main",
+        step_name="b_transform",
+    )
+    fresh_b = _workflow_input_job(fresh_b_plan, step_name="b_transform")
+    assert isinstance(fresh_b.projection_state, RequestBundleProjectionV1)
+
+    c_plan = build_run_plan(
+        project_dir=project_dir,
+        context="cache",
+        workflow_name="main",
+        step_name="c_transform",
+    )
+    reused_b = next(
+        output
+        for output in c_plan.reused_outputs
+        if output.step_name == "b_transform"
+    )
+    c_job = _workflow_input_job(c_plan, step_name="c_transform")
+    assert reused_b.projection_state == fresh_b.projection_state
+    assert isinstance(c_job.projection_state, RequestBundleProjectionV1)
+    assert c_job.projection_state.role_labelled_bindings == (
+        UpstreamRequestedOutputBinding(
+            role="b_input",
+            upstream_request_projection=fresh_b.projection_state,
+            output_name="b_out",
+        ),
+    )
+
+    derivative_b_plan = build_run_plan(
+        project_dir=project_dir,
+        context="cache",
+        workflow_name="derivative",
+        step_name="b_transform",
+    )
+    derivative_b = _workflow_input_job(
+        derivative_b_plan,
+        step_name="b_transform",
+    )
+    assert derivative_b.projection_state == fresh_b.projection_state
+
+    _write_workflow_variant(
+        project_dir,
+        workflow_name="parameter_variant",
+        base_workflow="main",
+        step_overrides={"b_transform": {"params": {"version": "2"}}},
+    )
+    parameter_variant_plan = build_run_plan(
+        project_dir=project_dir,
+        context="cache",
+        workflow_name="parameter_variant",
+        step_name="b_transform",
+    )
+    parameter_variant_b = _workflow_input_job(
+        parameter_variant_plan,
+        step_name="b_transform",
+    )
+    assert parameter_variant_b.projection_state != fresh_b.projection_state
+
+    before_edit = canonical_projection_json(c_job.projection_state)
+    (runtime_dir / "data/source/sub_001.txt").write_text(
+        "edited without source re-registration\n",
+        encoding="utf-8",
+    )
+    after_edit_plan = build_run_plan(
+        project_dir=project_dir,
+        context="cache",
+        workflow_name="main",
+        step_name="c_transform",
+    )
+    after_edit_c = _workflow_input_job(after_edit_plan, step_name="c_transform")
+    assert isinstance(after_edit_c.projection_state, RequestBundleProjectionV1)
+    assert canonical_projection_json(after_edit_c.projection_state) == before_edit
+
+    source_step_path = project_dir / "steps/a_source.yaml"
+    source_step = yaml.safe_load(source_step_path.read_text(encoding="utf-8"))
+    source_step["step_contract_version"] = "2"
+    _write_yaml(source_step_path, source_step)
+    changed_request_plan = build_run_plan(
+        project_dir=project_dir,
+        context="cache",
+        workflow_name="main",
+        step_name="b_transform",
+    )
+    changed_b = _workflow_input_job(
+        changed_request_plan,
+        step_name="b_transform",
+    )
+    assert isinstance(changed_b.projection_state, RequestBundleProjectionV1)
+    assert changed_b.projection_state != fresh_b.projection_state
+
+
+def test_projection_planning_covers_collection_cohort_and_sibling_outputs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project_dir, _runtime_dir, _log_path = _write_cache_project(
+        tmp_path,
+        monkeypatch,
+        entities=("sub_001", "sub_002"),
+    )
+    _write_sibling_workflow(
+        project_dir,
+        workflow_name="apply_flow",
+        step_names=["a_source", "b_transform", "fit_transform", "apply_transform"],
+    )
+    b_plan = build_run_plan(
+        project_dir=project_dir,
+        context="cache",
+        workflow_name="main",
+        step_name="b_transform",
+    )
+    assert execute_run_plan(b_plan, cores=1).published_count == len(
+        b_plan.published_outputs
+    )
+
+    fit_plan = build_run_plan(
+        project_dir=project_dir,
+        context="cache",
+        workflow_name="main",
+        step_name="fit_transform",
+    )
+    fit_job = _workflow_input_job(fit_plan, step_name="fit_transform")
+    assert fit_job.address == "subjects"
+    assert isinstance(fit_job.projection_state, RequestBundleProjectionV1)
+    collection = fit_job.projection_state.role_labelled_bindings[0]
+    assert isinstance(collection, CollectionBinding)
+    assert collection.collection_semantics == "coordinate_set_v1"
+    assert collection.manifest_digest is not None
+    assert [member.upstream_request_projection.address for member in collection.members] == [
+        "sub_001",
+        "sub_002",
+    ]
+
+    apply_plan = build_run_plan(
+        project_dir=project_dir,
+        context="cache",
+        workflow_name="apply_flow",
+        step_name="apply_transform",
+    )
+    apply_jobs = [
+        job for job in apply_plan.jobs if job.step_name == "apply_transform"
+    ]
+    assert len(apply_jobs) == 2
+    for apply_job in apply_jobs:
+        assert isinstance(apply_job.projection_state, RequestBundleProjectionV1)
+        assert {
+            binding.role
+            for binding in apply_job.projection_state.role_labelled_bindings
+            if isinstance(binding, UpstreamRequestedOutputBinding)
+        } == {"b_input", "fit_input"}
+
+    multi_plan = build_run_plan(
+        project_dir=project_dir,
+        context="cache",
+        workflow_name="main",
+        step_name="multi_transform",
+    )
+    multi_job = _workflow_input_job(multi_plan, step_name="multi_transform")
+    assert isinstance(multi_job.projection_state, RequestBundleProjectionV1)
+    assert [
+        sibling.output_name
+        for sibling in multi_job.projection_state.output_contract.sibling_outputs
+    ] == ["left_out", "right_out"]
+    assert multi_job.output_ref("left_out").projection_plan is multi_job.projection_plan
+    assert multi_job.output_ref("right_out").projection_state is multi_job.projection_state
 
 
 def test_cross_target_run_plan_reuses_upstream_from_registry(
