@@ -726,6 +726,9 @@ def _registry_row_counts(runtime_dir: Path) -> dict[str, int]:
             "workflow_outputs": conn.execute(
                 "SELECT COUNT(*) FROM artifacts WHERE origin = 'workflow_output'"
             ).fetchone()[0],
+            "request_bundle_projections": conn.execute(
+                "SELECT COUNT(*) FROM request_bundle_projections"
+            ).fetchone()[0],
             "dependencies": conn.execute(
                 "SELECT COUNT(*) FROM artifact_dependencies"
             ).fetchone()[0],
@@ -2100,9 +2103,11 @@ def test_cross_workflow_membership_adopts_complete_transitive_reused_bundles(
             """
             SELECT artifact_id, run_id, workflow_name, step_name, output_name,
                    address, path, content_digest, output_hash,
-                   request_bundle_projection_json
-            FROM artifacts
-            WHERE context = 'cache' AND workflow_name = 'main'
+                   rp.projection_json
+            FROM artifacts AS a
+            JOIN request_bundle_projections AS rp
+              ON rp.request_bundle_digest = a.request_bundle_digest
+            WHERE a.context = 'cache' AND a.workflow_name = 'main'
             ORDER BY artifact_id
             """
         ).fetchall()
@@ -2182,9 +2187,11 @@ def test_cross_workflow_membership_adopts_complete_transitive_reused_bundles(
             """
             SELECT artifact_id, run_id, workflow_name, step_name, output_name,
                    address, path, content_digest, output_hash,
-                   request_bundle_projection_json
-            FROM artifacts
-            WHERE context = 'cache' AND workflow_name = 'main'
+                   rp.projection_json
+            FROM artifacts AS a
+            JOIN request_bundle_projections AS rp
+              ON rp.request_bundle_digest = a.request_bundle_digest
+            WHERE a.context = 'cache' AND a.workflow_name = 'main'
             ORDER BY artifact_id
             """
         ).fetchall() == main_artifacts_before
@@ -2588,19 +2595,17 @@ def test_published_artifact_from_another_context_is_not_reused(
         workflow_name="main",
         step_name="b_transform",
     )
-    assert execute_run_plan(b_plan, cores=1).published_count == len(b_plan.published_outputs)
-    probe_plan = build_run_plan(
+    assert execute_run_plan(b_plan, cores=1).published_count == len(
+        b_plan.published_outputs
+    )
+    request = build_run_plan(
         project_dir=project_dir,
         context="cache",
         workflow_name="main",
         step_name="c_transform",
-    )
-    request = probe_plan.reused_outputs[0].reuse_request
+    ).reused_outputs[0].reuse_request
 
-    # Runtime roots are separate in normal projects, but the registry resolver
-    # still needs an explicit context predicate. Without it, a valid selected
-    # output from another context in the same registry could be hydrated into the
-    # wrong workflow declaration.
+    # A valid artifact from another context must not satisfy this request.
     foreign_context_request = registry_module.ReusableArtifactBundleRequest(
         **{**request.__dict__, "context": "other_context"}
     )
@@ -2613,6 +2618,93 @@ def test_published_artifact_from_another_context_is_not_reused(
         )
         is None
     )
+
+
+def test_bundle_resolver_treats_missing_projection_as_cache_miss(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project_dir, runtime_dir, _log_path = _write_cache_project(tmp_path, monkeypatch)
+    b_plan = build_run_plan(
+        project_dir=project_dir,
+        context="cache",
+        workflow_name="main",
+        step_name="b_transform",
+    )
+    assert execute_run_plan(b_plan, cores=1).published_count == len(
+        b_plan.published_outputs
+    )
+    request = build_run_plan(
+        project_dir=project_dir,
+        context="cache",
+        workflow_name="main",
+        step_name="c_transform",
+    ).reused_outputs[0].reuse_request
+    registry_path = runtime_dir / "database/registry.db"
+    with sqlite3.connect(registry_path) as conn:
+        conn.execute(
+            "DELETE FROM request_bundle_projections WHERE request_bundle_digest = ?",
+            (request.resolved_projection.request_bundle_digest,),
+        )
+
+    assert (
+        registry_module.resolve_reusable_artifact_bundle(
+            registry_path,
+            runtime_root=runtime_dir,
+            request=request,
+        )
+        is None
+    )
+
+
+def test_bundle_resolver_fails_closed_for_malformed_projection_payload(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project_dir, runtime_dir, _log_path = _write_cache_project(tmp_path, monkeypatch)
+    b_plan = build_run_plan(
+        project_dir=project_dir,
+        context="cache",
+        workflow_name="main",
+        step_name="b_transform",
+    )
+    assert execute_run_plan(b_plan, cores=1).published_count == len(
+        b_plan.published_outputs
+    )
+    request = build_run_plan(
+        project_dir=project_dir,
+        context="cache",
+        workflow_name="main",
+        step_name="c_transform",
+    ).reused_outputs[0].reuse_request
+    registry_path = runtime_dir / "database/registry.db"
+    with sqlite3.connect(registry_path) as conn:
+        projection_json = conn.execute(
+            """
+            SELECT projection_json
+            FROM request_bundle_projections
+            WHERE request_bundle_digest = ?
+            """,
+            (request.resolved_projection.request_bundle_digest,),
+        ).fetchone()[0]
+        conn.execute(
+            """
+            UPDATE request_bundle_projections
+            SET projection_json = ?
+            WHERE request_bundle_digest = ?
+            """,
+            (
+                json.dumps(json.loads(projection_json), indent=2),
+                request.resolved_projection.request_bundle_digest,
+            ),
+        )
+
+    with pytest.raises(ValidationError, match="not canonical JSON"):
+        registry_module.resolve_reusable_artifact_bundle(
+            registry_path,
+            runtime_root=runtime_dir,
+            request=request,
+        )
 
 
 @pytest.mark.parametrize(
@@ -3851,9 +3943,18 @@ def test_targeted_rerun_with_identical_bytes_revalidates_published_file(
     )
     digest_before = sha256_file_digest(runtime_dir / row_before[1])
     with sqlite3.connect(runtime_dir / "database/registry.db") as conn:
-        projection_before = conn.execute(
-            "SELECT request_bundle_projection_json FROM artifacts WHERE artifact_id = ?",
+        projection_digest_before, projection_before = conn.execute(
+            """
+            SELECT a.request_bundle_digest, rp.projection_json
+            FROM artifacts AS a
+            JOIN request_bundle_projections AS rp
+              ON rp.request_bundle_digest = a.request_bundle_digest
+            WHERE a.artifact_id = ?
+            """,
             (row_before[0],),
+        ).fetchone()
+        projection_count_before = conn.execute(
+            "SELECT COUNT(*) FROM request_bundle_projections"
         ).fetchone()[0]
 
     # Unchanged inputs: the forced-fresh selected job recomputes identical
@@ -3881,14 +3982,25 @@ def test_targeted_rerun_with_identical_bytes_revalidates_published_file(
         assert conn.execute("SELECT COUNT(*) FROM workflow_runs").fetchone()[0] == 2
         projection_after, current_run_id = conn.execute(
             """
-            SELECT a.request_bundle_projection_json, wr.run_id
+            SELECT rp.projection_json, wr.run_id
             FROM artifacts AS a
             JOIN workflow_runs AS wr ON wr.run_id = a.run_id
+            JOIN request_bundle_projections AS rp
+              ON rp.request_bundle_digest = a.request_bundle_digest
             WHERE a.artifact_id = ? AND wr.is_current = 1
             """,
             (row_after[0],),
         ).fetchone()
+        projection_digest_after = conn.execute(
+            "SELECT request_bundle_digest FROM artifacts WHERE artifact_id = ?",
+            (row_after[0],),
+        ).fetchone()[0]
+        projection_count_after = conn.execute(
+            "SELECT COUNT(*) FROM request_bundle_projections"
+        ).fetchone()[0]
     assert projection_after == projection_before
+    assert projection_digest_after == projection_digest_before
+    assert projection_count_after == projection_count_before
     assert current_run_id == _artifact_run_id(
         runtime_dir,
         artifact_id=row_after[0],
@@ -4167,7 +4279,7 @@ def test_bundle_reresolution_records_the_equivalent_artifact_actually_consumed(
         conn.execute(
             """
             UPDATE artifacts
-            SET path = ?, published_path = ?
+            SET path = ?, published_path = ?, is_published = 0
             WHERE artifact_id = ?
             """,
             (
@@ -4939,6 +5051,7 @@ def test_targeted_dry_run_writes_no_outputs_and_no_registry_rows(
     assert _registry_row_counts(runtime_dir) == {
         "workflow_runs": 0,
         "workflow_outputs": 0,
+        "request_bundle_projections": 0,
         "dependencies": 0,
     }
     with sqlite3.connect(runtime_dir / "database/registry.db") as conn:

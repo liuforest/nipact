@@ -20,7 +20,7 @@ from nipact.execution import (
     build_run_plan,
     execute_run_plan,
 )
-from nipact.hashing import sha256_file_digest, short_hash
+from nipact.hashing import is_valid_digest, sha256_digest, sha256_file_digest, short_hash
 from nipact.projection import ResolvedRequestBundleProjectionV1
 from nipact.registry import EnvironmentObservationV1
 from nipact.runtime import run_job
@@ -840,11 +840,20 @@ def test_multi_output_run_registers_sibling_outputs_and_exact_dependency(
         ).fetchall()
         projection_rows = conn.execute(
             """
-            SELECT step_name, output_name, address,
-                   identity_contract_version, request_bundle_projection_json
-            FROM artifacts
-            WHERE origin = 'workflow_output'
+            SELECT a.step_name, a.output_name, a.address,
+                   a.request_bundle_digest, rp.projection_json
+            FROM artifacts AS a
+            JOIN request_bundle_projections AS rp
+              ON rp.request_bundle_digest = a.request_bundle_digest
+            WHERE a.origin = 'workflow_output'
             ORDER BY step_name, output_name, address
+            """
+        ).fetchall()
+        stored_projection_rows = conn.execute(
+            """
+            SELECT request_bundle_digest, projection_json
+            FROM request_bundle_projections
+            ORDER BY request_bundle_digest
             """
         ).fetchall()
         source_snapshots = {
@@ -880,9 +889,17 @@ def test_multi_output_run_registers_sibling_outputs_and_exact_dependency(
         for step, output, address, *_rest in artifact_rows
     }
     assert set(published_rows) == artifact_keys
-    assert all(row[3] == 1 and row[4] for row in projection_rows)
+    assert all(is_valid_digest(row[3]) and row[4] for row in projection_rows)
+    assert len(stored_projection_rows) == len({row[3] for row in projection_rows})
+    assert {row[0] for row in stored_projection_rows} == {
+        row[3] for row in projection_rows
+    }
+    assert all(
+        sha256_digest(projection_json.encode("utf-8")) == digest
+        for digest, projection_json in stored_projection_rows
+    )
     source_projection_by_address: dict[str, set[str]] = {}
-    for step_name, _output_name, address, _version, projection_json in projection_rows:
+    for step_name, _output_name, address, _digest, projection_json in projection_rows:
         if step_name == "source_text":
             source_projection_by_address.setdefault(address, set()).add(projection_json)
     assert set(source_projection_by_address) == {"sub_001", "sub_002"}

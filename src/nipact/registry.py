@@ -17,13 +17,14 @@ from .hashing import is_valid_digest, sha256_digest, sha256_file_digest, short_h
 from .identity import validate_hash_alias, validate_path_token
 from .manifest import Manifest
 from .projection import (
-    IDENTITY_CONTRACT_VERSION,
     RegisteredSourceSnapshot,
     RequestBundleProjectionPlanV1,
     ResolvedRequestBundleProjectionV1,
     RequestedOutputCoordinate,
     SourceCoordinate,
+    ValidatedStoredRequestBundleProjectionV1,
     resolve_request_bundle_projection_plan,
+    validate_stored_request_bundle_projection_v1,
 )
 
 REGISTRY_DB_PATH = "database/registry.db"
@@ -95,7 +96,8 @@ class RetainedJobProjectionRecipe:
 @dataclass(frozen=True)
 class ReusedProjectionSeed:
     requested_output: RequestedOutputCoordinate
-    resolved_projection: ResolvedRequestBundleProjectionV1
+    actual_artifact_id: int
+    request_bundle_digest: str
 
 
 @dataclass(frozen=True)
@@ -170,8 +172,7 @@ class RegistryArtifact:
     callable_ref: str | None
     software_ref: str | None
     created_at: str
-    identity_contract_version: int | None = None
-    request_bundle_projection_json: str | None = None
+    request_bundle_digest: str | None = None
 
 
 @dataclass(frozen=True)
@@ -216,8 +217,7 @@ class ReusableArtifactCandidate:
     step_name: str
     output_name: str
     address: str
-    identity_contract_version: int
-    request_bundle_projection_json: str
+    request_bundle_digest: str
     dependencies: tuple[RegistryDependency, ...]
 
 
@@ -287,8 +287,7 @@ _ARTIFACT_SELECT_COLUMNS = """
     p.parameter_hash,
     p.parameter_digest,
     p.parameters_json,
-    a.identity_contract_version,
-    a.request_bundle_projection_json,
+    a.request_bundle_digest,
     a.path,
     a.is_selected_output,
     a.is_published,
@@ -533,6 +532,7 @@ def validate_registry_db(
                 """,
                 (context,),
             ).fetchall()
+            _validate_request_bundle_projection_graph(conn, context=context)
     except sqlite3.Error as exc:
         raise ValidationError(f"registry.db is malformed: {exc}") from exc
 
@@ -623,6 +623,7 @@ def validate_prepared_registry_db(
                 """,
                 (context,),
             ).fetchall()
+            _validate_request_bundle_projection_graph(conn, context=context)
     except sqlite3.Error as exc:
         raise ValidationError(f"registry.db is malformed: {exc}") from exc
     verified_occurrences: set[tuple[Path, str]] = set()
@@ -640,6 +641,77 @@ def validate_prepared_registry_db(
         verified_occurrences=verified_occurrences,
     )
     return {"published_outputs": int(published_outputs)}
+
+
+def _validate_request_bundle_projection_graph(
+    conn: sqlite3.Connection,
+    *,
+    context: str,
+) -> None:
+    rows = conn.execute(
+        """
+        SELECT request_bundle_digest, projection_json
+        FROM request_bundle_projections
+        ORDER BY request_bundle_digest
+        """
+    ).fetchall()
+    graph: dict[str, tuple[str, ...]] = {}
+    for row in rows:
+        digest = str(row[0])
+        validated = validate_stored_request_bundle_projection_v1(
+            request_bundle_digest=digest,
+            projection_json=str(row[1]),
+        )
+        graph[digest] = validated.direct_upstream_request_bundle_digests
+    for digest, upstream_digests in graph.items():
+        for upstream_digest in upstream_digests:
+            if upstream_digest not in graph:
+                raise ValidationError(
+                    "registry request projection references a missing upstream "
+                    f"projection: {digest} -> {upstream_digest}"
+                )
+
+    visiting: set[str] = set()
+    visited: set[str] = set()
+
+    def visit(digest: str) -> None:
+        if digest in visited:
+            return
+        if digest in visiting:
+            raise ValidationError("registry request projection graph contains a cycle")
+        visiting.add(digest)
+        for upstream_digest in graph[digest]:
+            visit(upstream_digest)
+        visiting.remove(digest)
+        visited.add(digest)
+
+    for digest in graph:
+        visit(digest)
+
+    artifact_rows = conn.execute(
+        """
+        SELECT origin, request_bundle_digest
+        FROM artifacts
+        WHERE context = ?
+        ORDER BY artifact_id
+        """,
+        (context,),
+    ).fetchall()
+    for origin, digest in artifact_rows:
+        if origin == "source":
+            if digest is not None:
+                raise ValidationError(
+                    "registry source artifact references a request projection"
+                )
+            continue
+        if origin != "workflow_output" or not isinstance(digest, str):
+            raise ValidationError(
+                "registry workflow artifact is missing its request projection"
+            )
+        if digest not in graph:
+            raise ValidationError(
+                "registry workflow artifact references a missing request projection"
+            )
 
 
 def record_workflow_run(
@@ -1228,34 +1300,50 @@ def resolve_reusable_artifact_bundle(
     preferred_artifact_ids: tuple[int, ...] | None = None,
 ) -> ReusableArtifactBundleCandidate | None:
     """Resolve one coherent reusable bundle independently of workflow membership."""
+    validate_stored_request_bundle_projection_v1(
+        request_bundle_digest=request.resolved_projection.request_bundle_digest,
+        projection_json=request.resolved_projection.canonical_json,
+    )
     declared_outputs = dict(request.sibling_outputs)
     if len(declared_outputs) != len(request.sibling_outputs):
         raise ValidationError("reusable bundle request has duplicate sibling outputs")
     try:
         with _connect_readonly_rows(path) as conn:
             _validate_schema_version(conn)
+            stored_projection = _validated_stored_request_bundle_projection(
+                conn,
+                request.resolved_projection.request_bundle_digest,
+                missing_ok=True,
+            )
+            if stored_projection is None:
+                return None
+            if (
+                stored_projection.resolved_projection.canonical_json
+                != request.resolved_projection.canonical_json
+            ):
+                raise ValidationError(
+                    "request projection digest has conflicting canonical payload"
+                )
             rows = conn.execute(
                 """
                 SELECT artifact_id, run_id, path, published_path,
                        content_digest, output_hash, file_size,
                        extension, workflow_name, step_name, output_name, address,
-                       identity_contract_version, request_bundle_projection_json
+                       request_bundle_digest
                 FROM artifacts
                 WHERE context = ?
                   AND origin = 'workflow_output'
                   AND is_published = 1
                   AND step_name = ?
                   AND address = ?
-                  AND identity_contract_version = ?
-                  AND request_bundle_projection_json = ?
+                  AND request_bundle_digest = ?
                 ORDER BY run_id, artifact_id
                 """,
                 (
                     request.context,
                     request.step_name,
                     request.address,
-                    request.resolved_projection.identity_contract_version,
-                    request.resolved_projection.canonical_json,
+                    request.resolved_projection.request_bundle_digest,
                 ),
             ).fetchall()
             candidates_by_run: dict[int, dict[str, ReusableArtifactCandidate]] = {}
@@ -1267,8 +1355,7 @@ def resolve_reusable_artifact_bundle(
                     or row["output_name"] is None
                     or row["address"] is None
                     or row["output_hash"] is None
-                    or row["identity_contract_version"] is None
-                    or row["request_bundle_projection_json"] is None
+                    or row["request_bundle_digest"] is None
                 ):
                     raise ValidationError("registry reusable artifact row is incomplete")
                 run_id = int(row["run_id"])
@@ -1293,10 +1380,7 @@ def resolve_reusable_artifact_bundle(
                     step_name=str(row["step_name"]),
                     output_name=output_name,
                     address=str(row["address"]),
-                    identity_contract_version=int(row["identity_contract_version"]),
-                    request_bundle_projection_json=str(
-                        row["request_bundle_projection_json"]
-                    ),
+                    request_bundle_digest=str(row["request_bundle_digest"]),
                     dependencies=tuple(_dependencies_for_artifact(conn, artifact_id)),
                 )
 
@@ -1538,9 +1622,7 @@ def _workflow_artifacts_are_equivalent(
         and source.step_name == requested.step_name
         and source.output_name == requested.output_name
         and source.address == requested.address
-        and source.identity_contract_version == requested.identity_contract_version
-        and source.request_bundle_projection_json
-        == requested.request_bundle_projection_json
+        and source.request_bundle_digest == requested.request_bundle_digest
         and source.content_digest == requested.content_digest
         and source.file_size == requested.file_size
         and source.extension == requested.extension
@@ -1561,7 +1643,7 @@ def _workflow_artifact_dependencies_match_registry(
     if not dependencies:
         visited.remove(artifact_id)
         artifact = _dependency_source_artifact(conn, artifact_id)
-        return _artifact_projection_declares_no_bindings(artifact)
+        return _artifact_projection_declares_no_bindings(conn, artifact)
     for dependency in dependencies:
         source = _dependency_source_artifact(conn, dependency.source_artifact_id)
         if source.context != expected_context:
@@ -1596,22 +1678,20 @@ def _workflow_artifact_dependencies_match_registry(
     return True
 
 
-def _artifact_projection_declares_no_bindings(artifact: RegistryArtifact) -> bool:
-    raw_projection = artifact.request_bundle_projection_json
-    if raw_projection is None:
+def _artifact_projection_declares_no_bindings(
+    conn: sqlite3.Connection,
+    artifact: RegistryArtifact,
+) -> bool:
+    request_bundle_digest = artifact.request_bundle_digest
+    if request_bundle_digest is None:
         return False
-    try:
-        payload = json.loads(raw_projection)
-    except (TypeError, json.JSONDecodeError) as exc:
-        raise ValidationError("registry artifact request projection is malformed") from exc
-    if not isinstance(payload, dict):
-        raise ValidationError("registry artifact request projection must be an object")
-    bindings = payload.get("role_labelled_bindings")
-    if not isinstance(bindings, list):
-        raise ValidationError(
-            "registry artifact request projection bindings are malformed"
-        )
-    return not bindings
+    projection = _validated_stored_request_bundle_projection(
+        conn,
+        request_bundle_digest,
+    )
+    assert projection is not None
+    payload = json.loads(projection.resolved_projection.canonical_json)
+    return not payload["role_labelled_bindings"]
 
 
 def _validate_workflow_dependency_snapshot(
@@ -2123,14 +2203,16 @@ def _insert_workflow_output_artifacts(
     run_id: int,
     artifact_rows: tuple[WorkflowOutputArtifactRow, ...],
     parameter_ids: dict[tuple[str, str], int],
-    finalized_projections: dict[tuple[str, str], str],
+    finalized_projections: dict[
+        tuple[str, str], ResolvedRequestBundleProjectionV1
+    ],
     created_at: str,
 ) -> dict[tuple[str, str, str], int]:
     artifact_ids: dict[tuple[str, str, str], int] = {}
     for row in artifact_rows:
         parameter_id = parameter_ids[(row.step_name, row.parameters_json)]
         try:
-            projection_json = finalized_projections[(row.step_name, row.address)]
+            projection = finalized_projections[(row.step_name, row.address)]
         except KeyError as exc:
             raise ValidationError(
                 "workflow output artifact is missing its finalized projection"
@@ -2142,12 +2224,11 @@ def _insert_workflow_output_artifacts(
                 address, job_id, parameter_id, path, is_selected_output,
                 is_published, published_path, staging_path, content_digest,
                 output_hash, file_size, extension, callable_ref,
-                identity_contract_version, request_bundle_projection_json,
-                created_at
+                request_bundle_digest, created_at
             )
             VALUES (
                 'workflow_output', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                ?, ?, ?, ?, ?, ?
+                ?, ?, ?, ?, ?
             )
             """,
             (
@@ -2169,8 +2250,7 @@ def _insert_workflow_output_artifacts(
                 row.file_size,
                 row.extension,
                 row.callable_ref,
-                IDENTITY_CONTRACT_VERSION,
-                projection_json,
+                projection.request_bundle_digest,
                 created_at,
             ),
         )
@@ -2186,7 +2266,9 @@ def _validate_no_divergent_fresh_bundles(
     context: str,
     run_id: int,
     artifact_rows: tuple[WorkflowOutputArtifactRow, ...],
-    finalized_projections: dict[tuple[str, str], str],
+    finalized_projections: dict[
+        tuple[str, str], ResolvedRequestBundleProjectionV1
+    ],
 ) -> None:
     fresh_rows_by_job: dict[
         tuple[str, str], dict[str, WorkflowOutputArtifactRow]
@@ -2200,7 +2282,7 @@ def _validate_no_divergent_fresh_bundles(
 
     for (step_name, address), fresh_outputs in sorted(fresh_rows_by_job.items()):
         try:
-            projection_json = finalized_projections[(step_name, address)]
+            projection = finalized_projections[(step_name, address)]
         except KeyError as exc:
             raise ValidationError(
                 "fresh deterministic bundle is missing its finalized projection"
@@ -2219,16 +2301,14 @@ def _validate_no_divergent_fresh_bundles(
               AND context = ?
               AND step_name = ?
               AND address = ?
-              AND identity_contract_version = ?
-              AND request_bundle_projection_json = ?
+              AND request_bundle_digest = ?
             ORDER BY run_id, output_name, artifact_id
             """,
             (
                 context,
                 step_name,
                 address,
-                IDENTITY_CONTRACT_VERSION,
-                projection_json,
+                projection.request_bundle_digest,
             ),
         ).fetchall()
         historical_by_run: dict[int, dict[str, tuple[int, str]]] = {}
@@ -2266,6 +2346,116 @@ def _validate_no_divergent_fresh_bundles(
             )
 
 
+def _validated_stored_request_bundle_projection(
+    conn: sqlite3.Connection,
+    request_bundle_digest: str,
+    *,
+    missing_ok: bool = False,
+    cache: dict[str, ValidatedStoredRequestBundleProjectionV1] | None = None,
+) -> ValidatedStoredRequestBundleProjectionV1 | None:
+    if not is_valid_digest(request_bundle_digest):
+        raise ValidationError("registry request projection digest is invalid")
+    if cache is not None and request_bundle_digest in cache:
+        return cache[request_bundle_digest]
+    row = conn.execute(
+        """
+        SELECT projection_json
+        FROM request_bundle_projections
+        WHERE request_bundle_digest = ?
+        """,
+        (request_bundle_digest,),
+    ).fetchone()
+    if row is None:
+        if missing_ok:
+            return None
+        raise ValidationError("registry request projection is missing")
+    validated = validate_stored_request_bundle_projection_v1(
+        request_bundle_digest=request_bundle_digest,
+        projection_json=str(row[0]),
+    )
+    if cache is not None:
+        cache[request_bundle_digest] = validated
+    return validated
+
+
+def _insert_or_validate_request_bundle_projection(
+    conn: sqlite3.Connection,
+    projection: ResolvedRequestBundleProjectionV1,
+    *,
+    cache: dict[str, ValidatedStoredRequestBundleProjectionV1],
+) -> None:
+    validated = validate_stored_request_bundle_projection_v1(
+        request_bundle_digest=projection.request_bundle_digest,
+        projection_json=projection.canonical_json,
+    )
+    for upstream_digest in validated.direct_upstream_request_bundle_digests:
+        _validated_stored_request_bundle_projection(
+            conn,
+            upstream_digest,
+            cache=cache,
+        )
+    existing = _validated_stored_request_bundle_projection(
+        conn,
+        projection.request_bundle_digest,
+        missing_ok=True,
+        cache=cache,
+    )
+    if existing is not None:
+        if existing.resolved_projection.canonical_json != projection.canonical_json:
+            raise ValidationError(
+                "registry request projection digest has conflicting canonical payload"
+            )
+        return
+    conn.execute(
+        """
+        INSERT INTO request_bundle_projections (
+            request_bundle_digest, projection_json
+        )
+        VALUES (?, ?)
+        """,
+        (projection.request_bundle_digest, projection.canonical_json),
+    )
+    cache[projection.request_bundle_digest] = validated
+
+
+def _authenticate_reused_projection_seed(
+    conn: sqlite3.Connection,
+    *,
+    context: str,
+    seed: ReusedProjectionSeed,
+    projection_cache: dict[str, ValidatedStoredRequestBundleProjectionV1],
+) -> ResolvedRequestBundleProjectionV1:
+    if type(seed.actual_artifact_id) is not int or seed.actual_artifact_id <= 0:
+        raise ValidationError("reused projection seed artifact id is invalid")
+    if not is_valid_digest(seed.request_bundle_digest):
+        raise ValidationError("reused projection seed digest is invalid")
+    artifact = _dependency_source_artifact(conn, seed.actual_artifact_id)
+    coordinate = seed.requested_output
+    if (
+        artifact.context != context
+        or artifact.origin != "workflow_output"
+        or not artifact.is_published
+        or artifact.step_name != coordinate.step_name
+        or artifact.output_name != coordinate.output_name
+        or artifact.address != coordinate.address
+        or artifact.request_bundle_digest != seed.request_bundle_digest
+    ):
+        raise ValidationError("reused projection seed does not match its artifact")
+    validated = _validated_stored_request_bundle_projection(
+        conn,
+        seed.request_bundle_digest,
+        cache=projection_cache,
+    )
+    assert validated is not None
+    for upstream_digest in validated.direct_upstream_request_bundle_digests:
+        _validated_stored_request_bundle_projection(
+            conn,
+            upstream_digest,
+            cache=projection_cache,
+        )
+    return validated.resolved_projection
+
+
 def _finalize_retained_job_projections(
     conn: sqlite3.Connection,
     *,
@@ -2273,26 +2463,24 @@ def _finalize_retained_job_projections(
     artifact_rows: tuple[WorkflowOutputArtifactRow, ...],
     projection_recipes: tuple[RetainedJobProjectionRecipe, ...],
     reused_projection_seeds: tuple[ReusedProjectionSeed, ...],
-) -> dict[tuple[str, str], str]:
+) -> dict[tuple[str, str], ResolvedRequestBundleProjectionV1]:
     source_snapshots = _read_registered_source_snapshots_conn(conn, context=context)
     upstream_states: dict[
         RequestedOutputCoordinate,
         ResolvedRequestBundleProjectionV1,
     ] = {}
+    projection_cache: dict[str, ValidatedStoredRequestBundleProjectionV1] = {}
     for seed in reused_projection_seeds:
         if seed.requested_output.namespace != context:
             raise ValidationError("reused projection seed belongs to another context")
         if seed.requested_output in upstream_states:
             raise ValidationError("reused projection seed coordinate is duplicated")
-        if (
-            seed.resolved_projection.identity_contract_version
-            != IDENTITY_CONTRACT_VERSION
-            or not is_valid_digest(seed.resolved_projection.request_bundle_digest)
-            or sha256_digest(seed.resolved_projection.canonical_json.encode("utf-8"))
-            != seed.resolved_projection.request_bundle_digest
-        ):
-            raise ValidationError("reused projection seed identity is invalid")
-        upstream_states[seed.requested_output] = seed.resolved_projection
+        upstream_states[seed.requested_output] = _authenticate_reused_projection_seed(
+            conn,
+            context=context,
+            seed=seed,
+            projection_cache=projection_cache,
+        )
 
     artifact_outputs_by_job: dict[tuple[str, str], set[str]] = {}
     for row in artifact_rows:
@@ -2300,7 +2488,7 @@ def _finalize_retained_job_projections(
             row.output_name
         )
 
-    finalized: dict[tuple[str, str], str] = {}
+    finalized: dict[tuple[str, str], ResolvedRequestBundleProjectionV1] = {}
     for recipe in projection_recipes:
         job_key = (recipe.step_name, recipe.address)
         if job_key in finalized:
@@ -2334,7 +2522,12 @@ def _finalize_retained_job_projections(
             ResolvedRequestBundleProjectionV1,
         ):
             raise ValidationError("retained projection remained unresolved after source upsert")
-        finalized[job_key] = projection_state.canonical_json
+        _insert_or_validate_request_bundle_projection(
+            conn,
+            projection_state,
+            cache=projection_cache,
+        )
+        finalized[job_key] = projection_state
         for output_name in recipe.output_names:
             coordinate = RequestedOutputCoordinate(
                 namespace=context,
@@ -2355,17 +2548,16 @@ def _reused_projection_identities(
     *,
     context: str,
     seeds: tuple[ReusedProjectionSeed, ...],
-) -> dict[RequestedOutputCoordinate, tuple[int, str]]:
-    identities: dict[RequestedOutputCoordinate, tuple[int, str]] = {}
+) -> dict[RequestedOutputCoordinate, str]:
+    identities: dict[RequestedOutputCoordinate, str] = {}
     for seed in seeds:
         if seed.requested_output.namespace != context:
             raise ValidationError("reused projection seed belongs to another context")
         if seed.requested_output in identities:
             raise ValidationError("reused projection seed coordinate is duplicated")
-        identities[seed.requested_output] = (
-            seed.resolved_projection.identity_contract_version,
-            seed.resolved_projection.canonical_json,
-        )
+        if not is_valid_digest(seed.request_bundle_digest):
+            raise ValidationError("reused projection seed digest is invalid")
+        identities[seed.requested_output] = seed.request_bundle_digest
     return identities
 
 
@@ -2440,7 +2632,7 @@ def _insert_artifact_dependencies(
     context: str,
     reused_projection_identities: dict[
         RequestedOutputCoordinate,
-        tuple[int, str],
+        str,
     ],
     artifact_rows: tuple[WorkflowOutputArtifactRow, ...],
     artifact_ids: dict[tuple[str, str, str], int],
@@ -2495,7 +2687,7 @@ def _dependency_source_artifact_id(
     context: str,
     reused_projection_identities: dict[
         RequestedOutputCoordinate,
-        tuple[int, str],
+        str,
     ],
     input_record: ArtifactInputRow,
     artifact_ids: dict[tuple[str, str, str], int],
@@ -2550,7 +2742,7 @@ def _validate_reused_dependency_source(
     context: str,
     reused_projection_identities: dict[
         RequestedOutputCoordinate,
-        tuple[int, str],
+        str,
     ],
     input_record: ArtifactInputRow,
 ) -> None:
@@ -2571,9 +2763,7 @@ def _validate_reused_dependency_source(
         address=input_record.source_address,
     )
     try:
-        expected_identity_version, expected_projection_json = (
-            reused_projection_identities[coordinate]
-        )
+        expected_request_bundle_digest = reused_projection_identities[coordinate]
     except KeyError as exc:
         raise ValidationError(
             "reused workflow dependency source projection is missing"
@@ -2581,6 +2771,10 @@ def _validate_reused_dependency_source(
     artifact = _dependency_source_artifact(
         conn,
         input_record.registry_source_artifact_id,
+    )
+    _validated_stored_request_bundle_projection(
+        conn,
+        expected_request_bundle_digest,
     )
     if artifact.context != context:
         raise ValidationError("reused workflow dependency source context mismatch")
@@ -2593,8 +2787,7 @@ def _validate_reused_dependency_source(
     ):
         raise ValidationError("reused workflow dependency source coordinates mismatch")
     if (
-        artifact.identity_contract_version != expected_identity_version
-        or artifact.request_bundle_projection_json != expected_projection_json
+        artifact.request_bundle_digest != expected_request_bundle_digest
         or artifact.extension != input_record.source_extension
     ):
         raise ValidationError("reused workflow dependency source identity mismatch")
@@ -3176,6 +3369,15 @@ def _create_schema(conn: sqlite3.Connection) -> None:
             UNIQUE (hash_version, step_name, parameter_hash)
         );
 
+        CREATE TABLE IF NOT EXISTS request_bundle_projections (
+            request_bundle_digest TEXT PRIMARY KEY
+                CHECK(
+                    length(request_bundle_digest) = 64
+                    AND request_bundle_digest NOT GLOB '*[^0-9a-f]*'
+                ),
+            projection_json TEXT NOT NULL
+        );
+
         CREATE TABLE IF NOT EXISTS artifacts (
             artifact_id INTEGER PRIMARY KEY AUTOINCREMENT,
             origin TEXT NOT NULL CHECK(origin IN ('source', 'workflow_output')),
@@ -3207,19 +3409,18 @@ def _create_schema(conn: sqlite3.Connection) -> None:
             source_metadata_json TEXT,
             callable_ref TEXT,
             software_ref TEXT,
-            identity_contract_version INTEGER,
-            request_bundle_projection_json TEXT,
+            request_bundle_digest TEXT
+                REFERENCES request_bundle_projections(request_bundle_digest)
+                ON DELETE RESTRICT,
             created_at TEXT NOT NULL,
             CHECK (
                 (
                     origin = 'workflow_output'
-                    AND identity_contract_version IS NOT NULL
-                    AND request_bundle_projection_json IS NOT NULL
+                    AND request_bundle_digest IS NOT NULL
                 )
                 OR (
                     origin = 'source'
-                    AND identity_contract_version IS NULL
-                    AND request_bundle_projection_json IS NULL
+                    AND request_bundle_digest IS NULL
                 )
             ),
             CHECK (
@@ -3252,7 +3453,7 @@ def _create_schema(conn: sqlite3.Connection) -> None:
             WHERE is_selected_output = 1;
         CREATE INDEX IF NOT EXISTS artifacts_reuse_lookup_idx
             ON artifacts(
-                context, step_name, address, identity_contract_version, run_id
+                context, step_name, address, request_bundle_digest, run_id
             )
             WHERE origin = 'workflow_output' AND is_published = 1;
 
@@ -3482,8 +3683,7 @@ def _registry_artifact_from_row(row: sqlite3.Row) -> RegistryArtifact:
         parameter_hash=row["parameter_hash"],
         parameter_digest=row["parameter_digest"],
         parameters_json=row["parameters_json"],
-        identity_contract_version=_optional_int(row["identity_contract_version"]),
-        request_bundle_projection_json=row["request_bundle_projection_json"],
+        request_bundle_digest=row["request_bundle_digest"],
         path=path,
         is_selected_output=is_selected_output,
         is_published=is_published,

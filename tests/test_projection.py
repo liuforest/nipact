@@ -29,6 +29,7 @@ from nipact.projection import (
     UpstreamRequestedOutputBindingPlan,
     canonicalize_request_bundle_projection,
     resolve_request_bundle_projection_plan,
+    validate_stored_request_bundle_projection_v1,
 )
 
 
@@ -807,3 +808,82 @@ def test_collection_projection_size_grows_linearly_with_direct_fan_in() -> None:
     ten_members = size_for(10)
     twenty_members = size_for(20)
     assert twenty_members - ten_members == 10 * (ten_members - one_member) // 9
+
+
+def test_stored_projection_validator_round_trips_and_reports_direct_upstreams() -> None:
+    first = _resolved(_projection(address="first"))
+    second = _resolved(_projection(address="second"))
+    resolved = _resolved(
+        _projection(
+            role_labelled_bindings=(
+                UpstreamRequestedOutputBinding(
+                    role="mask",
+                    upstream_request_bundle_digest=second.request_bundle_digest,
+                    output_name="segmentation",
+                ),
+                CollectionBinding(
+                    role="images",
+                    collection_semantics="coordinate_set_v1",
+                    manifest_digest=None,
+                    members=(
+                        UpstreamRequestedOutputBinding(
+                            role="images",
+                            upstream_request_bundle_digest=first.request_bundle_digest,
+                            output_name="segmentation",
+                        ),
+                        UpstreamRequestedOutputBinding(
+                            role="images",
+                            upstream_request_bundle_digest=second.request_bundle_digest,
+                            output_name="segmentation",
+                        ),
+                    ),
+                ),
+            )
+        )
+    )
+
+    validated = validate_stored_request_bundle_projection_v1(
+        request_bundle_digest=resolved.request_bundle_digest,
+        projection_json=resolved.canonical_json,
+    )
+
+    assert validated.resolved_projection == resolved
+    assert validated.direct_upstream_request_bundle_digests == tuple(
+        sorted({first.request_bundle_digest, second.request_bundle_digest})
+    )
+
+
+@pytest.mark.parametrize(
+    ("projection_json", "digest", "error"),
+    [
+        ('{"a":1,"a":2}', "a" * 64, "duplicate key"),
+        ("[]", "a" * 64, "must be an object"),
+        ('{"unknown":1}', "a" * 64, "invalid shape"),
+    ],
+)
+def test_stored_projection_validator_rejects_malformed_shapes(
+    projection_json: str,
+    digest: str,
+    error: str,
+) -> None:
+    with pytest.raises(ValidationError, match=error):
+        validate_stored_request_bundle_projection_v1(
+            request_bundle_digest=digest,
+            projection_json=projection_json,
+        )
+
+
+def test_stored_projection_validator_rejects_noncanonical_or_mismatched_payload() -> None:
+    resolved = _resolved(_projection())
+    noncanonical = json.dumps(json.loads(resolved.canonical_json), indent=2)
+
+    with pytest.raises(ValidationError, match="not canonical"):
+        validate_stored_request_bundle_projection_v1(
+            request_bundle_digest=resolved.request_bundle_digest,
+            projection_json=noncanonical,
+        )
+    with pytest.raises(ValidationError, match="does not match"):
+        validate_stored_request_bundle_projection_v1(
+            request_bundle_digest="f" * 64,
+            projection_json=resolved.canonical_json,
+        )
