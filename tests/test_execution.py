@@ -617,6 +617,45 @@ def test_build_run_plan_with_address_selects_one_entity(
     assert _run_plan_payload(run_plan)["requested_address"] == "sub_001"
 
 
+@pytest.mark.parametrize(
+    ("registry_mutation", "message"),
+    [
+        ("missing_context", "unknown context: mini"),
+        ("runtime_mismatch", "registry.db context runtime path is out of date"),
+        ("incompatible_schema", "registry.db schema version is incompatible"),
+    ],
+)
+def test_build_run_plan_validates_registry_binding_before_workspace_creation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    registry_mutation: str,
+    message: str,
+) -> None:
+    project_dir, runtime_dir = _write_tiny_non_colors_project(tmp_path, monkeypatch)
+    registry_path = runtime_dir / "database/registry.db"
+    with sqlite3.connect(registry_path) as conn:
+        if registry_mutation == "missing_context":
+            conn.execute("DELETE FROM contexts WHERE context = 'mini'")
+        elif registry_mutation == "runtime_mismatch":
+            conn.execute(
+                "UPDATE contexts SET runtime_path = ? WHERE context = 'mini'",
+                (str(tmp_path / "other-runtime"),),
+            )
+        else:
+            conn.execute("PRAGMA user_version = 14")
+
+    with pytest.raises(ValidationError, match=message):
+        build_run_plan(
+            project_dir=project_dir,
+            context="mini",
+            workflow_name="main",
+            step_name="uppercase_text",
+            address="sub_001",
+        )
+
+    assert not (runtime_dir / "runs").exists()
+
+
 def test_build_run_plan_without_address_selects_all_entities(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

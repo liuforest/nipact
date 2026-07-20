@@ -306,9 +306,7 @@ def _run_workflow_command(args: argparse.Namespace) -> int | None:
     if args.workflow_command == "run":
         from .cli_feedback import CliFeedback
         from .execution import build_run_plan, execute_run_plan
-        from .project_setup import validate_project
 
-        validate_project(project_dir=project_dir, context=args.context)
         run_plan = build_run_plan(
             project_dir=project_dir,
             context=args.context,
