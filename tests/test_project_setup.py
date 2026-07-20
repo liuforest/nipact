@@ -322,6 +322,16 @@ def _insert_published_output(
             sort_keys=True,
             separators=(",", ":"),
         )
+        projection_digest = sha256_digest(projection_json.encode("utf-8"))
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO request_bundle_projections (
+                request_bundle_digest, projection_json
+            )
+            VALUES (?, ?)
+            """,
+            (projection_digest, projection_json),
+        )
         artifact_id = int(
             conn.execute(
                 """
@@ -330,12 +340,11 @@ def _insert_published_output(
                     output_name, address, job_id, parameter_id, path,
                     is_selected_output, is_published, published_path,
                     staging_path, content_digest, output_hash, file_size,
-                    extension, callable_ref, identity_contract_version,
-                    request_bundle_projection_json, created_at
+                    extension, callable_ref, request_bundle_digest, created_at
                 )
                 VALUES (
                     'workflow_output', ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 1, ?,
-                    ?, ?, ?, ?, ?, ?, 1, ?, ?
+                    ?, ?, ?, ?, ?, ?, ?, ?
                 )
                 """,
                 (
@@ -355,7 +364,7 @@ def _insert_published_output(
                     output_path.stat().st_size,
                     extension,
                     "tests:manual",
-                    projection_json,
+                    projection_digest,
                     "2026-07-19T00:00:00+00:00",
                 ),
             ).lastrowid
@@ -844,6 +853,81 @@ def test_validate_accepts_registered_published_output(
     assert "PASS: validate" in output
 
 
+def test_validate_rejects_noncanonical_stored_request_projection(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    project_dir, runtime_dir = _init_demo(tmp_path, capsys)
+    _insert_published_output(runtime_dir)
+    registry_path = runtime_dir / "database/registry.db"
+    with sqlite3.connect(registry_path) as conn:
+        digest, projection_json = conn.execute(
+            """
+            SELECT request_bundle_digest, projection_json
+            FROM request_bundle_projections
+            """
+        ).fetchone()
+        conn.execute(
+            """
+            UPDATE request_bundle_projections
+            SET projection_json = ?
+            WHERE request_bundle_digest = ?
+            """,
+            (json.dumps(json.loads(projection_json), indent=2), digest),
+        )
+
+    _assert_validate_fails(project_dir, capsys, "not canonical JSON")
+
+
+def test_validate_rejects_missing_upstream_request_projection(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    project_dir, runtime_dir = _init_demo(tmp_path, capsys)
+    registry_path = runtime_dir / "database/registry.db"
+    payload = {
+        "address": "init",
+        "canonical_parameters": {},
+        "determinism_contract": "deterministic",
+        "identity_contract_version": 1,
+        "namespace": "colors",
+        "output_contract": {
+            "output_contract_version": 1,
+            "sibling_outputs": [
+                {"declared_extension": ".json", "output_name": "output"}
+            ],
+        },
+        "result_affecting_settings": {},
+        "role_labelled_bindings": [
+            {
+                "output_name": "output",
+                "role": "upstream",
+                "upstream_request_bundle_digest": "f" * 64,
+            }
+        ],
+        "step_contract": {
+            "callable_ref": "tests:manual",
+            "runner_contract_version": "1",
+            "step_contract_id": "manual",
+            "step_contract_version": "1",
+        },
+    }
+    projection_json = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    digest = sha256_digest(projection_json.encode("utf-8"))
+    with sqlite3.connect(registry_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO request_bundle_projections (
+                request_bundle_digest, projection_json
+            )
+            VALUES (?, ?)
+            """,
+            (digest, projection_json),
+        )
+
+    _assert_validate_fails(project_dir, capsys, "missing upstream projection")
+
+
 def test_registry_v15_projection_observation_and_membership_constraints(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
@@ -870,9 +954,18 @@ def test_registry_v15_projection_observation_and_membership_constraints(
         artifact_sql = conn.execute(
             "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'artifacts'"
         ).fetchone()[0]
+        projection_columns = {
+            row[1]: row
+            for row in conn.execute("PRAGMA table_info(request_bundle_projections)")
+        }
+        artifact_foreign_keys = conn.execute(
+            "PRAGMA foreign_key_list(artifacts)"
+        ).fetchall()
 
-    assert "identity_contract_version" in artifact_columns
-    assert "request_bundle_projection_json" in artifact_columns
+    assert "request_bundle_digest" in artifact_columns
+    assert "identity_contract_version" not in artifact_columns
+    assert "request_bundle_projection_json" not in artifact_columns
+    assert set(projection_columns) == {"request_bundle_digest", "projection_json"}
     assert run_columns["resolution_summary_json"][3] == 1
     assert run_columns["environment_observation_json"][3] == 1
     assert membership_columns["artifact_id"][3] == 1
@@ -881,9 +974,14 @@ def test_registry_v15_projection_observation_and_membership_constraints(
     assert artifact_fk[6] == "RESTRICT"
     assert membership_indexes["published_outputs_artifact_id_idx"][2] == 0
     assert "origin = 'workflow_output'" in artifact_sql
-    assert "identity_contract_version IS NOT NULL" in artifact_sql
+    projection_fk = next(
+        row for row in artifact_foreign_keys if row[3] == "request_bundle_digest"
+    )
+    assert projection_fk[2] == "request_bundle_projections"
+    assert projection_fk[6] == "RESTRICT"
+    assert "request_bundle_digest IS NOT NULL" in artifact_sql
     assert "origin = 'source'" in artifact_sql
-    assert "request_bundle_projection_json IS NULL" in artifact_sql
+    assert "request_bundle_digest IS NULL" in artifact_sql
 
     with sqlite3.connect(registry_path) as conn:
         source_artifact_id = conn.execute(
@@ -892,12 +990,21 @@ def test_registry_v15_projection_observation_and_membership_constraints(
         with pytest.raises(sqlite3.IntegrityError, match="CHECK constraint failed"):
             conn.execute(
                 """
+                INSERT INTO request_bundle_projections (
+                    request_bundle_digest, projection_json
+                )
+                VALUES (?, '{}')
+                """,
+                ("A" * 64,),
+            )
+        with pytest.raises(sqlite3.IntegrityError, match="CHECK constraint failed"):
+            conn.execute(
+                """
                 UPDATE artifacts
-                SET identity_contract_version = 1,
-                    request_bundle_projection_json = '{}'
+                SET request_bundle_digest = ?
                 WHERE artifact_id = ?
                 """,
-                (source_artifact_id,),
+                ("e" * 64, source_artifact_id),
             )
         with pytest.raises(sqlite3.IntegrityError, match="CHECK constraint failed"):
             conn.execute(

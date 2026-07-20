@@ -103,6 +103,12 @@ class ResolvedRequestBundleProjectionV1:
 
 
 @dataclass(frozen=True)
+class ValidatedStoredRequestBundleProjectionV1:
+    resolved_projection: ResolvedRequestBundleProjectionV1
+    direct_upstream_request_bundle_digests: tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class RequestedOutputCoordinate:
     namespace: str
     step_name: str
@@ -306,6 +312,296 @@ def canonicalize_request_bundle_projection(
         canonical_json=canonical_json,
         request_bundle_digest=sha256_digest(canonical_json.encode("utf-8")),
     )
+
+
+def validate_stored_request_bundle_projection_v1(
+    *,
+    request_bundle_digest: str,
+    projection_json: str,
+) -> ValidatedStoredRequestBundleProjectionV1:
+    """Validate one stored V1 payload against its canonical bytes and digest."""
+    digest = _require_digest(
+        request_bundle_digest,
+        path="request_bundle_digest",
+    )
+    if type(projection_json) is not str:
+        raise ValidationError("stored request projection must be a JSON string")
+    try:
+        payload = json.loads(projection_json, object_pairs_hook=_unique_json_object)
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise ValidationError("stored request projection is malformed JSON") from exc
+    projection = _projection_from_payload(payload, path="projection")
+    resolved = canonicalize_request_bundle_projection(projection)
+    if projection_json != resolved.canonical_json:
+        raise ValidationError("stored request projection is not canonical JSON")
+    if digest != resolved.request_bundle_digest:
+        raise ValidationError("stored request projection digest does not match payload")
+    upstream_digests = sorted(
+        {
+            upstream_digest
+            for binding in projection.role_labelled_bindings
+            for upstream_digest in _binding_upstream_digests(binding)
+        }
+    )
+    return ValidatedStoredRequestBundleProjectionV1(
+        resolved_projection=resolved,
+        direct_upstream_request_bundle_digests=tuple(upstream_digests),
+    )
+
+
+def _unique_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    payload: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in payload:
+            raise ValidationError(
+                f"stored request projection contains duplicate key {key!r}"
+            )
+        payload[key] = value
+    return payload
+
+
+def _projection_from_payload(payload: Any, *, path: str) -> RequestBundleProjectionV1:
+    obj = _require_object_shape(
+        payload,
+        path=path,
+        keys={
+            "identity_contract_version",
+            "namespace",
+            "step_contract",
+            "address",
+            "canonical_parameters",
+            "role_labelled_bindings",
+            "result_affecting_settings",
+            "determinism_contract",
+            "output_contract",
+        },
+    )
+    bindings_payload = _require_list(
+        obj["role_labelled_bindings"],
+        path=f"{path}.role_labelled_bindings",
+    )
+    settings = obj["result_affecting_settings"]
+    if type(settings) is not dict:
+        raise ValidationError(f"{path}.result_affecting_settings must be an object")
+    return RequestBundleProjectionV1(
+        identity_contract_version=_require_int(
+            obj["identity_contract_version"],
+            path=f"{path}.identity_contract_version",
+        ),
+        namespace=_require_string(obj["namespace"], path=f"{path}.namespace"),
+        step_contract=_step_contract_from_payload(
+            obj["step_contract"], path=f"{path}.step_contract"
+        ),
+        address=_require_string(obj["address"], path=f"{path}.address"),
+        canonical_parameters=_json_value(
+            obj["canonical_parameters"], path=f"{path}.canonical_parameters"
+        ),
+        role_labelled_bindings=tuple(
+            _binding_from_payload(binding, path=f"{path}.role_labelled_bindings[{index}]")
+            for index, binding in enumerate(bindings_payload)
+        ),
+        result_affecting_settings=_json_value(
+            settings, path=f"{path}.result_affecting_settings"
+        ),
+        determinism_contract=_require_string(
+            obj["determinism_contract"], path=f"{path}.determinism_contract"
+        ),
+        output_contract=_output_contract_from_payload(
+            obj["output_contract"], path=f"{path}.output_contract"
+        ),
+    )
+
+
+def _step_contract_from_payload(payload: Any, *, path: str) -> StepContract:
+    obj = _require_object_shape(
+        payload,
+        path=path,
+        keys={
+            "step_contract_id",
+            "step_contract_version",
+            "callable_ref",
+            "runner_contract_version",
+        },
+    )
+    return StepContract(
+        step_contract_id=_require_string(
+            obj["step_contract_id"], path=f"{path}.step_contract_id"
+        ),
+        step_contract_version=_require_string(
+            obj["step_contract_version"], path=f"{path}.step_contract_version"
+        ),
+        callable_ref=_require_string(obj["callable_ref"], path=f"{path}.callable_ref"),
+        runner_contract_version=_require_string(
+            obj["runner_contract_version"], path=f"{path}.runner_contract_version"
+        ),
+    )
+
+
+def _binding_from_payload(payload: Any, *, path: str) -> ProjectionBinding:
+    if type(payload) is not dict:
+        raise ValidationError(f"{path} must be an object")
+    if "source_coordinate" in payload:
+        return _registered_source_from_payload(payload, path=path)
+    if "upstream_request_bundle_digest" in payload:
+        return _upstream_output_from_payload(payload, path=path)
+    if "collection_semantics" in payload:
+        return _collection_from_payload(payload, path=path)
+    raise ValidationError(f"{path} has no recognized binding form")
+
+
+def _registered_source_from_payload(
+    payload: Any, *, path: str
+) -> RegisteredSourceBinding:
+    obj = _require_object_shape(
+        payload,
+        path=path,
+        keys={
+            "role",
+            "source_coordinate",
+            "registered_content_digest",
+            "registered_file_size",
+            "declared_extension",
+        },
+    )
+    coordinate = _require_object_shape(
+        obj["source_coordinate"],
+        path=f"{path}.source_coordinate",
+        keys={"namespace", "path"},
+    )
+    return RegisteredSourceBinding(
+        role=_require_string(obj["role"], path=f"{path}.role"),
+        source_coordinate=SourceCoordinate(
+            namespace=_require_string(
+                coordinate["namespace"], path=f"{path}.source_coordinate.namespace"
+            ),
+            path=_require_registered_source_path(
+                coordinate["path"], path=f"{path}.source_coordinate.path"
+            ),
+        ),
+        registered_content_digest=_require_digest(
+            obj["registered_content_digest"],
+            path=f"{path}.registered_content_digest",
+        ),
+        registered_file_size=_require_int(
+            obj["registered_file_size"], path=f"{path}.registered_file_size"
+        ),
+        declared_extension=_require_string(
+            obj["declared_extension"], path=f"{path}.declared_extension"
+        ),
+    )
+
+
+def _upstream_output_from_payload(
+    payload: Any, *, path: str
+) -> UpstreamRequestedOutputBinding:
+    obj = _require_object_shape(
+        payload,
+        path=path,
+        keys={"role", "upstream_request_bundle_digest", "output_name"},
+    )
+    return UpstreamRequestedOutputBinding(
+        role=_require_string(obj["role"], path=f"{path}.role"),
+        upstream_request_bundle_digest=_require_digest(
+            obj["upstream_request_bundle_digest"],
+            path=f"{path}.upstream_request_bundle_digest",
+        ),
+        output_name=_require_string(
+            obj["output_name"], path=f"{path}.output_name"
+        ),
+    )
+
+
+def _collection_from_payload(payload: Any, *, path: str) -> CollectionBinding:
+    obj = _require_object_shape(
+        payload,
+        path=path,
+        keys={"role", "collection_semantics", "manifest_digest", "members"},
+    )
+    members = _require_list(obj["members"], path=f"{path}.members")
+    manifest_digest = obj["manifest_digest"]
+    if manifest_digest is not None:
+        manifest_digest = _require_digest(
+            manifest_digest, path=f"{path}.manifest_digest"
+        )
+    return CollectionBinding(
+        role=_require_string(obj["role"], path=f"{path}.role"),
+        collection_semantics=_require_string(
+            obj["collection_semantics"], path=f"{path}.collection_semantics"
+        ),
+        manifest_digest=manifest_digest,
+        members=tuple(
+            _upstream_output_from_payload(member, path=f"{path}.members[{index}]")
+            for index, member in enumerate(members)
+        ),
+    )
+
+
+def _output_contract_from_payload(payload: Any, *, path: str) -> OutputContract:
+    obj = _require_object_shape(
+        payload,
+        path=path,
+        keys={"output_contract_version", "sibling_outputs"},
+    )
+    siblings = _require_list(
+        obj["sibling_outputs"], path=f"{path}.sibling_outputs"
+    )
+    return OutputContract(
+        output_contract_version=_require_int(
+            obj["output_contract_version"], path=f"{path}.output_contract_version"
+        ),
+        sibling_outputs=tuple(
+            _sibling_output_from_payload(
+                sibling, path=f"{path}.sibling_outputs[{index}]"
+            )
+            for index, sibling in enumerate(siblings)
+        ),
+    )
+
+
+def _sibling_output_from_payload(payload: Any, *, path: str) -> SiblingOutput:
+    obj = _require_object_shape(
+        payload,
+        path=path,
+        keys={"output_name", "declared_extension"},
+    )
+    return SiblingOutput(
+        output_name=_require_string(obj["output_name"], path=f"{path}.output_name"),
+        declared_extension=_require_string(
+            obj["declared_extension"], path=f"{path}.declared_extension"
+        ),
+    )
+
+
+def _binding_upstream_digests(binding: ProjectionBinding) -> tuple[str, ...]:
+    if isinstance(binding, UpstreamRequestedOutputBinding):
+        return (binding.upstream_request_bundle_digest,)
+    if isinstance(binding, CollectionBinding):
+        return tuple(member.upstream_request_bundle_digest for member in binding.members)
+    return ()
+
+
+def _require_object_shape(
+    value: Any, *, path: str, keys: set[str]
+) -> dict[str, Any]:
+    if type(value) is not dict:
+        raise ValidationError(f"{path} must be an object")
+    actual = set(value)
+    if actual != keys:
+        missing = sorted(keys - actual)
+        unknown = sorted(actual - keys)
+        details: list[str] = []
+        if missing:
+            details.append(f"missing keys {missing}")
+        if unknown:
+            details.append(f"unknown keys {unknown}")
+        raise ValidationError(f"{path} has invalid shape: {', '.join(details)}")
+    return value
+
+
+def _require_list(value: Any, *, path: str) -> list[Any]:
+    if type(value) is not list:
+        raise ValidationError(f"{path} must be an array")
+    return value
 
 
 def _projection_payload(

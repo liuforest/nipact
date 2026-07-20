@@ -129,8 +129,7 @@ def test_registry_reads_initialized_source_artifact(
     assert source.origin == "source"
     assert source.path == "data/color_source.json"
     assert source.run_id is None
-    assert source.identity_contract_version is None
-    assert source.request_bundle_projection_json is None
+    assert source.request_bundle_digest is None
     assert source.source_metadata is not None
     assert source.source_metadata["entity_count"] == 200
     assert read_artifact_by_id(registry_path, source.artifact_id) == source
@@ -283,16 +282,53 @@ def test_registry_path_lookup_rejects_duplicate_rows(
     with sqlite3.connect(registry_path) as conn:
         conn.execute("PRAGMA foreign_keys = ON")
         for index in range(2):
+            projection_json = json.dumps(
+                {
+                    "address": "init",
+                    "canonical_parameters": {},
+                    "determinism_contract": "deterministic",
+                    "identity_contract_version": 1,
+                    "namespace": "colors",
+                    "output_contract": {
+                        "output_contract_version": 1,
+                        "sibling_outputs": [
+                            {
+                                "declared_extension": ".json",
+                                "output_name": "output",
+                            }
+                        ],
+                    },
+                    "result_affecting_settings": {},
+                    "role_labelled_bindings": [],
+                    "step_contract": {
+                        "callable_ref": "tests:manual",
+                        "runner_contract_version": "1",
+                        "step_contract_id": f"manual_step_{index}",
+                        "step_contract_version": "1",
+                    },
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            projection_digest = registry.sha256_digest(projection_json.encode("utf-8"))
+            conn.execute(
+                """
+                INSERT INTO request_bundle_projections (
+                    request_bundle_digest, projection_json
+                )
+                VALUES (?, ?)
+                """,
+                (projection_digest, projection_json),
+            )
             conn.execute(
                 """
                 INSERT INTO artifacts (
                     origin, context, workflow_name, step_name, output_name,
                     address, job_id, path, content_digest, output_hash,
-                    file_size, extension, identity_contract_version,
-                    request_bundle_projection_json, created_at
+                    file_size, extension, request_bundle_digest, created_at
                 )
                 VALUES (
-                    'workflow_output', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?
+                    'workflow_output', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
                 )
                 """,
                 (
@@ -307,34 +343,7 @@ def test_registry_path_lookup_rejects_duplicate_rows(
                     str(index) * 16,
                     index,
                     ".json",
-                    json.dumps(
-                        {
-                            "address": "init",
-                            "canonical_parameters": {},
-                            "determinism_contract": "deterministic",
-                            "identity_contract_version": 1,
-                            "namespace": "colors",
-                            "output_contract": {
-                                "output_contract_version": 1,
-                                "sibling_outputs": [
-                                    {
-                                        "declared_extension": ".json",
-                                        "output_name": "output",
-                                    }
-                                ],
-                            },
-                            "result_affecting_settings": {},
-                            "role_labelled_bindings": [],
-                            "step_contract": {
-                                "callable_ref": "tests:manual",
-                                "runner_contract_version": "1",
-                                "step_contract_id": f"manual_step_{index}",
-                                "step_contract_version": "1",
-                            },
-                        },
-                        sort_keys=True,
-                        separators=(",", ":"),
-                    ),
+                    projection_digest,
                     "2026-06-03T00:00:00+00:00",
                 ),
             )
@@ -373,11 +382,8 @@ def test_registry_reads_workflow_output_and_neighbors(
     assert selected.run_id is not None
     assert selected.parameter_hash is not None
     assert selected.parameters_json is not None
-    assert selected.identity_contract_version == 1
-    assert selected.request_bundle_projection_json is not None
-    assert json.loads(selected.request_bundle_projection_json)[
-        "identity_contract_version"
-    ] == 1
+    assert selected.request_bundle_digest is not None
+    assert len(selected.request_bundle_digest) == 64
     assert set(json.loads(selected.parameters_json)) == {"arc_half_width", "min_radius"}
     assert read_artifact_by_id(registry_path, selected.artifact_id) == selected
     assert (

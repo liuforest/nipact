@@ -427,6 +427,7 @@ def execute_run_plan(
         reused_projection_seeds = _reused_projection_seeds(
             run_plan,
             artifact_rows=artifact_rows,
+            actual_reused_artifacts=actual_reused_artifacts,
         )
         selected_resolution_intents = _selected_resolution_intents(
             run_plan,
@@ -1126,6 +1127,7 @@ def _reused_projection_seeds(
     run_plan: RunPlan,
     *,
     artifact_rows: tuple[WorkflowOutputArtifactRow, ...],
+    actual_reused_artifacts: dict[int, ReusableArtifactCandidate],
 ) -> tuple[ReusedProjectionSeed, ...]:
     required_coordinates = {
         RequestedOutputCoordinate(
@@ -1152,15 +1154,19 @@ def _reused_projection_seeds(
         )
         if requested_output not in required_coordinates:
             continue
-        if not isinstance(
-            output_ref.projection_state,
-            ResolvedRequestBundleProjectionV1,
-        ):
+        if not isinstance(output_ref.projection_state, ResolvedRequestBundleProjectionV1):
             raise ValidationError("reused output has an unresolved request projection")
+        try:
+            actual_candidate = actual_reused_artifacts[output_ref.source_artifact_id]
+        except KeyError as exc:
+            raise ValidationError(
+                "reused output is missing its execution-time artifact"
+            ) from exc
         seeds.append(
             ReusedProjectionSeed(
                 requested_output=requested_output,
-                resolved_projection=output_ref.projection_state,
+                actual_artifact_id=actual_candidate.artifact_id,
+                request_bundle_digest=actual_candidate.request_bundle_digest,
             )
         )
     if {seed.requested_output for seed in seeds} != required_coordinates:
