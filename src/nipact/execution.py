@@ -433,6 +433,13 @@ def execute_run_plan(
             run_plan,
             published_rows=published_rows,
         )
+        membership_intents = tuple(
+            MembershipIntent(row=row) for row in published_rows
+        ) + _reused_membership_intents(
+            run_plan,
+            published_rows=published_rows,
+            actual_reused_artifacts=actual_reused_artifacts,
+        )
         published_count = record_workflow_run(
             run_plan.runtime_root / REGISTRY_DB_PATH,
             runtime_root=run_plan.runtime_root,
@@ -453,9 +460,7 @@ def execute_run_plan(
             selected_resolution_intents=selected_resolution_intents,
             environment_observation=_environment_observation(),
             manifest_bindings=_run_manifest_binding_rows(run_plan),
-            membership_intents=tuple(
-                MembershipIntent(row=row) for row in published_rows
-            ),
+            membership_intents=membership_intents,
         )
         _emit_status(status_callback, "registry_updated")
         selected_addresses = {
@@ -804,9 +809,26 @@ def _reresolve_reused_bundles(
             raise ValidationError("reusable artifact bundle is no longer valid")
         bundles[request] = bundle
     resolved: dict[int, ReusableArtifactCandidate] = {}
-    for output_ref in run_plan.reused_outputs:
-        candidate = bundles[output_ref.reuse_request].output(output_ref.output_name)
-        resolved[output_ref.source_artifact_id] = candidate
+    for request, output_refs in refs_by_request.items():
+        planned_artifact_ids = output_refs[0].source_bundle_artifact_ids
+        output_names = sorted(dict(request.sibling_outputs))
+        if len(planned_artifact_ids) != len(output_names):
+            raise ValidationError(
+                "reused artifact bundle does not match its sibling contract"
+            )
+        bundle = bundles[request]
+        for planned_artifact_id, output_name in zip(
+            planned_artifact_ids,
+            output_names,
+            strict=True,
+        ):
+            candidate = bundle.output(output_name)
+            prior = resolved.get(planned_artifact_id)
+            if prior is not None and prior.artifact_id != candidate.artifact_id:
+                raise ValidationError(
+                    "reused artifact resolves inconsistently across bundle requests"
+                )
+            resolved[planned_artifact_id] = candidate
     return resolved
 
 
@@ -1142,6 +1164,113 @@ def _reused_projection_seeds(
     if {seed.requested_output for seed in seeds} != required_coordinates:
         raise ValidationError("retained closure is missing a reused projection seed")
     return tuple(seeds)
+
+
+def _reused_membership_intents(
+    run_plan: RunPlan,
+    *,
+    published_rows: tuple[PublishedOutputRow, ...],
+    actual_reused_artifacts: dict[int, ReusableArtifactCandidate],
+) -> tuple[MembershipIntent, ...]:
+    """Adopt coherent reused bundles in the retained successful closure."""
+    retained_jobs = {(row.step_name, row.address) for row in published_rows}
+    refs_by_planned_artifact_id: dict[int, ReusedRunJobOutputRef] = {}
+    for output_ref in run_plan.reused_validation_outputs:
+        for artifact_id in output_ref.source_bundle_artifact_ids:
+            prior = refs_by_planned_artifact_id.get(artifact_id)
+            if prior is not None and prior.reuse_request != output_ref.reuse_request:
+                raise ValidationError(
+                    "planned reused artifact belongs to conflicting bundle requests"
+                )
+            refs_by_planned_artifact_id[artifact_id] = output_ref
+
+    pending = [
+        record.registry_source_artifact_id
+        for job in run_plan.jobs
+        if (job.step_name, job.address) in retained_jobs
+        for record in job.input_records
+        if record.origin == "workflow_output"
+        and record.registry_source_artifact_id is not None
+    ]
+    seen_requests: set[ReusableArtifactBundleRequest] = set()
+    intents_by_coordinate: dict[tuple[str, str, str], MembershipIntent] = {}
+    while pending:
+        planned_artifact_id = pending.pop()
+        try:
+            output_ref = refs_by_planned_artifact_id[planned_artifact_id]
+        except KeyError as exc:
+            raise ValidationError(
+                "retained reused dependency is missing its planned bundle"
+            ) from exc
+        request = output_ref.reuse_request
+        if request in seen_requests:
+            continue
+        seen_requests.add(request)
+
+        output_names = sorted(dict(request.sibling_outputs))
+        planned_ids = output_ref.source_bundle_artifact_ids
+        if len(planned_ids) != len(output_names):
+            raise ValidationError(
+                "retained reused bundle does not match its sibling contract"
+            )
+        for sibling_artifact_id, output_name in zip(
+            planned_ids,
+            output_names,
+            strict=True,
+        ):
+            try:
+                candidate = actual_reused_artifacts[sibling_artifact_id]
+            except KeyError as exc:
+                raise ValidationError(
+                    "retained reused bundle is missing its execution candidate"
+                ) from exc
+            if (
+                candidate.step_name != request.step_name
+                or candidate.output_name != output_name
+                or candidate.address != request.address
+            ):
+                raise ValidationError(
+                    "re-resolved reusable artifact has the wrong requested coordinate"
+                )
+            coordinate = (
+                candidate.step_name,
+                candidate.output_name,
+                candidate.address,
+            )
+            intent = MembershipIntent(
+                row=PublishedOutputRow(
+                    context=run_plan.context,
+                    workflow_name=run_plan.workflow_name,
+                    step_name=candidate.step_name,
+                    output_name=candidate.output_name,
+                    address=candidate.address,
+                    path=candidate.path,
+                    output_digest=candidate.content_digest,
+                    output_hash=candidate.output_hash,
+                ),
+                existing_artifact_id=candidate.artifact_id,
+            )
+            prior = intents_by_coordinate.get(coordinate)
+            if (
+                prior is not None
+                and prior.existing_artifact_id != intent.existing_artifact_id
+            ):
+                raise ValidationError(
+                    "retained reused bundles disagree on workflow membership"
+                )
+            intents_by_coordinate[coordinate] = intent
+
+        pending.extend(
+            record.registry_source_artifact_id
+            for record in request.input_records
+            if record.origin == "workflow_output"
+            and record.registry_source_artifact_id is not None
+        )
+
+    return tuple(
+        intents_by_coordinate[coordinate]
+        for coordinate in sorted(intents_by_coordinate)
+    )
 
 
 def _selected_resolution_intents(

@@ -211,6 +211,7 @@ class ReusableArtifactCandidate:
     path: str
     published_path: str | None
     content_digest: str
+    output_hash: str
     file_size: int
     extension: str
     workflow_name: str
@@ -509,11 +510,15 @@ def validate_registry_db(
             ).fetchall()
             published_rows = conn.execute(
                 """
-                SELECT workflow_name, step_name, output_name, address, path,
-                       output_digest, output_hash
-                FROM published_outputs
-                WHERE context = ?
-                ORDER BY workflow_name, step_name, output_name, address
+                SELECT po.workflow_name, po.step_name, po.output_name, po.address,
+                       po.path, po.output_digest, po.output_hash, po.artifact_id,
+                       a.context, a.workflow_name, a.step_name, a.output_name,
+                       a.address, a.origin, a.is_published, a.published_path,
+                       a.content_digest, a.output_hash
+                FROM published_outputs po
+                JOIN artifacts a ON a.artifact_id = po.artifact_id
+                WHERE po.context = ?
+                ORDER BY po.workflow_name, po.step_name, po.output_name, po.address
                 """,
                 (context,),
             ).fetchall()
@@ -613,6 +618,18 @@ def record_workflow_run(
         for intent in membership_rows
     ):
         raise ValidationError("membership intent belongs to another run scope")
+    membership_coordinates = [
+        (
+            intent.row.context,
+            intent.row.workflow_name,
+            intent.row.step_name,
+            intent.row.output_name,
+            intent.row.address,
+        )
+        for intent in membership_rows
+    ]
+    if len(membership_coordinates) != len(set(membership_coordinates)):
+        raise ValidationError("membership intent coordinate is duplicated")
     now = _utc_now()
     try:
         with _connect(path) as conn:
@@ -724,7 +741,7 @@ def record_workflow_run(
             )
     except sqlite3.Error as exc:
         raise ValidationError(f"registry.db is malformed: {exc}") from exc
-    return len(membership_rows)
+    return len(artifact_rows)
 
 
 def read_published_outputs(
@@ -903,13 +920,17 @@ def read_artifact_by_path(
                 f"""
                 SELECT {_ARTIFACT_SELECT_COLUMNS}
                 FROM artifacts a
-                JOIN published_outputs po ON po.artifact_id = a.artifact_id
                 LEFT JOIN parameters p ON a.parameter_id = p.parameter_id
                 WHERE a.context = ?
                   AND a.path = ?
                   AND a.origin = 'workflow_output'
                   AND a.is_published = 1
-                  AND po.context = a.context
+                  AND EXISTS (
+                    SELECT 1
+                    FROM published_outputs po
+                    WHERE po.artifact_id = a.artifact_id
+                      AND po.context = a.context
+                  )
                 """,
                 (context, artifact_path),
             ).fetchall()
@@ -954,7 +975,6 @@ def resolve_registered_artifact_path(
                 f"""
                 SELECT {_ARTIFACT_SELECT_COLUMNS}
                 FROM artifacts a
-                JOIN published_outputs po ON po.artifact_id = a.artifact_id
                 LEFT JOIN parameters p ON a.parameter_id = p.parameter_id
                 WHERE a.context = ?
                   AND (
@@ -964,7 +984,12 @@ def resolve_registered_artifact_path(
                   )
                   AND a.origin = 'workflow_output'
                   AND a.is_published = 1
-                  AND po.context = a.context
+                  AND EXISTS (
+                    SELECT 1
+                    FROM published_outputs po
+                    WHERE po.artifact_id = a.artifact_id
+                      AND po.context = a.context
+                  )
                 """,
                 (context, artifact_path, artifact_path, artifact_path),
             ).fetchall()
@@ -1143,7 +1168,7 @@ def resolve_reusable_artifact_bundle(
             rows = conn.execute(
                 """
                 SELECT artifact_id, run_id, path, published_path,
-                       content_digest, file_size,
+                       content_digest, output_hash, file_size,
                        extension, workflow_name, step_name, output_name, address,
                        identity_contract_version, request_bundle_projection_json
                 FROM artifacts
@@ -1172,6 +1197,7 @@ def resolve_reusable_artifact_bundle(
                     or row["step_name"] is None
                     or row["output_name"] is None
                     or row["address"] is None
+                    or row["output_hash"] is None
                     or row["identity_contract_version"] is None
                     or row["request_bundle_projection_json"] is None
                 ):
@@ -1191,6 +1217,7 @@ def resolve_reusable_artifact_bundle(
                     path=str(row["path"]),
                     published_path=row["published_path"],
                     content_digest=str(row["content_digest"]),
+                    output_hash=str(row["output_hash"]),
                     file_size=int(row["file_size"]),
                     extension=str(row["extension"]),
                     workflow_name=str(row["workflow_name"]),
@@ -1620,7 +1647,6 @@ def read_current_published_artifact(
                   AND po.output_name = ?
                   AND po.address = ?
                   AND a.context = po.context
-                  AND a.workflow_name = po.workflow_name
                   AND a.step_name = po.step_name
                   AND a.output_name = po.output_name
                   AND a.address = po.address
@@ -2746,8 +2772,18 @@ def _validated_existing_artifact_id(
     ).fetchone()
     if row is None:
         raise ValidationError("existing artifact intent does not name a published artifact")
+    actual_digest = str(row[1])
+    actual_output_hash = str(row[2])
+    if not is_valid_digest(actual_digest):
+        raise ValidationError("existing membership artifact digest is invalid")
+    try:
+        actual_output_hash = validate_hash_alias(actual_output_hash)
+    except ValidationError as exc:
+        raise ValidationError("existing membership artifact hash is invalid") from exc
+    if actual_output_hash != short_hash(actual_digest):
+        raise ValidationError("existing membership artifact hash does not match digest")
     expected = (path, content_digest, output_hash)
-    actual = (str(row[0]), str(row[1]), str(row[2]))
+    actual = (str(row[0]), actual_digest, actual_output_hash)
     if any(value is not None for value in expected) and actual != expected:
         raise ValidationError("existing membership intent does not match its artifact")
     return artifact_id
@@ -2788,28 +2824,46 @@ def _validate_published_output_rows(
         workflow_name: set(workflow.steps)
         for workflow_name, workflow in loaded_workflow_project.workflows.items()
     }
+    verified_artifact_ids: set[int] = set()
     for row in rows:
         (
-            workflow_name,
+            membership_workflow_name,
             step_name,
             output_name,
             address,
             output_artifact_path,
             output_digest,
             output_hash,
+            artifact_id,
+            artifact_context,
+            generating_workflow_name,
+            artifact_step_name,
+            artifact_output_name,
+            artifact_address,
+            artifact_origin,
+            artifact_is_published,
+            artifact_published_path,
+            artifact_content_digest,
+            artifact_output_hash,
         ) = row
         if not all(
             isinstance(value, str) and value
-            for value in (workflow_name, step_name, output_name, address)
+            for value in (
+                membership_workflow_name,
+                step_name,
+                output_name,
+                address,
+                generating_workflow_name,
+            )
         ):
             raise ValidationError("registry.db published output row has invalid identity")
         try:
             address = validate_path_token(address, label="published output address")
         except ValidationError as exc:
             raise ValidationError("registry.db published output address is invalid") from exc
-        if workflow_name not in loaded_workflow_project.workflows:
+        if membership_workflow_name not in loaded_workflow_project.workflows:
             raise ValidationError("registry.db published output references unknown workflow")
-        if step_name not in workflow_steps[workflow_name]:
+        if step_name not in workflow_steps[membership_workflow_name]:
             raise ValidationError("registry.db published output references unknown workflow step")
         step = loaded_workflow_project.steps.get(step_name)
         if step is None or output_name not in step.outputs:
@@ -2822,23 +2876,45 @@ def _validate_published_output_rows(
             raise ValidationError("registry.db published output hash is invalid") from exc
         if output_hash != short_hash(output_digest):
             raise ValidationError("registry.db published output hash does not match digest")
-        expected_directory = f"outputs/{context}/{workflow_name}/{step_name}/{output_name}"
+        expected_directory = (
+            f"outputs/{context}/{generating_workflow_name}/{step_name}/{output_name}"
+        )
         output_path = _resolve_published_output_path(
             runtime_root,
             output_artifact_path,
             expected_directory=expected_directory,
         )
-        if sha256_file_digest(output_path) != output_digest:
-            raise ValidationError("published output artifact digest mismatch")
-        declared_extension = step.outputs[output_name].extension
-        parsed_address, filename_hash = parse_output_filename(
-            output_path.name,
-            declared_extension=declared_extension,
-        )
-        if parsed_address != address:
-            raise ValidationError("published output artifact filename address mismatch")
-        if filename_hash != output_hash:
-            raise ValidationError("published output artifact filename hash mismatch")
+        if (
+            artifact_context != context
+            or artifact_step_name != step_name
+            or artifact_output_name != output_name
+            or artifact_address != address
+            or artifact_origin != "workflow_output"
+            or artifact_is_published != 1
+            or artifact_published_path != output_artifact_path
+            or artifact_content_digest != output_digest
+            or artifact_output_hash != output_hash
+        ):
+            raise ValidationError(
+                "registry.db published output does not match its artifact"
+            )
+        if type(artifact_id) is not int or artifact_id <= 0:
+            raise ValidationError("registry.db published output artifact id is invalid")
+        if artifact_id not in verified_artifact_ids:
+            if sha256_file_digest(output_path) != output_digest:
+                raise ValidationError("published output artifact digest mismatch")
+            declared_extension = step.outputs[output_name].extension
+            parsed_address, filename_hash = parse_output_filename(
+                output_path.name,
+                declared_extension=declared_extension,
+            )
+            if parsed_address != address:
+                raise ValidationError(
+                    "published output artifact filename address mismatch"
+                )
+            if filename_hash != output_hash:
+                raise ValidationError("published output artifact filename hash mismatch")
+            verified_artifact_ids.add(artifact_id)
 
 
 def _resolve_published_output_path(

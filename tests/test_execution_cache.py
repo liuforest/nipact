@@ -534,6 +534,8 @@ _STEP_SELECTED_OUTPUT = {
     "d_transform": "d_out",
     "fit_transform": "fit_out",
     "apply_transform": "apply_out",
+    "multi_transform": "left_out",
+    "use_multi": "multi_used",
 }
 
 
@@ -2043,6 +2045,221 @@ def test_multi_output_selected_step_publishes_siblings_for_reuse(
     assert log_path.read_text(encoding="utf-8").splitlines() == ["B sub_001"]
 
 
+def test_cross_workflow_membership_adopts_complete_transitive_reused_bundles(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project_dir, runtime_dir, _log_path = _write_cache_project(
+        tmp_path,
+        monkeypatch,
+    )
+    main_plan = build_run_plan(
+        project_dir=project_dir,
+        context="cache",
+        workflow_name="main",
+        step_name="multi_transform",
+    )
+    assert execute_run_plan(main_plan, cores=1).published_count == len(
+        main_plan.published_outputs
+    )
+    with sqlite3.connect(runtime_dir / "database/registry.db") as conn:
+        main_artifacts_before = conn.execute(
+            """
+            SELECT artifact_id, run_id, workflow_name, step_name, output_name,
+                   address, path, content_digest, output_hash,
+                   request_bundle_projection_json
+            FROM artifacts
+            WHERE context = 'cache' AND workflow_name = 'main'
+            ORDER BY artifact_id
+            """
+        ).fetchall()
+        main_dependencies_before = conn.execute(
+            """
+            SELECT ad.*
+            FROM artifact_dependencies ad
+            JOIN artifacts a ON a.artifact_id = ad.dependent_artifact_id
+            WHERE a.context = 'cache' AND a.workflow_name = 'main'
+            ORDER BY ad.dependent_artifact_id, ad.binding_name,
+                     ad.input_path, ad.source_artifact_id
+            """
+        ).fetchall()
+    _write_sibling_workflow(
+        project_dir,
+        workflow_name="multi_derivative",
+        step_names=[
+            "a_source",
+            "b_transform",
+            "multi_transform",
+            "use_multi",
+        ],
+    )
+
+    derivative_plan = build_run_plan(
+        project_dir=project_dir,
+        context="cache",
+        workflow_name="multi_derivative",
+        step_name="use_multi",
+    )
+    assert [ref.output_name for ref in derivative_plan.reused_outputs] == ["left_out"]
+    outcome = execute_run_plan(derivative_plan, cores=1)
+    assert outcome.published_count == len(derivative_plan.published_outputs) == 1
+
+    with sqlite3.connect(runtime_dir / "database/registry.db") as conn:
+        memberships = conn.execute(
+            """
+            SELECT po.step_name, po.output_name, po.artifact_id, a.workflow_name
+            FROM published_outputs po
+            JOIN artifacts a ON a.artifact_id = po.artifact_id
+            WHERE po.context = 'cache'
+              AND po.workflow_name = 'multi_derivative'
+              AND po.address = 'sub_001'
+            ORDER BY po.step_name, po.output_name
+            """
+        ).fetchall()
+        resolution_summary = json.loads(
+            conn.execute(
+                """
+                SELECT resolution_summary_json
+                FROM workflow_runs
+                WHERE context = 'cache'
+                  AND workflow_name = 'multi_derivative'
+                  AND selected_step_name = 'use_multi'
+                  AND is_current = 1
+                """
+            ).fetchone()[0]
+        )
+        assert conn.execute(
+            """
+            SELECT artifact_id, run_id, workflow_name, step_name, output_name,
+                   address, path, content_digest, output_hash,
+                   request_bundle_projection_json
+            FROM artifacts
+            WHERE context = 'cache' AND workflow_name = 'main'
+            ORDER BY artifact_id
+            """
+        ).fetchall() == main_artifacts_before
+        assert conn.execute(
+            """
+            SELECT ad.*
+            FROM artifact_dependencies ad
+            JOIN artifacts a ON a.artifact_id = ad.dependent_artifact_id
+            WHERE a.context = 'cache' AND a.workflow_name = 'main'
+            ORDER BY ad.dependent_artifact_id, ad.binding_name,
+                     ad.input_path, ad.source_artifact_id
+            """
+        ).fetchall() == main_dependencies_before
+    assert [(row[0], row[1]) for row in memberships] == [
+        ("a_source", "a_out"),
+        ("b_transform", "b_out"),
+        ("multi_transform", "left_out"),
+        ("multi_transform", "right_out"),
+        ("use_multi", "multi_used"),
+    ]
+    assert [row[3] for row in memberships] == [
+        "main",
+        "main",
+        "main",
+        "main",
+        "multi_derivative",
+    ]
+    sibling_run_ids = {
+        _artifact_run_id(runtime_dir, artifact_id=int(row[2]))
+        for row in memberships
+        if row[0] == "multi_transform"
+    }
+    assert len(sibling_run_ids) == 1
+    assert resolution_summary["selected_outputs"] == [
+        {
+            "context": "cache",
+            "workflow_name": "multi_derivative",
+            "step_name": "use_multi",
+            "output_name": "multi_used",
+            "address": "sub_001",
+            "resolution": {
+                "artifact_id": next(
+                    int(row[2]) for row in memberships if row[0] == "use_multi"
+                ),
+                "outcome": "generated",
+            },
+        }
+    ]
+
+
+def test_failed_fresh_branch_does_not_adopt_its_reused_memberships(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project_dir, runtime_dir, _log_path = _write_cache_project(
+        tmp_path,
+        monkeypatch,
+        entities=("sub_001", "sub_002"),
+    )
+    main_plan = build_run_plan(
+        project_dir=project_dir,
+        context="cache",
+        workflow_name="main",
+        step_name="b_transform",
+    )
+    assert execute_run_plan(main_plan, cores=1).all_selected_published
+
+    derivative_plan = build_run_plan(
+        project_dir=project_dir,
+        context="cache",
+        workflow_name="derivative",
+        step_name="c_transform",
+    )
+
+    def write_one_selected_output(
+        _run_plan: object,
+        *,
+        cores: int,
+        dry_run: bool,
+    ) -> int:
+        job = next(
+            job
+            for job in derivative_plan.jobs
+            if job.step_name == "c_transform" and job.address == "sub_001"
+        )
+        output = job.outputs["c_out"]
+        output.staging_path.parent.mkdir(parents=True, exist_ok=True)
+        output.staging_path.write_text('{"value":"retained"}\n', encoding="utf-8")
+        return 1
+
+    monkeypatch.setattr("nipact.execution._run_snakemake", write_one_selected_output)
+    outcome = execute_run_plan(derivative_plan, cores=1)
+    assert outcome.published_count == 1
+    assert any(address == "sub_002" for _step, address, _reason in outcome.failed_jobs)
+
+    with sqlite3.connect(runtime_dir / "database/registry.db") as conn:
+        derivative_memberships = conn.execute(
+            """
+            SELECT step_name, output_name, address
+            FROM published_outputs
+            WHERE context = 'cache' AND workflow_name = 'derivative'
+            ORDER BY step_name, output_name, address
+            """
+        ).fetchall()
+        main_memberships = conn.execute(
+            """
+            SELECT step_name, output_name, address
+            FROM published_outputs
+            WHERE context = 'cache'
+              AND workflow_name = 'main'
+              AND address = 'sub_002'
+            ORDER BY step_name, output_name
+            """
+        ).fetchall()
+    assert derivative_memberships == [
+        ("a_source", "a_out", "sub_001"),
+        ("b_transform", "b_out", "sub_001"),
+        ("c_transform", "c_out", "sub_001"),
+    ]
+    assert main_memberships == [
+        ("a_source", "a_out", "sub_002"),
+        ("b_transform", "b_out", "sub_002"),
+    ]
+
+
 def test_multi_output_dry_run_maps_consumed_reused_sibling(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2258,6 +2475,30 @@ def test_derivative_reuses_compatible_base_ancestor_artifact(
               AND is_current = 1
             """
         ).fetchone()[0] == "main"
+        membership = conn.execute(
+            """
+            SELECT po.artifact_id, a.workflow_name, a.run_id
+            FROM published_outputs po
+            JOIN artifacts a ON a.artifact_id = po.artifact_id
+            WHERE po.context = 'cache'
+              AND po.workflow_name = 'derivative'
+              AND po.step_name = 'b_transform'
+              AND po.output_name = 'b_out'
+              AND po.address = 'sub_001'
+            """
+        ).fetchone()
+        assert membership == (main_b_artifact_id, "main", main_b_run_id)
+
+    derivative_b = registry_module.read_current_published_artifact(
+        runtime_dir / "database/registry.db",
+        context="cache",
+        workflow_name="derivative",
+        step_name="b_transform",
+        output_name="b_out",
+        address="sub_001",
+    )
+    assert derivative_b.artifact_id == main_b_artifact_id
+    assert derivative_b.workflow_name == "main"
 
     derivative_c_artifact_id = _selected_artifact_id(
         runtime_dir,
@@ -3604,6 +3845,189 @@ def test_targeted_rerun_with_identical_bytes_revalidates_published_file(
     )
 
 
+def test_path_reads_deduplicate_multiple_memberships_for_one_current_artifact(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project_dir, runtime_dir, _log_path = _write_cache_project(
+        tmp_path,
+        monkeypatch,
+        entities=("sub_001",),
+    )
+    first_plan = build_run_plan(
+        project_dir=project_dir,
+        context="cache",
+        workflow_name="main",
+        step_name="b_transform",
+        address="sub_001",
+    )
+    assert execute_run_plan(first_plan, cores=1).all_selected_published
+    derivative_plan = build_run_plan(
+        project_dir=project_dir,
+        context="cache",
+        workflow_name="derivative",
+        step_name="c_transform",
+        address="sub_001",
+    )
+    assert execute_run_plan(derivative_plan, cores=1).all_selected_published
+
+    rerun_plan = build_run_plan(
+        project_dir=project_dir,
+        context="cache",
+        workflow_name="main",
+        step_name="b_transform",
+        address="sub_001",
+    )
+    assert execute_run_plan(rerun_plan, cores=1).all_selected_published
+    with sqlite3.connect(runtime_dir / "database/registry.db") as conn:
+        current_id, shared_path = conn.execute(
+            """
+            SELECT artifact_id, path
+            FROM published_outputs
+            WHERE context = 'cache'
+              AND workflow_name = 'main'
+              AND step_name = 'b_transform'
+              AND output_name = 'b_out'
+              AND address = 'sub_001'
+            """
+        ).fetchone()
+        assert conn.execute(
+            "SELECT COUNT(*) FROM artifacts WHERE context = 'cache' AND path = ?",
+            (shared_path,),
+        ).fetchone() == (2,)
+
+    registry_path = runtime_dir / "database/registry.db"
+    with pytest.raises(ValidationError, match="ambiguous registered artifact path"):
+        registry_module.read_artifact_by_path(
+            registry_path,
+            context="cache",
+            artifact_path=shared_path,
+        )
+    with pytest.raises(ValidationError, match="ambiguous registered artifact path"):
+        registry_module.resolve_registered_artifact_path(
+            registry_path,
+            context="cache",
+            artifact_path=shared_path,
+        )
+
+    with sqlite3.connect(runtime_dir / "database/registry.db") as conn:
+        # Point both workflow memberships at the newer byte-identical entity.
+        # The older historical entity deliberately retains the same path.
+        conn.execute(
+            """
+            UPDATE published_outputs
+            SET artifact_id = ?
+            WHERE context = 'cache'
+              AND workflow_name = 'derivative'
+              AND step_name = 'b_transform'
+              AND output_name = 'b_out'
+              AND address = 'sub_001'
+            """,
+            (current_id,),
+        )
+
+    assert registry_module.read_artifact_by_path(
+        registry_path,
+        context="cache",
+        artifact_path=shared_path,
+    ).artifact_id == current_id
+    assert registry_module.resolve_registered_artifact_path(
+        registry_path,
+        context="cache",
+        artifact_path=shared_path,
+    ).artifact_id == current_id
+
+
+def test_membership_write_failure_restores_registry_and_removes_new_output(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project_dir, runtime_dir, _log_path = _write_cache_project(
+        tmp_path,
+        monkeypatch,
+        entities=("sub_001",),
+    )
+    first_plan = build_run_plan(
+        project_dir=project_dir,
+        context="cache",
+        workflow_name="main",
+        step_name="b_transform",
+        address="sub_001",
+    )
+    assert execute_run_plan(first_plan, cores=1).all_selected_published
+    registry_path = runtime_dir / "database/registry.db"
+    with sqlite3.connect(registry_path) as conn:
+        counts_before = _registry_row_counts(runtime_dir)
+        memberships_before = conn.execute(
+            """
+            SELECT context, workflow_name, step_name, output_name, address,
+                   artifact_id
+            FROM published_outputs
+            ORDER BY context, workflow_name, step_name, output_name, address
+            """
+        ).fetchall()
+        current_runs_before = conn.execute(
+            """
+            SELECT run_id
+            FROM workflow_runs
+            WHERE is_current = 1
+            ORDER BY run_id
+            """
+        ).fetchall()
+    output_files_before = {
+        path.relative_to(runtime_dir).as_posix()
+        for path in (runtime_dir / "outputs").rglob("*")
+        if path.is_file()
+    }
+
+    step_path = project_dir / "steps/b_transform.yaml"
+    step = yaml.safe_load(step_path.read_text(encoding="utf-8"))
+    step["params"]["version"] = "v2"
+    _write_yaml(step_path, step)
+    changed_plan = build_run_plan(
+        project_dir=project_dir,
+        context="cache",
+        workflow_name="main",
+        step_name="b_transform",
+        address="sub_001",
+    )
+
+    def fail_membership_insert(*_args: object, **_kwargs: object) -> None:
+        raise sqlite3.IntegrityError("synthetic membership insert failure")
+
+    monkeypatch.setattr(
+        registry_module,
+        "_insert_memberships",
+        fail_membership_insert,
+    )
+    with pytest.raises(ValidationError, match="synthetic membership insert failure"):
+        execute_run_plan(changed_plan, cores=1)
+
+    with sqlite3.connect(registry_path) as conn:
+        assert _registry_row_counts(runtime_dir) == counts_before
+        assert conn.execute(
+            """
+            SELECT context, workflow_name, step_name, output_name, address,
+                   artifact_id
+            FROM published_outputs
+            ORDER BY context, workflow_name, step_name, output_name, address
+            """
+        ).fetchall() == memberships_before
+        assert conn.execute(
+            """
+            SELECT run_id
+            FROM workflow_runs
+            WHERE is_current = 1
+            ORDER BY run_id
+            """
+        ).fetchall() == current_runs_before
+    assert {
+        path.relative_to(runtime_dir).as_posix()
+        for path in (runtime_dir / "outputs").rglob("*")
+        if path.is_file()
+    } == output_files_before
+
+
 def test_bundle_reresolution_records_the_equivalent_artifact_actually_consumed(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -3684,7 +4108,7 @@ def test_bundle_reresolution_records_the_equivalent_artifact_actually_consumed(
     second_c_plan = build_run_plan(
         project_dir=project_dir,
         context="cache",
-        workflow_name="main",
+        workflow_name="derivative",
         step_name="c_transform",
         address="sub_001",
     )
@@ -3720,6 +4144,170 @@ def test_bundle_reresolution_records_the_equivalent_artifact_actually_consumed(
             """,
             (second_c_id,),
         ).fetchone() == (newer_id,)
+        assert conn.execute(
+            """
+            SELECT artifact_id
+            FROM published_outputs
+            WHERE context = 'cache'
+              AND workflow_name = 'derivative'
+              AND step_name = 'b_transform'
+              AND output_name = 'b_out'
+              AND address = 'sub_001'
+            """
+        ).fetchone() == (newer_id,)
+
+
+def test_multi_output_substitution_records_all_siblings_and_transitive_membership(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project_dir, runtime_dir, _log_path = _write_cache_project(
+        tmp_path,
+        monkeypatch,
+        entities=("sub_001",),
+    )
+    main_plan = build_run_plan(
+        project_dir=project_dir,
+        context="cache",
+        workflow_name="main",
+        step_name="multi_transform",
+        address="sub_001",
+    )
+    assert execute_run_plan(main_plan, cores=1).all_selected_published
+    _write_sibling_workflow(
+        project_dir,
+        workflow_name="multi_derivative",
+        step_names=[
+            "a_source",
+            "b_transform",
+            "multi_transform",
+            "use_multi",
+        ],
+    )
+    derivative_plan = build_run_plan(
+        project_dir=project_dir,
+        context="cache",
+        workflow_name="multi_derivative",
+        step_name="use_multi",
+        address="sub_001",
+    )
+    planned_multi = next(
+        ref
+        for ref in derivative_plan.reused_validation_outputs
+        if ref.step_name == "multi_transform"
+    )
+    planned_b = next(
+        ref
+        for ref in derivative_plan.reused_validation_outputs
+        if ref.step_name == "b_transform"
+    )
+
+    rerun_b = build_run_plan(
+        project_dir=project_dir,
+        context="cache",
+        workflow_name="main",
+        step_name="b_transform",
+        address="sub_001",
+    )
+    assert execute_run_plan(rerun_b, cores=1).all_selected_published
+    rerun_multi = build_run_plan(
+        project_dir=project_dir,
+        context="cache",
+        workflow_name="main",
+        step_name="multi_transform",
+        address="sub_001",
+    )
+    assert execute_run_plan(rerun_multi, cores=1).all_selected_published
+
+    registry_path = runtime_dir / "database/registry.db"
+    with sqlite3.connect(registry_path) as conn:
+        new_b_id = conn.execute(
+            """
+            SELECT artifact_id
+            FROM artifacts
+            WHERE step_name = 'b_transform'
+              AND output_name = 'b_out'
+              AND address = 'sub_001'
+            ORDER BY run_id DESC
+            LIMIT 1
+            """
+        ).fetchone()[0]
+        new_multi = dict(
+            conn.execute(
+                """
+                SELECT output_name, artifact_id
+                FROM artifacts
+                WHERE step_name = 'multi_transform' AND address = 'sub_001'
+                  AND run_id = (
+                    SELECT MAX(run_id)
+                    FROM artifacts
+                    WHERE step_name = 'multi_transform' AND address = 'sub_001'
+                  )
+                """
+            ).fetchall()
+        )
+        for artifact_id in (
+            *planned_multi.source_bundle_artifact_ids,
+            *planned_b.source_bundle_artifact_ids,
+        ):
+            conn.execute(
+                """
+                UPDATE artifacts
+                SET path = ?, published_path = ?
+                WHERE artifact_id = ?
+                """,
+                (
+                    f"outputs/cache/main/missing/{artifact_id}.json",
+                    f"outputs/cache/main/missing/{artifact_id}.json",
+                    artifact_id,
+                ),
+            )
+
+    assert execute_run_plan(derivative_plan, cores=1).all_selected_published
+    use_artifact_id = _latest_workflow_artifact_id(
+        runtime_dir,
+        step_name="use_multi",
+        output_name="multi_used",
+        address="sub_001",
+    )
+    with sqlite3.connect(registry_path) as conn:
+        memberships = dict(
+            conn.execute(
+                """
+                SELECT step_name || '.' || output_name, artifact_id
+                FROM published_outputs
+                WHERE context = 'cache'
+                  AND workflow_name = 'multi_derivative'
+                  AND address = 'sub_001'
+                  AND step_name IN ('b_transform', 'multi_transform')
+                """
+            ).fetchall()
+        )
+        dependency_id = conn.execute(
+            """
+            SELECT source_artifact_id
+            FROM artifact_dependencies
+            WHERE dependent_artifact_id = ?
+              AND source_step_name = 'multi_transform'
+            """,
+            (use_artifact_id,),
+        ).fetchone()[0]
+    assert memberships == {
+        "b_transform.b_out": new_b_id,
+        "multi_transform.left_out": new_multi["left_out"],
+        "multi_transform.right_out": new_multi["right_out"],
+    }
+    assert dependency_id == new_multi["left_out"]
+    assert {
+        _artifact_run_id(runtime_dir, artifact_id=int(artifact_id))
+        for key, artifact_id in memberships.items()
+        if key.startswith("multi_transform.")
+    } == {
+        _artifact_run_id(
+            runtime_dir,
+            artifact_id=int(new_multi["left_out"]),
+        )
+    }
 
 
 def test_bundle_resolver_reports_recorded_divergence_before_missing_files(
