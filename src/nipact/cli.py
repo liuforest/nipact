@@ -328,7 +328,11 @@ def _run_workflow_command(args: argparse.Namespace) -> int | None:
         )
         feedback.key_value("cores", args.cores)
         feedback.key_value("dry_run", run_plan.dry_run)
-        feedback.key_value("selected_outputs", len(run_plan.selected_output_refs))
+        feedback.key_value(
+            "selected_outputs",
+            len(run_plan.selected_fresh_output_refs)
+            + len(run_plan.selected_reused_output_refs),
+        )
         # planned_jobs counts compiled fresh jobs population-wide even for a
         # targeted run; planned_reachable_fresh_jobs and the reuse counters
         # below are closure-scoped.
@@ -363,7 +367,7 @@ def _run_workflow_command(args: argparse.Namespace) -> int | None:
                 "existing_staged_outputs",
                 sum(
                     1
-                    for output_ref in run_plan.selected_output_refs
+                    for output_ref in run_plan.selected_fresh_output_refs
                     if output_ref.staging_path.is_file()
                 ),
             )
@@ -434,7 +438,7 @@ def _run_workflow_command(args: argparse.Namespace) -> int | None:
             for step_name, address, reason in outcome.failed_jobs:
                 feedback.key_value("failed_job", f"{step_name} {address} ({reason})")
         feedback.key_value("elapsed_seconds", f"{elapsed_seconds:.3f}")
-        if outcome.all_selected_published:
+        if outcome.all_selected_resolved:
             feedback.pass_line("PASS: workflow run")
             return 0
         feedback.line("PARTIAL: workflow run", style="yellow")

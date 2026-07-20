@@ -44,7 +44,7 @@ def _write_all_staged_outputs(
 ) -> None:
     selected_keys = {
         (job.step_name, job.output_name, job.address)
-        for job in run_plan.selected_jobs
+        for job in run_plan.selected_fresh_jobs
     }
     for job in run_plan.jobs:
         job.staging_path.parent.mkdir(parents=True, exist_ok=True)
@@ -536,7 +536,7 @@ def test_build_run_plan_for_base_entity_step(
         / "runs/colors/base/color_local_transform/staging/"
         "color_source/source_color/color_000.json"
     )
-    assert run_plan.selected_jobs[0].staging_path == (
+    assert run_plan.selected_fresh_jobs[0].staging_path == (
         runtime_dir
         / "runs/colors/base/color_local_transform/staging/"
         "color_local_transform/local_color/color_000.json"
@@ -568,8 +568,8 @@ def test_build_run_plan_for_base_cohort_step(
         (spec.step_name, spec.output_name, spec.address)
         for spec in run_plan.published_outputs
     }
-    assert len(run_plan.selected_jobs) == 1
-    assert run_plan.selected_jobs[0].inputs["sector_label"][-1].endswith(
+    assert len(run_plan.selected_fresh_jobs) == 1
+    assert run_plan.selected_fresh_jobs[0].inputs["sector_label"][-1].endswith(
         "color_sector_label/sector_label/color_199.json"
     )
 
@@ -608,13 +608,63 @@ def test_build_run_plan_with_address_selects_one_entity(
     )
 
     assert run_plan.requested_address == "sub_001"
-    assert len(run_plan.selected_output_refs) == 1
-    assert run_plan.selected_output_refs[0].address == "sub_001"
-    assert len(run_plan.selected_jobs) == 1
+    assert len(run_plan.selected_fresh_output_refs) == 1
+    assert run_plan.selected_fresh_output_refs[0].address == "sub_001"
+    assert run_plan.selected_reused_output_refs == ()
+    assert len(run_plan.selected_fresh_jobs) == 1
     # Plan construction stays population-wide; selection narrows targets, not jobs.
     assert {job.address for job in run_plan.jobs} == {"sub_001", "sub_002"}
     assert {spec.address for spec in run_plan.published_outputs} == {"sub_001"}
-    assert _run_plan_payload(run_plan)["requested_address"] == "sub_001"
+    payload = _run_plan_payload(run_plan)
+    assert payload["requested_address"] == "sub_001"
+    assert payload["selected_outputs"] == [
+        {
+            "step_name": "uppercase_text",
+            "output_name": "upper_text",
+            "address": "sub_001",
+        }
+    ]
+    assert payload["selected_fresh_outputs"] == [
+        {
+            "step_name": "uppercase_text",
+            "output_name": "upper_text",
+            "address": "sub_001",
+            "staging_path": "staging/uppercase_text/upper_text/sub_001.json",
+        }
+    ]
+    assert payload["selected_reused_outputs"] == []
+
+
+def test_selected_output_partition_rejects_duplicates_and_missing_coordinates(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project_dir, _runtime_dir = _write_tiny_non_colors_project(tmp_path, monkeypatch)
+    run_plan = build_run_plan(
+        project_dir=project_dir,
+        context="mini",
+        workflow_name="main",
+        step_name="uppercase_text",
+        address="sub_001",
+    )
+    selected_ref = run_plan.selected_fresh_output_refs[0]
+
+    with pytest.raises(ValidationError, match="coordinate is duplicated"):
+        execution_module._validate_selected_output_partition(
+            selected_step_name="uppercase_text",
+            selected_output_name="upper_text",
+            selected_addresses=("sub_001",),
+            selected_fresh_output_refs=(selected_ref, selected_ref),
+            selected_reused_output_refs=(),
+        )
+    with pytest.raises(ValidationError, match="do not cover"):
+        execution_module._validate_selected_output_partition(
+            selected_step_name="uppercase_text",
+            selected_output_name="upper_text",
+            selected_addresses=("sub_001",),
+            selected_fresh_output_refs=(),
+            selected_reused_output_refs=(),
+        )
 
 
 @pytest.mark.parametrize(
@@ -670,7 +720,10 @@ def test_build_run_plan_without_address_selects_all_entities(
     )
 
     assert run_plan.requested_address is None
-    assert [ref.address for ref in run_plan.selected_output_refs] == ["sub_001", "sub_002"]
+    assert [ref.address for ref in run_plan.selected_fresh_output_refs] == [
+        "sub_001",
+        "sub_002",
+    ]
     assert {spec.address for spec in run_plan.published_outputs} == {"sub_001", "sub_002"}
     assert _run_plan_payload(run_plan)["requested_address"] is None
 
@@ -753,7 +806,7 @@ def test_targeted_runs_for_different_addresses_get_distinct_workspaces(
     # Staging paths derive from run_workspace, so partitioned runs cannot
     # overwrite each other's staged files.
     for address, run_plan in plans.items():
-        for job in run_plan.selected_jobs:
+        for job in run_plan.selected_fresh_jobs:
             for output in job.outputs.values():
                 assert output.staging_path.is_relative_to(
                     step_workspace / "addresses" / address
@@ -809,7 +862,7 @@ def test_dry_run_workspace_is_isolated_for_single_output_shapes(
     )
     for run_plan in (full_plan, targeted_plan):
         assert run_plan.dry_run is True
-        for job in run_plan.selected_jobs:
+        for job in run_plan.selected_fresh_jobs:
             for output in job.outputs.values():
                 assert output.staging_path.is_relative_to(run_plan.run_workspace)
 
@@ -847,7 +900,7 @@ def test_dry_run_workspace_is_isolated_for_multi_output_shapes(
     )
     for run_plan in (full_plan, targeted_plan):
         assert run_plan.dry_run is True
-        for job in run_plan.selected_jobs:
+        for job in run_plan.selected_fresh_jobs:
             for output in job.outputs.values():
                 assert output.staging_path.is_relative_to(run_plan.run_workspace)
 
@@ -1041,11 +1094,14 @@ def test_execute_run_plan_publishes_selected_outputs_without_real_snakemake(
     )
     events: list[str] = []
 
-    assert execute_run_plan(
+    outcome = execute_run_plan(
         run_plan,
         cores=2,
         status_callback=events.append,
-    ).published_count == len(run_plan.published_outputs)
+    )
+    assert outcome.published_count == len(run_plan.published_outputs)
+    assert outcome.selected_generated_count == 1
+    assert outcome.selected_reused_count == 0
     assert events == [
         "building_workspace",
         "starting_snakemake",
@@ -1514,7 +1570,9 @@ def test_partial_publish_records_surviving_jobs(
     # records the survivors instead of rolling everything back.
     outcome = execute_run_plan(run_plan, cores=1)
     assert outcome.published_count == 2
-    assert outcome.all_selected_published is False
+    assert outcome.selected_generated_count == 1
+    assert outcome.selected_reused_count == 0
+    assert outcome.all_selected_resolved is False
     assert outcome.failed_jobs == (
         ("source_text", "sub_002", "missing staged output"),
         ("uppercase_text", "sub_002", "missing staged output"),
@@ -1596,7 +1654,7 @@ def test_projection_finalization_failure_rolls_back_current_run(
         address="sub_001",
     )
     active_plan["value"] = first_plan
-    assert execute_run_plan(first_plan, cores=1).all_selected_published
+    assert execute_run_plan(first_plan, cores=1).all_selected_resolved
 
     registry_path = runtime_dir / "database/registry.db"
     with sqlite3.connect(registry_path) as conn:
@@ -1671,7 +1729,7 @@ def test_multi_output_partial_sibling_prunes_orphan_child(
     # rollback. The independent survivor sub_001 is still recorded.
     outcome = execute_run_plan(run_plan, cores=1)
     assert outcome.published_count == 3
-    assert outcome.all_selected_published is False
+    assert outcome.all_selected_resolved is False
     # source_text/sub_002 skips on the missing sibling; qc_echo/sub_002 published
     # then prunes because its fresh parent did not.
     assert outcome.failed_jobs == (

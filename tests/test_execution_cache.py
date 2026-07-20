@@ -2,6 +2,7 @@ import json
 import os
 import sqlite3
 import subprocess
+from dataclasses import fields, replace
 from pathlib import Path
 
 import pytest
@@ -11,7 +12,12 @@ import nipact.execution as execution_module
 import nipact.registry as registry_module
 from nipact.cli import main
 from nipact.errors import ValidationError
-from nipact.execution import RunOutcome, build_run_plan, execute_run_plan
+from nipact.execution import (
+    RunOutcome,
+    SelectedReusedBundleRef,
+    build_run_plan,
+    execute_run_plan,
+)
 from nipact.hashing import sha256_file_digest
 from nipact.projection import (
     ResolvedRequestBundleProjectionV1,
@@ -819,7 +825,7 @@ def test_projection_planning_propagates_unregistered_source_state(
     )
     assert {job.step_name for job in run_plan.jobs} == {"a_source", "b_transform"}
     assert all(job.projection_state == expected for job in run_plan.jobs)
-    assert run_plan.selected_jobs[0].projection_state == expected
+    assert run_plan.selected_fresh_jobs[0].projection_state == expected
     assert run_plan.reused_outputs == ()
     assert snapshot_reads == 1
 
@@ -1131,7 +1137,7 @@ def test_dependency_free_workflow_output_remains_reusable_as_an_input(
         "nipact.execution._run_snakemake",
         lambda *_args, **_kwargs: execute_synthetic(constant_plan),
     )
-    assert execute_run_plan(constant_plan, cores=1).all_selected_published
+    assert execute_run_plan(constant_plan, cores=1).all_selected_resolved
 
     consumer_plan = build_run_plan(
         project_dir=project_dir,
@@ -1147,7 +1153,7 @@ def test_dependency_free_workflow_output_remains_reusable_as_an_input(
         "nipact.execution._run_snakemake",
         lambda *_args, **_kwargs: execute_synthetic(consumer_plan),
     )
-    assert execute_run_plan(consumer_plan, cores=1).all_selected_published
+    assert execute_run_plan(consumer_plan, cores=1).all_selected_resolved
 
 
 def test_cross_target_run_plan_reuses_upstream_from_registry(
@@ -1411,8 +1417,10 @@ def test_real_run_cli_reports_planned_hydration_bytes_fanout_once(
         captured_plans.append(run_plan)
         return RunOutcome(
             published_count=0,
+            selected_generated_count=0,
+            selected_reused_count=0,
             failed_jobs=(),
-            all_selected_published=True,
+            all_selected_resolved=True,
         )
 
     monkeypatch.setattr("nipact.execution.execute_run_plan", publish_stub)
@@ -1631,7 +1639,7 @@ def test_real_run_records_reused_dependency_without_current_membership(
             (reused_id,),
         )
 
-    assert execute_run_plan(c_plan, cores=1).all_selected_published
+    assert execute_run_plan(c_plan, cores=1).all_selected_resolved
     c_id = _latest_workflow_artifact_id(
         runtime_dir,
         step_name="c_transform",
@@ -1736,7 +1744,7 @@ def test_real_hydration_reads_freshly_reresolved_registered_path(
         return original_digest(path)
 
     monkeypatch.setattr(execution_module, "sha256_file_digest", recording_digest)
-    assert execute_run_plan(c_plan, cores=1).all_selected_published
+    assert execute_run_plan(c_plan, cores=1).all_selected_resolved
     assert new_path in hashed_paths
     assert old_path not in hashed_paths
 
@@ -1800,7 +1808,7 @@ def test_dry_run_forecast_not_suppressed_by_completed_real_run(
     assert execute_run_plan(real_plan, cores=1).published_count == len(
         real_plan.published_outputs
     )
-    staged_real_c = real_plan.selected_output_refs[0].staging_path
+    staged_real_c = real_plan.selected_fresh_output_refs[0].staging_path
     assert staged_real_c.is_file()
 
     dry_plan = build_run_plan(
@@ -1815,7 +1823,9 @@ def test_dry_run_forecast_not_suppressed_by_completed_real_run(
     staged_seen: list[bool] = []
 
     def record_staging(*_args: object, **_kwargs: object) -> int:
-        staged_seen.append(dry_plan.selected_output_refs[0].staging_path.exists())
+        staged_seen.append(
+            dry_plan.selected_fresh_output_refs[0].staging_path.exists()
+        )
         return 0
 
     monkeypatch.setattr("nipact.execution._run_snakemake", record_staging)
@@ -2257,7 +2267,7 @@ def test_failed_fresh_branch_does_not_adopt_its_reused_memberships(
         workflow_name="main",
         step_name="b_transform",
     )
-    assert execute_run_plan(main_plan, cores=1).all_selected_published
+    assert execute_run_plan(main_plan, cores=1).all_selected_resolved
 
     derivative_plan = build_run_plan(
         project_dir=project_dir,
@@ -2422,11 +2432,11 @@ def test_targeted_multi_output_run_publishes_both_siblings_for_one_entity(
         step_name="multi_transform",
         address="sub_001",
     )
-    assert len(multi_plan.selected_output_refs) == 1
+    assert len(multi_plan.selected_fresh_output_refs) == 1
     assert multi_plan.run_workspace == (
         runtime_dir / "runs/cache/main/multi_transform/left_out/addresses/sub_001"
     )
-    assert execute_run_plan(multi_plan, cores=1).all_selected_published
+    assert execute_run_plan(multi_plan, cores=1).all_selected_resolved
     # The workflow target names left_out for one entity, but the selected job
     # writes both siblings; both publish so the downstream all-or-nothing
     # producer reuse check stays satisfiable, and nothing publishes or
@@ -3315,7 +3325,7 @@ def test_targeted_selected_job_executes_despite_registered_equivalent(
     job_keys = [(job.step_name, job.address) for job in targeted_plan.jobs]
     assert ("b_transform", "sub_001") in job_keys
     assert ("b_transform", "sub_002") not in job_keys
-    assert execute_run_plan(targeted_plan, cores=1).all_selected_published
+    assert execute_run_plan(targeted_plan, cores=1).all_selected_resolved
     lines = log_path.read_text(encoding="utf-8").splitlines()
     assert lines.count("B sub_001") == 2
     assert lines.count("B sub_002") == 1
@@ -3357,7 +3367,7 @@ def test_targeted_run_reuses_valid_upstream_for_selected_entity(
         output_name="b_out",
         address="sub_001",
     )
-    assert execute_run_plan(c_plan, cores=1).all_selected_published
+    assert execute_run_plan(c_plan, cores=1).all_selected_resolved
     # b was hydrated from the registry, not recomputed.
     lines = log_path.read_text(encoding="utf-8").splitlines()
     assert lines.count("B sub_001") == 1
@@ -3401,7 +3411,7 @@ def test_targeted_run_excludes_reuse_needed_only_by_unreachable_jobs(
         address="sub_001",
     )
     assert _reused_keys(c_plan) == {("b_transform", "b_out", "sub_001")}
-    assert execute_run_plan(c_plan, cores=1).all_selected_published
+    assert execute_run_plan(c_plan, cores=1).all_selected_resolved
     payload = json.loads(
         (c_plan.run_workspace / "run_plan.json").read_text(encoding="utf-8")
     )
@@ -3451,7 +3461,7 @@ def test_targeted_run_unaffected_by_same_size_corruption_outside_closure(
         address="sub_001",
     )
     assert ("b_transform", "b_out", "sub_002") not in _reused_keys(c_plan)
-    assert execute_run_plan(c_plan, cores=1).all_selected_published
+    assert execute_run_plan(c_plan, cores=1).all_selected_resolved
     c_payload = _latest_workflow_payload(
         runtime_dir,
         step_name="c_transform",
@@ -3606,7 +3616,7 @@ def test_targeted_run_does_not_execute_or_republish_sibling_entity(
         (spec.step_name, spec.output_name, spec.address)
         for spec in targeted_plan.published_outputs
     } == {("b_transform", "b_out", "sub_001")}
-    assert execute_run_plan(targeted_plan, cores=1).all_selected_published
+    assert execute_run_plan(targeted_plan, cores=1).all_selected_resolved
     lines = log_path.read_text(encoding="utf-8").splitlines()
     assert lines.count("B sub_002") == 1
     assert (
@@ -3659,7 +3669,7 @@ def test_targeted_apply_reuses_registered_cohort_fit_without_executing_sibling(
         ("b_transform", "b_out", "sub_001"),
         ("fit_transform", "fit_out", "subjects"),
     }
-    assert execute_run_plan(apply_plan, cores=1).all_selected_published
+    assert execute_run_plan(apply_plan, cores=1).all_selected_resolved
     lines = log_path.read_text(encoding="utf-8").splitlines()
     assert lines.count("B sub_001") == 1
     assert lines.count("B sub_002") == 1
@@ -3785,7 +3795,7 @@ def test_targeted_apply_executes_fresh_cohort_ancestor_with_population_fan_in(
         ("apply_transform", "apply_out", "sub_001"),
         ("fit_transform", "fit_out", "subjects"),
     }
-    assert execute_run_plan(apply_plan, cores=1).all_selected_published
+    assert execute_run_plan(apply_plan, cores=1).all_selected_resolved
     lines = log_path.read_text(encoding="utf-8").splitlines()
     assert lines.count("B sub_001") == 1
     assert lines.count("B sub_002") == 1
@@ -3842,7 +3852,7 @@ def test_targeted_apply_with_empty_registry_executes_fresh_population_fan_in(
     } == expected_coordinates
 
     outcome = execute_run_plan(apply_plan, cores=1)
-    assert outcome.all_selected_published
+    assert outcome.all_selected_resolved
     assert outcome.published_count == len(expected_coordinates)
     lines = log_path.read_text(encoding="utf-8").splitlines()
     assert lines.count("B sub_001") == 1
@@ -3896,7 +3906,7 @@ def test_real_snakemake_targeted_command_receives_one_selected_target(
         step_name="b_transform",
         address="sub_001",
     )
-    assert execute_run_plan(run_plan, cores=1).all_selected_published
+    assert execute_run_plan(run_plan, cores=1).all_selected_resolved
 
     # The real Snakemake command names exactly one selected target path.
     (command,) = commands
@@ -3965,7 +3975,7 @@ def test_targeted_rerun_replaces_only_selected_coordinates_and_keeps_history(
         step_name="b_transform",
         address="sub_001",
     )
-    assert execute_run_plan(targeted_plan, cores=1).all_selected_published
+    assert execute_run_plan(targeted_plan, cores=1).all_selected_resolved
 
     selected_after = _published_output_row(
         runtime_dir,
@@ -4046,7 +4056,7 @@ def test_targeted_rerun_with_identical_bytes_revalidates_published_file(
         step_name="b_transform",
         address="sub_001",
     )
-    assert execute_run_plan(targeted_plan, cores=1).all_selected_published
+    assert execute_run_plan(targeted_plan, cores=1).all_selected_resolved
 
     row_after = _published_output_row(
         runtime_dir,
@@ -4103,7 +4113,7 @@ def test_path_reads_deduplicate_multiple_memberships_for_one_current_artifact(
         step_name="b_transform",
         address="sub_001",
     )
-    assert execute_run_plan(first_plan, cores=1).all_selected_published
+    assert execute_run_plan(first_plan, cores=1).all_selected_resolved
     derivative_plan = build_run_plan(
         project_dir=project_dir,
         context="cache",
@@ -4111,7 +4121,7 @@ def test_path_reads_deduplicate_multiple_memberships_for_one_current_artifact(
         step_name="c_transform",
         address="sub_001",
     )
-    assert execute_run_plan(derivative_plan, cores=1).all_selected_published
+    assert execute_run_plan(derivative_plan, cores=1).all_selected_resolved
 
     rerun_plan = build_run_plan(
         project_dir=project_dir,
@@ -4120,7 +4130,7 @@ def test_path_reads_deduplicate_multiple_memberships_for_one_current_artifact(
         step_name="b_transform",
         address="sub_001",
     )
-    assert execute_run_plan(rerun_plan, cores=1).all_selected_published
+    assert execute_run_plan(rerun_plan, cores=1).all_selected_resolved
     with sqlite3.connect(runtime_dir / "database/registry.db") as conn:
         current_id, shared_path = conn.execute(
             """
@@ -4196,7 +4206,7 @@ def test_membership_write_failure_restores_registry_and_removes_new_output(
         step_name="b_transform",
         address="sub_001",
     )
-    assert execute_run_plan(first_plan, cores=1).all_selected_published
+    assert execute_run_plan(first_plan, cores=1).all_selected_resolved
     registry_path = runtime_dir / "database/registry.db"
     with sqlite3.connect(registry_path) as conn:
         counts_before = _registry_row_counts(runtime_dir)
@@ -4270,6 +4280,119 @@ def test_membership_write_failure_restores_registry_and_removes_new_output(
     } == output_files_before
 
 
+def test_selected_reused_bundle_seeds_validation_resolution_and_membership_closure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project_dir, _runtime_dir, _log_path = _write_cache_project(
+        tmp_path,
+        monkeypatch,
+        entities=("sub_001",),
+    )
+    upstream_plan = build_run_plan(
+        project_dir=project_dir,
+        context="cache",
+        workflow_name="main",
+        step_name="b_transform",
+        address="sub_001",
+    )
+    assert execute_run_plan(upstream_plan, cores=1).all_selected_resolved
+    downstream_plan = build_run_plan(
+        project_dir=project_dir,
+        context="cache",
+        workflow_name="main",
+        step_name="c_transform",
+        address="sub_001",
+    )
+    b_ref = next(
+        ref
+        for ref in downstream_plan.reused_validation_outputs
+        if ref.step_name == "b_transform"
+    )
+    selected_ref = SelectedReusedBundleRef(
+        step_name=b_ref.step_name,
+        output_name=b_ref.output_name,
+        address=b_ref.address,
+        reuse_request=b_ref.reuse_request,
+        planned_sibling_artifact_ids=tuple(
+            zip(
+                sorted(dict(b_ref.reuse_request.sibling_outputs)),
+                b_ref.source_bundle_artifact_ids,
+                strict=True,
+            )
+        ),
+    )
+    assert {
+        field.name for field in fields(SelectedReusedBundleRef)
+    } == {
+        "step_name",
+        "output_name",
+        "address",
+        "reuse_request",
+        "planned_sibling_artifact_ids",
+    }
+
+    refs_by_coordinate = {
+        (ref.step_name, ref.output_name, ref.address): ref
+        for ref in downstream_plan.reused_validation_outputs
+    }
+    closure = execution_module._reused_validation_outputs(
+        jobs=(),
+        reused_outputs_by_artifact=refs_by_coordinate,
+        selected_reused_output_refs=(selected_ref,),
+    )
+    assert {ref.step_name for ref in closure} == {"a_source", "b_transform"}
+
+    selected_plan = replace(
+        downstream_plan,
+        selected_fresh_output_refs=(),
+        selected_reused_output_refs=(selected_ref,),
+        reused_validation_outputs=closure,
+    )
+    selected_payload = execution_module._run_plan_payload(selected_plan)
+    assert selected_payload["selected_fresh_outputs"] == []
+    assert selected_payload["selected_reused_outputs"] == [
+        {
+            "step_name": "b_transform",
+            "output_name": "b_out",
+            "address": "sub_001",
+            "request_bundle_digest": (
+                b_ref.reuse_request.resolved_projection.request_bundle_digest
+            ),
+            "planned_sibling_artifacts": [
+                {
+                    "output_name": "b_out",
+                    "artifact_id": b_ref.source_artifact_id,
+                }
+            ],
+        }
+    ]
+    actual = execution_module._reresolve_reused_bundles(selected_plan)
+    resolutions = execution_module._selected_resolution_intents(
+        selected_plan,
+        published_rows=(),
+        actual_reused_artifacts=actual,
+    )
+    selected_actual = actual[b_ref.source_artifact_id]
+    assert len(resolutions) == 1
+    assert resolutions[0].outcome == "reused"
+    assert resolutions[0].existing_artifact_id == selected_actual.artifact_id
+
+    memberships = execution_module._reused_membership_intents(
+        selected_plan,
+        published_rows=(),
+        actual_reused_artifacts=actual,
+    )
+    assert {intent.row.step_name for intent in memberships} == {
+        "a_source",
+        "b_transform",
+    }
+    selected_membership = next(
+        intent for intent in memberships if intent.row.step_name == "b_transform"
+    )
+    assert selected_membership.existing_artifact_id == selected_actual.artifact_id
+
+
 def test_bundle_reresolution_records_the_equivalent_artifact_actually_consumed(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -4286,7 +4409,7 @@ def test_bundle_reresolution_records_the_equivalent_artifact_actually_consumed(
         step_name="b_transform",
         address="sub_001",
     )
-    assert execute_run_plan(first_plan, cores=1).all_selected_published
+    assert execute_run_plan(first_plan, cores=1).all_selected_resolved
 
     first_c_plan = build_run_plan(
         project_dir=project_dir,
@@ -4307,7 +4430,7 @@ def test_bundle_reresolution_records_the_equivalent_artifact_actually_consumed(
         step_name="b_transform",
         address="sub_001",
     )
-    assert execute_run_plan(second_plan, cores=1).all_selected_published
+    assert execute_run_plan(second_plan, cores=1).all_selected_resolved
 
     with sqlite3.connect(runtime_dir / "database/registry.db") as conn:
         artifact_ids = [
@@ -4329,7 +4452,7 @@ def test_bundle_reresolution_records_the_equivalent_artifact_actually_consumed(
     newer_id = artifact_ids[1]
 
     assert first_c_plan.reused_outputs[0].source_artifact_id == older_id
-    assert execute_run_plan(first_c_plan, cores=1).all_selected_published
+    assert execute_run_plan(first_c_plan, cores=1).all_selected_resolved
     first_c_id = _latest_workflow_artifact_id(
         runtime_dir,
         step_name="c_transform",
@@ -4369,7 +4492,7 @@ def test_bundle_reresolution_records_the_equivalent_artifact_actually_consumed(
             ),
         )
 
-    assert execute_run_plan(second_c_plan, cores=1).all_selected_published
+    assert execute_run_plan(second_c_plan, cores=1).all_selected_resolved
     second_c_id = _latest_workflow_artifact_id(
         runtime_dir,
         step_name="c_transform",
@@ -4415,7 +4538,7 @@ def test_multi_output_substitution_records_all_siblings_and_transitive_membershi
         step_name="multi_transform",
         address="sub_001",
     )
-    assert execute_run_plan(main_plan, cores=1).all_selected_published
+    assert execute_run_plan(main_plan, cores=1).all_selected_resolved
     _write_sibling_workflow(
         project_dir,
         workflow_name="multi_derivative",
@@ -4451,7 +4574,7 @@ def test_multi_output_substitution_records_all_siblings_and_transitive_membershi
         step_name="b_transform",
         address="sub_001",
     )
-    assert execute_run_plan(rerun_b, cores=1).all_selected_published
+    assert execute_run_plan(rerun_b, cores=1).all_selected_resolved
     rerun_multi = build_run_plan(
         project_dir=project_dir,
         context="cache",
@@ -4459,7 +4582,7 @@ def test_multi_output_substitution_records_all_siblings_and_transitive_membershi
         step_name="multi_transform",
         address="sub_001",
     )
-    assert execute_run_plan(rerun_multi, cores=1).all_selected_published
+    assert execute_run_plan(rerun_multi, cores=1).all_selected_resolved
 
     registry_path = runtime_dir / "database/registry.db"
     with sqlite3.connect(registry_path) as conn:
@@ -4505,7 +4628,7 @@ def test_multi_output_substitution_records_all_siblings_and_transitive_membershi
                 ),
             )
 
-    assert execute_run_plan(derivative_plan, cores=1).all_selected_published
+    assert execute_run_plan(derivative_plan, cores=1).all_selected_resolved
     use_artifact_id = _latest_workflow_artifact_id(
         runtime_dir,
         step_name="use_multi",
@@ -4569,7 +4692,7 @@ def test_bundle_resolver_reports_recorded_divergence_before_missing_files(
             step_name="b_transform",
             address="sub_001",
         )
-        assert execute_run_plan(plan, cores=1).all_selected_published
+        assert execute_run_plan(plan, cores=1).all_selected_resolved
 
     with sqlite3.connect(runtime_dir / "database/registry.db") as conn:
         rows = conn.execute(
@@ -4619,7 +4742,7 @@ def test_execution_rechecks_divergence_in_transitive_reused_closure(
         step_name="b_transform",
         address="sub_001",
     )
-    assert execute_run_plan(b_plan, cores=1).all_selected_published
+    assert execute_run_plan(b_plan, cores=1).all_selected_resolved
     c_plan = build_run_plan(
         project_dir=project_dir,
         context="cache",
@@ -4642,7 +4765,7 @@ def test_execution_rechecks_divergence_in_transitive_reused_closure(
         step_name="a_source",
         address="sub_001",
     )
-    assert execute_run_plan(second_a_plan, cores=1).all_selected_published
+    assert execute_run_plan(second_a_plan, cores=1).all_selected_resolved
     with sqlite3.connect(runtime_dir / "database/registry.db") as conn:
         newest_a_id = conn.execute(
             """
@@ -4690,7 +4813,7 @@ def test_targeted_rerun_rejects_divergent_deterministic_output_and_rolls_back(
         step_name="b_transform",
         address="sub_001",
     )
-    assert execute_run_plan(first_plan, cores=1).all_selected_published
+    assert execute_run_plan(first_plan, cores=1).all_selected_resolved
 
     row_before = _published_output_row(
         runtime_dir,
@@ -4815,7 +4938,7 @@ def test_targeted_multi_output_rerun_rejects_one_divergent_sibling_atomically(
         step_name="multi_transform",
         address="sub_001",
     )
-    assert execute_run_plan(first_plan, cores=1).all_selected_published
+    assert execute_run_plan(first_plan, cores=1).all_selected_resolved
 
     rows_before = {
         output_name: _published_output_row(
@@ -4913,7 +5036,7 @@ def test_incomplete_historical_bundle_does_not_block_fresh_registration(
         step_name="multi_transform",
         address="sub_001",
     )
-    assert execute_run_plan(first_plan, cores=1).all_selected_published
+    assert execute_run_plan(first_plan, cores=1).all_selected_resolved
 
     with sqlite3.connect(runtime_dir / "database/registry.db") as conn:
         conn.execute(
@@ -4945,7 +5068,7 @@ def test_incomplete_historical_bundle_does_not_block_fresh_registration(
         step_name="multi_transform",
         address="sub_001",
     )
-    assert execute_run_plan(rerun_plan, cores=1).all_selected_published
+    assert execute_run_plan(rerun_plan, cores=1).all_selected_resolved
     with sqlite3.connect(runtime_dir / "database/registry.db") as conn:
         rows = conn.execute(
             """
@@ -4977,7 +5100,7 @@ def test_recorded_divergence_precedes_missing_file_and_reports_first_run(
         step_name="b_transform",
         address="sub_001",
     )
-    assert execute_run_plan(first_plan, cores=1).all_selected_published
+    assert execute_run_plan(first_plan, cores=1).all_selected_resolved
     second_plan = build_run_plan(
         project_dir=project_dir,
         context="cache",
@@ -4985,7 +5108,7 @@ def test_recorded_divergence_precedes_missing_file_and_reports_first_run(
         step_name="b_transform",
         address="sub_001",
     )
-    assert execute_run_plan(second_plan, cores=1).all_selected_published
+    assert execute_run_plan(second_plan, cores=1).all_selected_resolved
     shared_path = runtime_dir / _published_output_row(
         runtime_dir,
         step_name="b_transform",
@@ -5049,7 +5172,7 @@ def test_failed_targeted_rerun_preserves_prior_published_coordinate(
         step_name="b_transform",
         address="sub_001",
     )
-    assert execute_run_plan(plan_one, cores=1).all_selected_published
+    assert execute_run_plan(plan_one, cores=1).all_selected_resolved
     row_before = _published_output_row(
         runtime_dir,
         step_name="b_transform",
@@ -5225,7 +5348,7 @@ def test_targeted_run_becomes_current_and_keeps_full_manifest_binding(
         step_name="b_transform",
         address="sub_001",
     )
-    assert execute_run_plan(targeted_plan, cores=1).all_selected_published
+    assert execute_run_plan(targeted_plan, cores=1).all_selected_resolved
 
     with sqlite3.connect(runtime_dir / "database/registry.db") as conn:
         runs = conn.execute(
