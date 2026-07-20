@@ -1,6 +1,7 @@
 import json
 import os
 import sqlite3
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -8,6 +9,7 @@ import pytest
 import yaml
 
 import nipact.registry as registry_module
+import nipact.execution as execution_module
 from nipact.cli import main
 from nipact.artifacts import output_filename, parse_output_filename
 from nipact.errors import ValidationError
@@ -1135,6 +1137,84 @@ def test_execute_run_plan_removes_published_files_when_registration_fails(
     with sqlite3.connect(runtime_dir / "database/registry.db") as conn:
         assert conn.execute("SELECT COUNT(*) FROM published_outputs").fetchone()[0] == 0
         assert conn.execute("SELECT COUNT(*) FROM workflow_runs").fetchone()[0] == 0
+
+
+def test_selected_resolution_mismatch_rolls_back_run_recording(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project_dir, runtime_dir = _init_demo(tmp_path, capsys)
+    run_plan = build_run_plan(
+        project_dir=project_dir,
+        context="colors",
+        workflow_name="base",
+        step_name="color_sector_analysis",
+    )
+
+    def write_staged_outputs(*_args: object, **_kwargs: object) -> int:
+        _write_all_staged_outputs(run_plan)
+        return 0
+
+    monkeypatch.setattr("nipact.execution._run_snakemake", write_staged_outputs)
+    execute_run_plan(run_plan, cores=1)
+
+    registry_path = runtime_dir / "database/registry.db"
+    with sqlite3.connect(registry_path) as conn:
+        prior_run_id = conn.execute(
+            "SELECT run_id FROM workflow_runs WHERE is_current = 1"
+        ).fetchone()[0]
+        prior_memberships = conn.execute(
+            """
+            SELECT context, workflow_name, step_name, output_name, address, artifact_id
+            FROM published_outputs
+            ORDER BY context, workflow_name, step_name, output_name, address
+            """
+        ).fetchall()
+        prior_artifact_count = conn.execute(
+            "SELECT COUNT(*) FROM artifacts WHERE origin = 'workflow_output'"
+        ).fetchone()[0]
+
+    run_plan = build_run_plan(
+        project_dir=project_dir,
+        context="colors",
+        workflow_name="base",
+        step_name="color_sector_analysis",
+    )
+
+    real_selected_resolution_intents = execution_module._selected_resolution_intents
+
+    def mismatched_selected_resolution_intents(*args: object, **kwargs: object):
+        intents = real_selected_resolution_intents(*args, **kwargs)
+        return (replace(intents[0], step_name="color_features"), *intents[1:])
+
+    monkeypatch.setattr(
+        "nipact.execution._selected_resolution_intents",
+        mismatched_selected_resolution_intents,
+    )
+
+    with pytest.raises(
+        ValidationError,
+        match="selected-output resolution does not match selected output",
+    ):
+        execute_run_plan(run_plan, cores=1)
+
+    with sqlite3.connect(registry_path) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM workflow_runs").fetchone()[0] == 1
+        assert conn.execute(
+            "SELECT is_current FROM workflow_runs WHERE run_id = ?",
+            (prior_run_id,),
+        ).fetchone() == (1,)
+        assert conn.execute(
+            """
+            SELECT context, workflow_name, step_name, output_name, address, artifact_id
+            FROM published_outputs
+            ORDER BY context, workflow_name, step_name, output_name, address
+            """
+        ).fetchall() == prior_memberships
+        assert conn.execute(
+            "SELECT COUNT(*) FROM artifacts WHERE origin = 'workflow_output'"
+        ).fetchone()[0] == prior_artifact_count
 
 
 def test_tiny_non_colors_run_registers_used_sources_and_trace(

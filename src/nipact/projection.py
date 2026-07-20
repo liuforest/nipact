@@ -6,6 +6,7 @@ import json
 import math
 from collections.abc import Mapping
 from dataclasses import dataclass
+from pathlib import PurePosixPath
 from typing import Any, TypeAlias
 
 from .errors import ValidationError
@@ -314,6 +315,9 @@ def _projection_payload(
         _binding_payload(binding, path=f"{path}.role_labelled_bindings[{index}]")
         for index, binding in enumerate(projection.role_labelled_bindings)
     ]
+    binding_roles = [binding["role"] for binding in bindings]
+    if len(binding_roles) != len(set(binding_roles)):
+        raise ValidationError(f"{path}.role_labelled_bindings contains duplicate roles")
     bindings.sort(key=_binding_sort_key)
 
     return {
@@ -393,6 +397,10 @@ def _registered_source_payload(
     )
     if file_size < 0:
         raise ValidationError(f"{path}.registered_file_size must be non-negative")
+    source_path = _require_registered_source_path(
+        binding.source_coordinate.path,
+        path=f"{path}.source_coordinate.path",
+    )
     return {
         "role": _require_string(binding.role, path=f"{path}.role"),
         "source_coordinate": {
@@ -400,10 +408,7 @@ def _registered_source_payload(
                 binding.source_coordinate.namespace,
                 path=f"{path}.source_coordinate.namespace",
             ),
-            "path": _require_string(
-                binding.source_coordinate.path,
-                path=f"{path}.source_coordinate.path",
-            ),
+            "path": source_path,
         },
         "registered_content_digest": _require_string(
             binding.registered_content_digest,
@@ -450,6 +455,17 @@ def _collection_payload(binding: CollectionBinding, *, path: str) -> dict[str, A
         _upstream_output_payload(member, path=f"{path}.members[{index}]")
         for index, member in enumerate(binding.members)
     ]
+    member_identities = [
+        _dump_json(
+            {
+                "upstream_request_projection": member["upstream_request_projection"],
+                "output_name": member["output_name"],
+            }
+        )
+        for member in members
+    ]
+    if len(member_identities) != len(set(member_identities)):
+        raise ValidationError(f"{path}.members contains duplicate requested outputs")
     members.sort(key=_requested_output_sort_key)
     manifest_digest = binding.manifest_digest
     if manifest_digest is not None:
@@ -502,6 +518,9 @@ def _output_contract_payload(
                 ),
             }
         )
+    output_names = [sibling["output_name"] for sibling in siblings]
+    if len(output_names) != len(set(output_names)):
+        raise ValidationError(f"{path}.sibling_outputs contains duplicate output names")
     siblings.sort(key=lambda sibling: (sibling["output_name"], _dump_json(sibling)))
     return {
         "output_contract_version": output_contract_version,
@@ -568,6 +587,22 @@ def _require_int(value: Any, *, path: str) -> int:
     if type(value) is not int:
         raise ValidationError(f"{path} must be an integer")
     return value
+
+
+def _require_registered_source_path(value: Any, *, path: str) -> str:
+    source_path = _require_string(value, path=path)
+    if "\\" in source_path:
+        raise ValidationError(f"{path} must be a normalized POSIX path under data/")
+    parsed = PurePosixPath(source_path)
+    if (
+        parsed.is_absolute()
+        or len(parsed.parts) < 2
+        or parsed.parts[0] != "data"
+        or any(part in {".", ".."} for part in parsed.parts)
+        or parsed.as_posix() != source_path
+    ):
+        raise ValidationError(f"{path} must be a normalized POSIX path under data/")
+    return source_path
 
 
 def _require_tuple(value: Any, *, path: str) -> tuple[Any, ...]:

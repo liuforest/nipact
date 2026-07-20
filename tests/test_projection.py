@@ -1,4 +1,4 @@
-from dataclasses import replace
+from dataclasses import fields, replace
 from datetime import date
 
 import pytest
@@ -247,6 +247,275 @@ def test_binding_role_is_identity_bearing() -> None:
     second = _projection(role_labelled_bindings=(_source_binding(role="mask"),))
 
     assert canonical_projection_json(first) != canonical_projection_json(second)
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/data/source.nii.gz",
+        "source.nii.gz",
+        "sources/source.nii.gz",
+        "data/../source.nii.gz",
+        "data/./source.nii.gz",
+        "data//source.nii.gz",
+        "data\\source.nii.gz",
+        "data/",
+    ],
+)
+def test_registered_source_path_must_be_normalized_posix_under_data(
+    path: str,
+) -> None:
+    with pytest.raises(ValidationError, match="normalized POSIX path under data"):
+        canonical_projection_json(
+            _projection(role_labelled_bindings=(_source_binding(path=path),))
+        )
+
+
+def test_canonical_projection_rejects_duplicate_top_level_binding_roles() -> None:
+    with pytest.raises(ValidationError, match="duplicate roles"):
+        canonical_projection_json(
+            _projection(
+                role_labelled_bindings=(
+                    _source_binding(role="image", path="data/first.nii.gz"),
+                    _source_binding(role="image", path="data/second.nii.gz"),
+                )
+            )
+        )
+
+
+def test_canonical_projection_rejects_duplicate_collection_members() -> None:
+    member = _upstream_binding(role="images", address="subject-a")
+    with pytest.raises(ValidationError, match="duplicate requested outputs"):
+        canonical_projection_json(
+            _projection(
+                role_labelled_bindings=(
+                    CollectionBinding(
+                        role="images",
+                        collection_semantics="coordinate_set_v1",
+                        manifest_digest=None,
+                        members=(member, member),
+                    ),
+                )
+            )
+        )
+
+
+def test_canonical_projection_rejects_duplicate_sibling_output_names() -> None:
+    with pytest.raises(ValidationError, match="duplicate output names"):
+        canonical_projection_json(
+            _projection(
+                sibling_outputs=(
+                    SiblingOutput("image", ".nii.gz"),
+                    SiblingOutput("image", ".json"),
+                )
+            )
+        )
+
+
+def _identity_matrix_projection(change: str) -> RequestBundleProjectionV1:
+    first_binding = _source_binding(role="image", path="data/image.nii.gz")
+    member = _upstream_binding(role="mask", address="subject-a")
+    second_binding = CollectionBinding(
+        role="mask",
+        collection_semantics="coordinate_set_v1",
+        manifest_digest="c" * 64,
+        members=(member,),
+    )
+    base = _projection(
+        canonical_parameters={"alpha": 1, "beta": 2},
+        role_labelled_bindings=(first_binding, second_binding),
+        sibling_outputs=(
+            SiblingOutput("image", ".nii.gz"),
+            SiblingOutput("metadata", ".json"),
+        ),
+    )
+    if change == "namespace":
+        return replace(base, namespace="other")
+    if change == "step_contract_id":
+        return replace(
+            base,
+            step_contract=replace(base.step_contract, step_contract_id="other"),
+        )
+    if change == "step_contract_version":
+        return replace(
+            base,
+            step_contract=replace(base.step_contract, step_contract_version="2"),
+        )
+    if change == "callable_ref":
+        return replace(
+            base,
+            step_contract=replace(base.step_contract, callable_ref="other:callable"),
+        )
+    if change == "runner_contract_version":
+        return replace(
+            base,
+            step_contract=replace(base.step_contract, runner_contract_version="2"),
+        )
+    if change == "address":
+        return replace(base, address="other")
+    if change == "parameters":
+        return replace(base, canonical_parameters={"alpha": 2, "beta": 2})
+    if change == "source_digest":
+        changed_binding = replace(first_binding, registered_content_digest="b" * 64)
+        return replace(
+            base,
+            role_labelled_bindings=(changed_binding, second_binding),
+        )
+    if change == "source_namespace":
+        changed_binding = replace(
+            first_binding,
+            source_coordinate=replace(first_binding.source_coordinate, namespace="other"),
+        )
+        return replace(base, role_labelled_bindings=(changed_binding, second_binding))
+    if change == "source_path":
+        changed_binding = replace(
+            first_binding,
+            source_coordinate=replace(
+                first_binding.source_coordinate,
+                path="data/other.nii.gz",
+            ),
+        )
+        return replace(base, role_labelled_bindings=(changed_binding, second_binding))
+    if change == "source_size":
+        changed_binding = replace(first_binding, registered_file_size=124)
+        return replace(base, role_labelled_bindings=(changed_binding, second_binding))
+    if change == "source_extension":
+        changed_binding = replace(first_binding, declared_extension=".mgz")
+        return replace(base, role_labelled_bindings=(changed_binding, second_binding))
+    if change == "manifest_digest":
+        changed_binding = replace(second_binding, manifest_digest="d" * 64)
+        return replace(base, role_labelled_bindings=(first_binding, changed_binding))
+    if change == "collection_semantics":
+        changed_binding = replace(second_binding, collection_semantics="ordered_v1")
+        return replace(base, role_labelled_bindings=(first_binding, changed_binding))
+    if change == "nested_upstream_projection":
+        changed_member = replace(
+            member,
+            upstream_request_projection=replace(
+                member.upstream_request_projection,
+                address="subject-b",
+            ),
+        )
+        changed_binding = replace(second_binding, members=(changed_member,))
+        return replace(base, role_labelled_bindings=(first_binding, changed_binding))
+    if change == "settings":
+        return replace(base, result_affecting_settings={"locale": "C"})
+    if change == "determinism":
+        return replace(base, determinism_contract="noncacheable")
+    if change == "output_extension":
+        return replace(
+            base,
+            output_contract=replace(
+                base.output_contract,
+                sibling_outputs=(
+                    SiblingOutput("image", ".mgz"),
+                    SiblingOutput("metadata", ".json"),
+                ),
+            ),
+        )
+    if change == "output_name":
+        return replace(
+            base,
+            output_contract=replace(
+                base.output_contract,
+                sibling_outputs=(
+                    SiblingOutput("other", ".nii.gz"),
+                    SiblingOutput("metadata", ".json"),
+                ),
+            ),
+        )
+    if change == "binding_order":
+        return replace(base, role_labelled_bindings=(second_binding, first_binding))
+    if change == "sibling_order":
+        return replace(
+            base,
+            output_contract=replace(
+                base.output_contract,
+                sibling_outputs=tuple(reversed(base.output_contract.sibling_outputs)),
+            ),
+        )
+    if change == "object_key_order":
+        return replace(base, canonical_parameters={"beta": 2, "alpha": 1})
+    raise AssertionError(f"unknown identity-matrix change: {change}")
+
+
+@pytest.mark.parametrize(
+    ("change", "same_identity"),
+    [
+        ("namespace", False),
+        ("step_contract_id", False),
+        ("step_contract_version", False),
+        ("callable_ref", False),
+        ("runner_contract_version", False),
+        ("address", False),
+        ("parameters", False),
+        ("source_namespace", False),
+        ("source_path", False),
+        ("source_digest", False),
+        ("source_size", False),
+        ("source_extension", False),
+        ("manifest_digest", False),
+        ("collection_semantics", False),
+        ("nested_upstream_projection", False),
+        ("settings", False),
+        ("determinism", False),
+        ("output_name", False),
+        ("output_extension", False),
+        ("binding_order", True),
+        ("sibling_order", True),
+        ("object_key_order", True),
+    ],
+)
+def test_projection_identity_inclusion_and_exclusion_matrix(
+    change: str,
+    same_identity: bool,
+) -> None:
+    baseline = _identity_matrix_projection("object_key_order")
+    baseline = replace(baseline, canonical_parameters={"alpha": 1, "beta": 2})
+    variant = _identity_matrix_projection(change)
+
+    assert (canonical_projection_json(baseline) == canonical_projection_json(variant)) is (
+        same_identity
+    )
+
+
+def test_projection_contract_excludes_operational_and_retrospective_facts() -> None:
+    field_names = {field.name for field in fields(RequestBundleProjectionV1)}
+
+    assert field_names.isdisjoint(
+        {
+            "workflow_name",
+            "run_id",
+            "workspace",
+            "cores",
+            "environment_observation",
+            "published_path",
+            "artifact_id",
+            "content_digest",
+        }
+    )
+
+
+@pytest.mark.parametrize(
+    "contract",
+    ["identity", "output"],
+)
+def test_projection_rejects_unknown_contract_versions(
+    contract: str,
+) -> None:
+    projection = _projection()
+    if contract == "identity":
+        projection = replace(projection, identity_contract_version=2)
+    else:
+        projection = replace(
+            projection,
+            output_contract=replace(
+                projection.output_contract,
+                output_contract_version=2,
+            ),
+        )
+    with pytest.raises(ValidationError, match="contract_version must be 1"):
+        canonical_projection_json(projection)
 
 
 @pytest.mark.parametrize(
