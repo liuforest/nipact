@@ -32,6 +32,7 @@ from nipact.registry import (
     read_registry_summary,
     resolve_registered_artifact_path,
 )
+from nipact.project_setup import validate_project
 
 
 def _run_main_from(cwd: Path, argv: list[str]) -> int:
@@ -442,6 +443,65 @@ def test_registry_reads_workflow_output_and_neighbors(
     assert {binding.context for binding in manifest_bindings} == {"colors"}
 
 
+def test_project_validation_accepts_cross_workflow_membership_path(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project_dir, runtime_dir, _run_plan = _successful_sector_run(
+        tmp_path,
+        capsys,
+        monkeypatch,
+    )
+    registry_path = runtime_dir / REGISTRY_DB_PATH
+    with sqlite3.connect(registry_path) as conn:
+        shared_path = conn.execute(
+            """
+            SELECT path
+            FROM published_outputs
+            WHERE context = 'colors'
+              AND workflow_name = 'base'
+              AND step_name = 'color_sector_analysis'
+              AND output_name = 'sector_counts'
+              AND address = 'init'
+            """
+        ).fetchone()[0]
+        conn.execute(
+            """
+            INSERT INTO published_outputs (
+                context, workflow_name, step_name, output_name, address, path,
+                output_digest, output_hash, artifact_id
+            )
+            SELECT context, 'red-qc-target', step_name, output_name, address, path,
+                   output_digest, output_hash, artifact_id
+            FROM published_outputs
+            WHERE context = 'colors'
+              AND workflow_name = 'base'
+              AND step_name = 'color_sector_analysis'
+              AND output_name = 'sector_counts'
+              AND address = 'init'
+            """
+        )
+
+    target_hashes = 0
+    real_sha256_file_digest = registry.sha256_file_digest
+
+    def count_shared_artifact_hashes(path: Path) -> str:
+        nonlocal target_hashes
+        if path == runtime_dir / shared_path:
+            target_hashes += 1
+        return real_sha256_file_digest(path)
+
+    monkeypatch.setattr(
+        registry,
+        "sha256_file_digest",
+        count_shared_artifact_hashes,
+    )
+    result = validate_project(project_dir=project_dir, context="colors")
+    assert result.published_outputs == len(_run_plan.published_outputs) + 1
+    assert target_hashes == 1
+
+
 def test_membership_intent_can_reference_one_existing_artifact_more_than_once(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
@@ -535,6 +595,58 @@ def test_membership_intent_can_reference_one_existing_artifact_more_than_once(
                 VALUES ('colors', 'null', 'step', 'output', 'init', ?, ?, ?, NULL)
                 """,
                 (path, digest, output_hash),
+            )
+
+
+def test_existing_membership_rejects_artifact_hash_inconsistent_with_digest(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _project_dir, runtime_dir, _run_plan = _successful_sector_run(
+        tmp_path,
+        capsys,
+        monkeypatch,
+    )
+    registry_path = runtime_dir / REGISTRY_DB_PATH
+    with sqlite3.connect(registry_path) as conn:
+        artifact_id, path, digest = conn.execute(
+            """
+            SELECT artifact_id, path, content_digest
+            FROM artifacts
+            WHERE step_name = 'color_sector_analysis'
+              AND output_name = 'sector_counts'
+              AND address = 'init'
+            """
+        ).fetchone()
+        bad_hash = "f" * 16
+        assert bad_hash != digest[:16]
+        conn.execute(
+            "UPDATE artifacts SET output_hash = ? WHERE artifact_id = ?",
+            (bad_hash, artifact_id),
+        )
+        with pytest.raises(
+            ValidationError,
+            match="existing membership artifact hash does not match digest",
+        ):
+            registry._insert_memberships(
+                conn,
+                intents=(
+                    MembershipIntent(
+                        row=PublishedOutputRow(
+                            context="colors",
+                            workflow_name="derived",
+                            step_name="color_sector_analysis",
+                            output_name="sector_counts",
+                            address="init",
+                            path=path,
+                            output_digest=digest,
+                            output_hash=bad_hash,
+                        ),
+                        existing_artifact_id=artifact_id,
+                    ),
+                ),
+                artifact_ids={},
             )
 
 
