@@ -331,28 +331,30 @@ def test_workflow_run_command_executes_step(
     # These values describe planner decisions before Snakemake runs. In the
     # fresh demo path nothing is hydrated, but the scheduled job count still
     # matters because it tells the user how much work the concrete DAG contains.
-    assert output[10].startswith("planned_jobs=")
-    planned_jobs = int(output[10].split("=", maxsplit=1)[1])
+    assert output[10] == "planned_selected_fresh_outputs=1"
+    assert output[11] == "planned_selected_reused_outputs=0"
+    assert output[12].startswith("planned_jobs=")
+    planned_jobs = int(output[12].split("=", maxsplit=1)[1])
     assert planned_jobs > 0
     # A full-population run with no reuse executes every compiled job, so the
     # closure-scoped forecast equals the population-wide count.
-    assert output[11] == f"planned_reachable_fresh_jobs={planned_jobs}"
-    assert output[12] == "planned_reused_registered_artifacts=0"
-    assert output[13] == "planned_reused_inputs=0"
-    assert output[14] == "planned_hydrated_inputs=0"
-    assert output[15] == "planned_hydration_bytes=0"
-    assert output[16] == "existing_staged_outputs=0"
-    assert output[17].endswith("/runs/colors/base/color_sector_analysis")
-    assert output[17].startswith("run_workspace=")
-    assert output[18].endswith(
+    assert output[13] == f"planned_reachable_fresh_jobs={planned_jobs}"
+    assert output[14] == "planned_reused_registered_artifacts=0"
+    assert output[15] == "planned_reused_inputs=0"
+    assert output[16] == "planned_hydrated_inputs=0"
+    assert output[17] == "planned_hydration_bytes=0"
+    assert output[18] == "existing_staged_outputs=0"
+    assert output[19].endswith("/runs/colors/base/color_sector_analysis")
+    assert output[19].startswith("run_workspace=")
+    assert output[20].endswith(
         "/runs/colors/base/color_sector_analysis/logs/snakemake.log"
     )
-    assert output[18].startswith("snakemake_log=")
-    assert output[19] == (
-        "note=Registered upstream artifacts can be hydrated into the current "
-        "run when their identity and digest checks pass."
+    assert output[20].startswith("snakemake_log=")
+    assert output[21] == (
+        "note=Valid selected outputs are reused; missing work executes through "
+        "Snakemake. Explicit recomputation is not available in this release."
     )
-    assert output[20:] == [
+    assert output[22:] == [
         "",
         "Preparing run workspace...",
         "Starting Snakemake...",
@@ -361,6 +363,8 @@ def test_workflow_run_command_executes_step(
         "Registry updated.",
         "",
         "published_outputs=1",
+        "selected_generated_outputs=1",
+        "selected_reused_outputs=0",
         "registry=updated",
         "elapsed_seconds=2.500",
         "PASS: workflow run",

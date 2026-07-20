@@ -1653,6 +1653,13 @@ def test_projection_finalization_failure_rolls_back_current_run(
         step_name="uppercase_text",
         address="sub_001",
     )
+    rerun_plan = build_run_plan(
+        project_dir=project_dir,
+        context="mini",
+        workflow_name="main",
+        step_name="uppercase_text",
+        address="sub_001",
+    )
     active_plan["value"] = first_plan
     assert execute_run_plan(first_plan, cores=1).all_selected_resolved
 
@@ -1667,13 +1674,6 @@ def test_projection_finalization_failure_rolls_back_current_run(
             conn.execute("SELECT COUNT(*) FROM published_outputs").fetchone()[0],
         )
 
-    rerun_plan = build_run_plan(
-        project_dir=project_dir,
-        context="mini",
-        workflow_name="main",
-        step_name="uppercase_text",
-        address="sub_001",
-    )
     active_plan["value"] = rerun_plan
     monkeypatch.setattr(
         "nipact.execution._retained_projection_recipes",
@@ -1781,21 +1781,22 @@ def test_rerun_reuses_partial_survivors_without_recompute(
     monkeypatch.setattr("nipact.execution._run_snakemake", run_all_but_sub_002)
     assert execute_run_plan(plan_one, cores=1).published_count == 2
 
-    # Run 2: sub_001's upstream source_text is now reusable, so it is hydrated
-    # rather than recomputed; only sub_002 and the always-rebuilt selected step
-    # remain as jobs.
+    # Run 2: sub_001's selected output is reused directly. Only sub_002's
+    # still-missing source and selected job remain fresh.
     plan_two = build_run_plan(
         project_dir=project_dir,
         context="mini",
         workflow_name="main",
         step_name="uppercase_text",
     )
-    reused_keys = {
-        (ref.step_name, ref.output_name, ref.address)
-        for ref in plan_two.reused_outputs
-    }
     job_addresses = {(job.step_name, job.address) for job in plan_two.jobs}
-    assert ("source_text", "raw_text", "sub_001") in reused_keys
+    assert plan_two.reused_outputs == ()
+    assert [ref.address for ref in plan_two.selected_reused_output_refs] == [
+        "sub_001"
+    ]
+    assert [ref.address for ref in plan_two.selected_fresh_output_refs] == [
+        "sub_002"
+    ]
     assert ("source_text", "sub_001") not in job_addresses
     assert ("source_text", "sub_002") in job_addresses
 
@@ -1809,7 +1810,9 @@ def test_rerun_reuses_partial_survivors_without_recompute(
         return 0
 
     monkeypatch.setattr("nipact.execution._run_snakemake", run_all)
-    execute_run_plan(plan_two, cores=1)
+    outcome = execute_run_plan(plan_two, cores=1)
+    assert outcome.selected_generated_count == 1
+    assert outcome.selected_reused_count == 1
 
     # The reused survivor was never re-executed.
     assert all(
@@ -1821,6 +1824,73 @@ def test_rerun_reuses_partial_survivors_without_recompute(
             "WHERE step_name = 'uppercase_text' ORDER BY address"
         ).fetchall()
     assert [row[0] for row in addresses] == ["sub_001", "sub_002"]
+
+
+def test_mixed_run_records_reused_selection_when_fresh_address_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project_dir, runtime_dir = _write_tiny_non_colors_project(tmp_path, monkeypatch)
+    first_plan = build_run_plan(
+        project_dir=project_dir,
+        context="mini",
+        workflow_name="main",
+        step_name="uppercase_text",
+    )
+
+    def publish_only_sub_001(*_args: object, **_kwargs: object) -> int:
+        run_plan_path = first_plan.run_workspace / "run_plan.json"
+        for job in first_plan.jobs:
+            if job.address == "sub_001":
+                run_job(run_plan_path=run_plan_path, job_id=job.job_id)
+        return 1
+
+    monkeypatch.setattr("nipact.execution._run_snakemake", publish_only_sub_001)
+    assert execute_run_plan(first_plan, cores=1).selected_generated_count == 1
+
+    mixed_plan = build_run_plan(
+        project_dir=project_dir,
+        context="mini",
+        workflow_name="main",
+        step_name="uppercase_text",
+    )
+    assert [ref.address for ref in mixed_plan.selected_reused_output_refs] == [
+        "sub_001"
+    ]
+    assert [ref.address for ref in mixed_plan.selected_fresh_output_refs] == [
+        "sub_002"
+    ]
+    monkeypatch.setattr(
+        "nipact.execution._run_snakemake",
+        lambda *_args, **_kwargs: 1,
+    )
+    outcome = execute_run_plan(mixed_plan, cores=1)
+    assert outcome.published_count == 0
+    assert outcome.selected_generated_count == 0
+    assert outcome.selected_reused_count == 1
+    assert outcome.all_selected_resolved is False
+
+    with sqlite3.connect(runtime_dir / "database/registry.db") as conn:
+        summary = json.loads(
+            conn.execute(
+                "SELECT resolution_summary_json FROM workflow_runs "
+                "ORDER BY run_id DESC LIMIT 1"
+            ).fetchone()[0]
+        )
+        memberships = conn.execute(
+            "SELECT address FROM published_outputs "
+            "WHERE workflow_name = 'main' AND step_name = 'uppercase_text' "
+            "ORDER BY address"
+        ).fetchall()
+    assert summary["all_selected_resolved"] is False
+    assert [
+        (
+            row["address"],
+            None if row["resolution"] is None else row["resolution"]["outcome"],
+        )
+        for row in summary["selected_outputs"]
+    ] == [("sub_001", "reused"), ("sub_002", None)]
+    assert memberships == [("sub_001",)]
 
 
 def test_launch_failure_raises_without_publishing(

@@ -847,17 +847,15 @@ def test_projection_planning_uses_prospective_upstream_request_identity(
     assert execute_run_plan(first_plan, cores=1).published_count == len(
         first_plan.published_outputs
     )
-
     fresh_b_plan = build_run_plan(
         project_dir=project_dir,
         context="cache",
         workflow_name="main",
         step_name="b_transform",
     )
-    fresh_b = _workflow_input_job(fresh_b_plan, step_name="b_transform")
-    assert isinstance(
-        fresh_b.projection_state,
-        ResolvedRequestBundleProjectionV1,
+    fresh_b_projection = (
+        fresh_b_plan.selected_reused_output_refs[0]
+        .reuse_request.resolved_projection
     )
 
     c_plan = build_run_plan(
@@ -872,7 +870,7 @@ def test_projection_planning_uses_prospective_upstream_request_identity(
         if output.step_name == "b_transform"
     )
     c_job = _workflow_input_job(c_plan, step_name="c_transform")
-    assert reused_b.projection_state == fresh_b.projection_state
+    assert reused_b.projection_state == fresh_b_projection
     assert isinstance(c_job.projection_state, ResolvedRequestBundleProjectionV1)
     c_bindings = json.loads(c_job.projection_state.canonical_json)[
         "role_labelled_bindings"
@@ -881,7 +879,7 @@ def test_projection_planning_uses_prospective_upstream_request_identity(
         {
             "role": "b_input",
             "upstream_request_bundle_digest": (
-                fresh_b.projection_state.request_bundle_digest
+                fresh_b_projection.request_bundle_digest
             ),
             "output_name": "b_out",
         }
@@ -893,11 +891,11 @@ def test_projection_planning_uses_prospective_upstream_request_identity(
         workflow_name="derivative",
         step_name="b_transform",
     )
-    derivative_b = _workflow_input_job(
-        derivative_b_plan,
-        step_name="b_transform",
+    derivative_b_projection = (
+        derivative_b_plan.selected_reused_output_refs[0]
+        .reuse_request.resolved_projection
     )
-    assert derivative_b.projection_state == fresh_b.projection_state
+    assert derivative_b_projection == fresh_b_projection
 
     _write_workflow_variant(
         project_dir,
@@ -915,7 +913,7 @@ def test_projection_planning_uses_prospective_upstream_request_identity(
         parameter_variant_plan,
         step_name="b_transform",
     )
-    assert parameter_variant_b.projection_state != fresh_b.projection_state
+    assert parameter_variant_b.projection_state != fresh_b_projection
 
     before_edit = c_job.projection_state.canonical_json
     (runtime_dir / "data/source/sub_001.txt").write_text(
@@ -953,7 +951,7 @@ def test_projection_planning_uses_prospective_upstream_request_identity(
         changed_b.projection_state,
         ResolvedRequestBundleProjectionV1,
     )
-    assert changed_b.projection_state != fresh_b.projection_state
+    assert changed_b.projection_state != fresh_b_projection
 
 
 def test_projection_planning_covers_collection_cohort_and_sibling_outputs(
@@ -1310,6 +1308,61 @@ def test_cross_target_dry_run_maps_reused_upstream_without_copying(
     assert outputs_after == outputs_before
 
 
+def test_real_cli_reports_selected_reuse_without_snakemake(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    project_dir, _runtime_dir, log_path = _write_cache_project(tmp_path, monkeypatch)
+    initial_plan = build_run_plan(
+        project_dir=project_dir,
+        context="cache",
+        workflow_name="main",
+        step_name="b_transform",
+        address="sub_001",
+    )
+    assert execute_run_plan(initial_plan, cores=1).all_selected_resolved
+    log_before = log_path.read_text(encoding="utf-8")
+    monkeypatch.setattr(
+        "nipact.execution._run_snakemake",
+        lambda *_args, **_kwargs: pytest.fail("reuse-only CLI invoked Snakemake"),
+    )
+    capsys.readouterr()
+
+    assert (
+        main(
+            [
+                "workflow",
+                "run",
+                "--project-dir",
+                str(project_dir),
+                "--context",
+                "cache",
+                "--workflow",
+                "main",
+                "--step",
+                "b_transform",
+                "--address",
+                "sub_001",
+            ]
+        )
+        == 0
+    )
+    lines = capsys.readouterr().out.splitlines()
+    summary = dict(line.split("=", maxsplit=1) for line in lines if "=" in line)
+    assert summary["planned_selected_fresh_outputs"] == "0"
+    assert summary["planned_selected_reused_outputs"] == "1"
+    assert summary["planned_reachable_fresh_jobs"] == "0"
+    assert summary["published_outputs"] == "0"
+    assert summary["selected_generated_outputs"] == "0"
+    assert summary["selected_reused_outputs"] == "1"
+    assert "snakemake_log" not in summary
+    assert "Validating selected reused outputs..." in lines
+    assert "Starting Snakemake..." not in lines
+    assert "Publishing outputs..." not in lines
+    assert log_path.read_text(encoding="utf-8") == log_before
+
+
 def test_dry_run_cli_reports_reuse_without_hydration(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1471,7 +1524,7 @@ def test_real_run_cli_reports_planned_hydration_bytes_fanout_once(
     assert summary["planned_hydrated_inputs"] == "3"
     assert summary["planned_hydration_bytes"] == str(expected_bytes)
     assert summary["existing_staged_outputs"] == "0"
-    assert "can be hydrated" in summary["note"]
+    assert "missing work executes through Snakemake" in summary["note"]
 
 
 def test_dry_run_maps_fresh_candidate_path_when_registered_path_moves(
@@ -1576,8 +1629,8 @@ def test_dry_run_revalidates_reused_source_before_snakemake(
 
     # The mapping exposes a direct registered path to Snakemake, so the reused
     # source is revalidated between planning and Snakemake invocation exactly
-    # like hydration would: a failure aborts before the dry workspace or any
-    # Snakemake process exists.
+    # like hydration would. Common workspace preparation occurs first, but no
+    # executor files or Snakemake process are created on failure.
     if change == "delete":
         source.unlink()
     elif change == "resize":
@@ -1608,7 +1661,10 @@ def test_dry_run_revalidates_reused_source_before_snakemake(
         with pytest.raises(ValidationError, match=message):
             execute_run_plan(c_plan, cores=1)
         assert calls == []
-        assert not c_plan.run_workspace.exists()
+        assert c_plan.run_workspace.is_dir()
+        assert not (c_plan.run_workspace / "Snakefile").exists()
+        assert not (c_plan.run_workspace / "selected_outputs.txt").exists()
+        assert not (c_plan.run_workspace / "logs/snakemake.log").exists()
     assert _registry_row_counts(runtime_dir) == counts_before
 
 
@@ -1794,7 +1850,7 @@ def test_dry_run_accepts_same_size_corruption_real_run_rejects_it(
         execute_run_plan(real_plan, cores=1)
 
 
-def test_dry_run_forecast_not_suppressed_by_completed_real_run(
+def test_dry_run_forecasts_selected_reuse_without_executor_files(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1820,21 +1876,23 @@ def test_dry_run_forecast_not_suppressed_by_completed_real_run(
     )
     assert dry_plan.run_workspace == real_plan.run_workspace / "dry-run"
 
-    staged_seen: list[bool] = []
-
-    def record_staging(*_args: object, **_kwargs: object) -> int:
-        staged_seen.append(
-            dry_plan.selected_fresh_output_refs[0].staging_path.exists()
-        )
-        return 0
-
-    monkeypatch.setattr("nipact.execution._run_snakemake", record_staging)
+    assert dry_plan.selected_fresh_output_refs == ()
+    assert len(dry_plan.selected_reused_output_refs) == 1
+    monkeypatch.setattr(
+        execution_module,
+        "sha256_file_digest",
+        lambda *_args, **_kwargs: pytest.fail("dry selected reuse hashed content"),
+    )
+    monkeypatch.setattr(
+        "nipact.execution._run_snakemake",
+        lambda *_args, **_kwargs: pytest.fail("reuse-only dry run invoked Snakemake"),
+    )
     assert execute_run_plan(dry_plan, cores=1).published_count == 0
 
-    # The executable workspace still holds the completed run's staged output,
-    # but the isolated dry-run workspace does not, so Snakemake plans the
-    # fresh job instead of reporting nothing to do.
-    assert staged_seen == [False]
+    assert (dry_plan.run_workspace / "run_plan.json").is_file()
+    assert not (dry_plan.run_workspace / "Snakefile").exists()
+    assert not (dry_plan.run_workspace / "selected_outputs.txt").exists()
+    assert not (dry_plan.run_workspace / "staging").exists()
     assert staged_real_c.is_file()
 
 
@@ -2996,6 +3054,15 @@ def test_sibling_does_not_reuse_when_source_data_differs(
         workflow_name="main",
         step_name="b_transform",
     )
+    # Compile a second fresh source request before the first publication. Once
+    # the source artifact exists, ordinary selection correctly reuses it; this
+    # precompiled plan preserves the explicit re-import behavior under test.
+    main_a_plan = build_run_plan(
+        project_dir=project_dir,
+        context="cache",
+        workflow_name="main",
+        step_name="a_source",
+    )
     assert execute_run_plan(main_b_plan, cores=1).published_count == len(
         main_b_plan.published_outputs
     )
@@ -3026,12 +3093,6 @@ def test_sibling_does_not_reuse_when_source_data_differs(
     # Re-import: new bytes on the same path, then run the source step so the registry
     # source row is re-hashed to the new digest. main's published b is now stale.
     (runtime_dir / "data/source/sub_001.txt").write_text("omega\n", encoding="utf-8")
-    main_a_plan = build_run_plan(
-        project_dir=project_dir,
-        context="cache",
-        workflow_name="main",
-        step_name="a_source",
-    )
     assert execute_run_plan(main_a_plan, cores=1).published_count == len(
         main_a_plan.published_outputs
     )
@@ -3291,7 +3352,7 @@ def test_sibling_cohort_collection_mixes_sources(
     assert fit_payload["values"] == ["alpha-b", "beta-b"]
 
 
-def test_targeted_selected_job_executes_despite_registered_equivalent(
+def test_targeted_selected_job_reuses_registered_equivalent_without_execution(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -3319,16 +3380,221 @@ def test_targeted_selected_job_executes_despite_registered_equivalent(
         step_name="b_transform",
         address="sub_001",
     )
-    # The selected key skips reuse resolution: sub_001's job stays fresh even
-    # though an equivalent registered output exists, while sub_002's job is
-    # resolved as reusable and dropped from the compiled job set.
-    job_keys = [(job.step_name, job.address) for job in targeted_plan.jobs]
-    assert ("b_transform", "sub_001") in job_keys
-    assert ("b_transform", "sub_002") not in job_keys
-    assert execute_run_plan(targeted_plan, cores=1).all_selected_resolved
+    assert targeted_plan.selected_fresh_output_refs == ()
+    assert len(targeted_plan.selected_reused_output_refs) == 1
+    assert targeted_plan.selected_reused_output_refs[0].address == "sub_001"
+    assert targeted_plan.reachable_job_count == 0
+    assert targeted_plan.published_outputs == ()
+
+    monkeypatch.setattr(
+        "nipact.execution._run_snakemake",
+        lambda *_args, **_kwargs: pytest.fail("reuse-only run invoked Snakemake"),
+    )
+    monkeypatch.setattr(
+        "nipact.execution.shutil.copy2",
+        lambda *_args, **_kwargs: pytest.fail("reuse-only run copied an artifact"),
+    )
+    monkeypatch.setattr(
+        "nipact.execution._publish_run_outputs",
+        lambda *_args, **_kwargs: pytest.fail("reuse-only run published outputs"),
+    )
+    outcome = execute_run_plan(targeted_plan, cores=1)
+    assert outcome.published_count == 0
+    assert outcome.selected_generated_count == 0
+    assert outcome.selected_reused_count == 1
+    assert outcome.all_selected_resolved
     lines = log_path.read_text(encoding="utf-8").splitlines()
-    assert lines.count("B sub_001") == 2
+    assert lines.count("B sub_001") == 1
     assert lines.count("B sub_002") == 1
+
+
+def test_selected_multi_output_reuse_hashes_only_root_siblings_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project_dir, runtime_dir, _log_path = _write_cache_project(
+        tmp_path,
+        monkeypatch,
+        entities=("sub_001",),
+    )
+    initial_plan = build_run_plan(
+        project_dir=project_dir,
+        context="cache",
+        workflow_name="main",
+        step_name="multi_transform",
+        address="sub_001",
+    )
+    assert execute_run_plan(initial_plan, cores=1).all_selected_resolved
+
+    selected_plan = build_run_plan(
+        project_dir=project_dir,
+        context="cache",
+        workflow_name="main",
+        step_name="multi_transform",
+        address="sub_001",
+    )
+    assert selected_plan.selected_fresh_output_refs == ()
+    assert len(selected_plan.selected_reused_output_refs) == 1
+    selected_ref = selected_plan.selected_reused_output_refs[0]
+    assert [name for name, _artifact_id in selected_ref.planned_sibling_artifact_ids] == [
+        "left_out",
+        "right_out",
+    ]
+
+    stale_snakefile = selected_plan.run_workspace / "Snakefile"
+    stale_targets = selected_plan.run_workspace / "selected_outputs.txt"
+    stale_log = selected_plan.run_workspace / "logs/snakemake.log"
+    residual_staging = selected_plan.run_workspace / "staging/residual.large"
+    stale_snakefile.parent.mkdir(parents=True, exist_ok=True)
+    stale_log.parent.mkdir(parents=True, exist_ok=True)
+    residual_staging.parent.mkdir(parents=True, exist_ok=True)
+    stale_snakefile.write_text("stale\n", encoding="utf-8")
+    stale_targets.write_text("stale\n", encoding="utf-8")
+    stale_log.write_text("stale\n", encoding="utf-8")
+    residual_staging.write_text("leave in place\n", encoding="utf-8")
+
+    real_digest = execution_module.sha256_file_digest
+    hashed_output_paths: list[Path] = []
+
+    def record_digest(path: Path) -> str:
+        resolved = Path(path).resolve()
+        if (runtime_dir / "outputs").resolve() in resolved.parents:
+            hashed_output_paths.append(resolved)
+        return real_digest(path)
+
+    monkeypatch.setattr(execution_module, "sha256_file_digest", record_digest)
+    monkeypatch.setattr(
+        "nipact.execution._run_snakemake",
+        lambda *_args, **_kwargs: pytest.fail("reuse-only run invoked Snakemake"),
+    )
+    monkeypatch.setattr(
+        "nipact.execution.shutil.copy2",
+        lambda *_args, **_kwargs: pytest.fail("reuse-only run copied an artifact"),
+    )
+    counts_before = _registry_row_counts(runtime_dir)
+    outcome = execute_run_plan(selected_plan, cores=1)
+    counts_after = _registry_row_counts(runtime_dir)
+
+    selected_paths = {
+        (runtime_dir / _latest_registered_path(
+            runtime_dir,
+            step_name="multi_transform",
+            output_name=output_name,
+            address="sub_001",
+        )).resolve()
+        for output_name in ("left_out", "right_out")
+    }
+    assert set(hashed_output_paths) == selected_paths
+    assert len(hashed_output_paths) == 2
+    assert outcome.published_count == 0
+    assert outcome.selected_reused_count == 1
+    assert counts_after["workflow_outputs"] == counts_before["workflow_outputs"]
+    assert counts_after["dependencies"] == counts_before["dependencies"]
+    assert counts_after["workflow_runs"] == counts_before["workflow_runs"] + 1
+    assert not stale_snakefile.exists()
+    assert not stale_targets.exists()
+    assert not stale_log.exists()
+    assert residual_staging.is_file()
+
+
+def test_selected_reuse_digest_failure_aborts_before_registry_update(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project_dir, runtime_dir, _log_path = _write_cache_project(
+        tmp_path,
+        monkeypatch,
+        entities=("sub_001",),
+    )
+    initial_plan = build_run_plan(
+        project_dir=project_dir,
+        context="cache",
+        workflow_name="main",
+        step_name="b_transform",
+        address="sub_001",
+    )
+    assert execute_run_plan(initial_plan, cores=1).all_selected_resolved
+    selected_plan = build_run_plan(
+        project_dir=project_dir,
+        context="cache",
+        workflow_name="main",
+        step_name="b_transform",
+        address="sub_001",
+    )
+    selected_path = runtime_dir / _latest_registered_path(
+        runtime_dir,
+        step_name="b_transform",
+        output_name="b_out",
+        address="sub_001",
+    )
+    original = selected_path.read_bytes()
+    selected_path.write_bytes(b"#" + original[1:])
+    counts_before = _registry_row_counts(runtime_dir)
+    monkeypatch.setattr(
+        "nipact.execution._run_snakemake",
+        lambda *_args, **_kwargs: pytest.fail("invalid reuse invoked Snakemake"),
+    )
+
+    with pytest.raises(
+        ValidationError,
+        match="selected reused artifact digest mismatch",
+    ):
+        execute_run_plan(selected_plan, cores=1)
+    assert _registry_row_counts(runtime_dir) == counts_before
+
+
+def test_cross_workflow_selected_reuse_adopts_transitive_membership(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project_dir, runtime_dir, _log_path = _write_cache_project(
+        tmp_path,
+        monkeypatch,
+        entities=("sub_001",),
+    )
+    initial_plan = build_run_plan(
+        project_dir=project_dir,
+        context="cache",
+        workflow_name="main",
+        step_name="b_transform",
+        address="sub_001",
+    )
+    assert execute_run_plan(initial_plan, cores=1).all_selected_resolved
+    counts_before = _registry_row_counts(runtime_dir)
+
+    derivative_plan = build_run_plan(
+        project_dir=project_dir,
+        context="cache",
+        workflow_name="derivative",
+        step_name="b_transform",
+        address="sub_001",
+    )
+    assert derivative_plan.selected_fresh_output_refs == ()
+    assert len(derivative_plan.selected_reused_output_refs) == 1
+    outcome = execute_run_plan(derivative_plan, cores=1)
+    assert outcome.selected_reused_count == 1
+
+    with sqlite3.connect(runtime_dir / "database/registry.db") as conn:
+        memberships = dict(
+            conn.execute(
+                "SELECT step_name, artifact_id FROM published_outputs "
+                "WHERE workflow_name = 'derivative' AND address = 'sub_001' "
+                "AND step_name IN ('a_source', 'b_transform')"
+            ).fetchall()
+        )
+        generators = {
+            str(row[0])
+            for row in conn.execute(
+                "SELECT DISTINCT workflow_name FROM artifacts "
+                "WHERE artifact_id IN (?, ?)",
+                (memberships["a_source"], memberships["b_transform"]),
+            ).fetchall()
+        }
+    assert set(memberships) == {"a_source", "b_transform"}
+    assert generators == {"main"}
+    counts_after = _registry_row_counts(runtime_dir)
+    assert counts_after["workflow_outputs"] == counts_before["workflow_outputs"]
+    assert counts_after["dependencies"] == counts_before["dependencies"]
 
 
 def test_targeted_run_reuses_valid_upstream_for_selected_entity(
@@ -3612,12 +3878,12 @@ def test_targeted_run_does_not_execute_or_republish_sibling_entity(
         step_name="b_transform",
         address="sub_001",
     )
-    assert {
-        (spec.step_name, spec.output_name, spec.address)
-        for spec in targeted_plan.published_outputs
-    } == {("b_transform", "b_out", "sub_001")}
+    assert targeted_plan.published_outputs == ()
+    assert targeted_plan.selected_fresh_output_refs == ()
+    assert len(targeted_plan.selected_reused_output_refs) == 1
     assert execute_run_plan(targeted_plan, cores=1).all_selected_resolved
     lines = log_path.read_text(encoding="utf-8").splitlines()
+    assert lines.count("B sub_001") == 1
     assert lines.count("B sub_002") == 1
     assert (
         _latest_workflow_artifact_id(
@@ -4020,6 +4286,15 @@ def test_targeted_rerun_with_identical_bytes_revalidates_published_file(
         workflow_name="main",
         step_name="b_transform",
     )
+    # Compile the repeated realization while the registry is still empty.
+    # Ordinary selection after publication reuses instead of recomputing.
+    targeted_plan = build_run_plan(
+        project_dir=project_dir,
+        context="cache",
+        workflow_name="main",
+        step_name="b_transform",
+        address="sub_001",
+    )
     assert execute_run_plan(full_plan, cores=1).published_count == len(
         full_plan.published_outputs
     )
@@ -4047,15 +4322,8 @@ def test_targeted_rerun_with_identical_bytes_revalidates_published_file(
             "SELECT COUNT(*) FROM request_bundle_projections"
         ).fetchone()[0]
 
-    # Unchanged inputs: the forced-fresh selected job recomputes identical
+    # Unchanged inputs: the precompiled fresh selected job recomputes identical
     # bytes, so publication validates the existing content-addressed file.
-    targeted_plan = build_run_plan(
-        project_dir=project_dir,
-        context="cache",
-        workflow_name="main",
-        step_name="b_transform",
-        address="sub_001",
-    )
     assert execute_run_plan(targeted_plan, cores=1).all_selected_resolved
 
     row_after = _published_output_row(
@@ -4113,6 +4381,13 @@ def test_path_reads_deduplicate_multiple_memberships_for_one_current_artifact(
         step_name="b_transform",
         address="sub_001",
     )
+    rerun_plan = build_run_plan(
+        project_dir=project_dir,
+        context="cache",
+        workflow_name="main",
+        step_name="b_transform",
+        address="sub_001",
+    )
     assert execute_run_plan(first_plan, cores=1).all_selected_resolved
     derivative_plan = build_run_plan(
         project_dir=project_dir,
@@ -4123,13 +4398,6 @@ def test_path_reads_deduplicate_multiple_memberships_for_one_current_artifact(
     )
     assert execute_run_plan(derivative_plan, cores=1).all_selected_resolved
 
-    rerun_plan = build_run_plan(
-        project_dir=project_dir,
-        context="cache",
-        workflow_name="main",
-        step_name="b_transform",
-        address="sub_001",
-    )
     assert execute_run_plan(rerun_plan, cores=1).all_selected_resolved
     with sqlite3.connect(runtime_dir / "database/registry.db") as conn:
         current_id, shared_path = conn.execute(
@@ -4409,6 +4677,13 @@ def test_bundle_reresolution_records_the_equivalent_artifact_actually_consumed(
         step_name="b_transform",
         address="sub_001",
     )
+    second_plan = build_run_plan(
+        project_dir=project_dir,
+        context="cache",
+        workflow_name="main",
+        step_name="b_transform",
+        address="sub_001",
+    )
     assert execute_run_plan(first_plan, cores=1).all_selected_resolved
 
     first_c_plan = build_run_plan(
@@ -4423,13 +4698,6 @@ def test_bundle_reresolution_records_the_equivalent_artifact_actually_consumed(
     # Insert an equivalent bundle after planning. Execution must preserve the
     # still-valid planned bundle rather than silently changing retrospective
     # lineage to the newly inserted entity.
-    second_plan = build_run_plan(
-        project_dir=project_dir,
-        context="cache",
-        workflow_name="main",
-        step_name="b_transform",
-        address="sub_001",
-    )
     assert execute_run_plan(second_plan, cores=1).all_selected_resolved
 
     with sqlite3.connect(runtime_dir / "database/registry.db") as conn:
@@ -4451,6 +4719,14 @@ def test_bundle_reresolution_records_the_equivalent_artifact_actually_consumed(
     assert artifact_ids[0] == older_id
     newer_id = artifact_ids[1]
 
+    second_c_plan = build_run_plan(
+        project_dir=project_dir,
+        context="cache",
+        workflow_name="derivative",
+        step_name="c_transform",
+        address="sub_001",
+    )
+    assert second_c_plan.reused_outputs[0].source_artifact_id == older_id
     assert first_c_plan.reused_outputs[0].source_artifact_id == older_id
     assert execute_run_plan(first_c_plan, cores=1).all_selected_resolved
     first_c_id = _latest_workflow_artifact_id(
@@ -4470,14 +4746,6 @@ def test_bundle_reresolution_records_the_equivalent_artifact_actually_consumed(
             (first_c_id,),
         ).fetchone() == (older_id,)
 
-    second_c_plan = build_run_plan(
-        project_dir=project_dir,
-        context="cache",
-        workflow_name="derivative",
-        step_name="c_transform",
-        address="sub_001",
-    )
-    assert second_c_plan.reused_outputs[0].source_artifact_id == older_id
     with sqlite3.connect(runtime_dir / "database/registry.db") as conn:
         conn.execute(
             """
@@ -4522,6 +4790,84 @@ def test_bundle_reresolution_records_the_equivalent_artifact_actually_consumed(
         ).fetchone() == (newer_id,)
 
 
+def test_selected_reuse_records_execution_time_bundle_substitute(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project_dir, runtime_dir, _log_path = _write_cache_project(
+        tmp_path,
+        monkeypatch,
+        entities=("sub_001",),
+    )
+    first_plan = build_run_plan(
+        project_dir=project_dir,
+        context="cache",
+        workflow_name="main",
+        step_name="b_transform",
+        address="sub_001",
+    )
+    second_plan = build_run_plan(
+        project_dir=project_dir,
+        context="cache",
+        workflow_name="main",
+        step_name="b_transform",
+        address="sub_001",
+    )
+    assert execute_run_plan(first_plan, cores=1).all_selected_resolved
+    assert execute_run_plan(second_plan, cores=1).all_selected_resolved
+
+    selected_plan = build_run_plan(
+        project_dir=project_dir,
+        context="cache",
+        workflow_name="main",
+        step_name="b_transform",
+        address="sub_001",
+    )
+    selected_ref = selected_plan.selected_reused_output_refs[0]
+    planned_id = dict(selected_ref.planned_sibling_artifact_ids)["b_out"]
+    with sqlite3.connect(runtime_dir / "database/registry.db") as conn:
+        artifact_ids = [
+            int(row[0])
+            for row in conn.execute(
+                "SELECT artifact_id FROM artifacts "
+                "WHERE step_name = 'b_transform' AND output_name = 'b_out' "
+                "AND address = 'sub_001' ORDER BY run_id"
+            ).fetchall()
+        ]
+        assert artifact_ids == sorted(artifact_ids)
+        assert planned_id == artifact_ids[0]
+        substitute_id = artifact_ids[1]
+        conn.execute(
+            "UPDATE artifacts SET is_published = 0 WHERE artifact_id = ?",
+            (planned_id,),
+        )
+    counts_before = _registry_row_counts(runtime_dir)
+
+    outcome = execute_run_plan(selected_plan, cores=1)
+    assert outcome.published_count == 0
+    assert outcome.selected_reused_count == 1
+    with sqlite3.connect(runtime_dir / "database/registry.db") as conn:
+        membership_id = conn.execute(
+            "SELECT artifact_id FROM published_outputs "
+            "WHERE workflow_name = 'main' AND step_name = 'b_transform' "
+            "AND output_name = 'b_out' AND address = 'sub_001'"
+        ).fetchone()[0]
+        summary = json.loads(
+            conn.execute(
+                "SELECT resolution_summary_json FROM workflow_runs "
+                "ORDER BY run_id DESC LIMIT 1"
+            ).fetchone()[0]
+        )
+    assert membership_id == substitute_id
+    assert (
+        summary["selected_outputs"][0]["resolution"]["artifact_id"]
+        == substitute_id
+    )
+    counts_after = _registry_row_counts(runtime_dir)
+    assert counts_after["workflow_outputs"] == counts_before["workflow_outputs"]
+    assert counts_after["dependencies"] == counts_before["dependencies"]
+
+
 def test_multi_output_substitution_records_all_siblings_and_transitive_membership(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -4538,7 +4884,25 @@ def test_multi_output_substitution_records_all_siblings_and_transitive_membershi
         step_name="multi_transform",
         address="sub_001",
     )
-    assert execute_run_plan(main_plan, cores=1).all_selected_resolved
+    rerun_b = build_run_plan(
+        project_dir=project_dir,
+        context="cache",
+        workflow_name="main",
+        step_name="b_transform",
+        address="sub_001",
+    )
+    # Build the historical coherent chain first, then compile the derivative
+    # against it. The precompiled main plan creates a byte-equivalent newer
+    # chain after derivative planning, which exercises execution substitution.
+    assert execute_run_plan(rerun_b, cores=1).all_selected_resolved
+    rerun_multi = build_run_plan(
+        project_dir=project_dir,
+        context="cache",
+        workflow_name="main",
+        step_name="multi_transform",
+        address="sub_001",
+    )
+    assert execute_run_plan(rerun_multi, cores=1).all_selected_resolved
     _write_sibling_workflow(
         project_dir,
         workflow_name="multi_derivative",
@@ -4567,22 +4931,7 @@ def test_multi_output_substitution_records_all_siblings_and_transitive_membershi
         if ref.step_name == "b_transform"
     )
 
-    rerun_b = build_run_plan(
-        project_dir=project_dir,
-        context="cache",
-        workflow_name="main",
-        step_name="b_transform",
-        address="sub_001",
-    )
-    assert execute_run_plan(rerun_b, cores=1).all_selected_resolved
-    rerun_multi = build_run_plan(
-        project_dir=project_dir,
-        context="cache",
-        workflow_name="main",
-        step_name="multi_transform",
-        address="sub_001",
-    )
-    assert execute_run_plan(rerun_multi, cores=1).all_selected_resolved
+    assert execute_run_plan(main_plan, cores=1).all_selected_resolved
 
     registry_path = runtime_dir / "database/registry.db"
     with sqlite3.connect(registry_path) as conn:
@@ -4684,14 +5033,17 @@ def test_bundle_resolver_reports_recorded_divergence_before_missing_files(
         monkeypatch,
         entities=("sub_001",),
     )
-    for _ in range(2):
-        plan = build_run_plan(
+    plans = tuple(
+        build_run_plan(
             project_dir=project_dir,
             context="cache",
             workflow_name="main",
             step_name="b_transform",
             address="sub_001",
         )
+        for _ in range(2)
+    )
+    for plan in plans:
         assert execute_run_plan(plan, cores=1).all_selected_resolved
 
     with sqlite3.connect(runtime_dir / "database/registry.db") as conn:
@@ -4742,6 +5094,13 @@ def test_execution_rechecks_divergence_in_transitive_reused_closure(
         step_name="b_transform",
         address="sub_001",
     )
+    second_a_plan = build_run_plan(
+        project_dir=project_dir,
+        context="cache",
+        workflow_name="main",
+        step_name="a_source",
+        address="sub_001",
+    )
     assert execute_run_plan(b_plan, cores=1).all_selected_resolved
     c_plan = build_run_plan(
         project_dir=project_dir,
@@ -4758,13 +5117,6 @@ def test_execution_rechecks_divergence_in_transitive_reused_closure(
 
     # A is not copied into C's workspace because B is the reuse boundary, but
     # its requested bundle remains part of the transitive validation closure.
-    second_a_plan = build_run_plan(
-        project_dir=project_dir,
-        context="cache",
-        workflow_name="main",
-        step_name="a_source",
-        address="sub_001",
-    )
     assert execute_run_plan(second_a_plan, cores=1).all_selected_resolved
     with sqlite3.connect(runtime_dir / "database/registry.db") as conn:
         newest_a_id = conn.execute(
@@ -4813,6 +5165,13 @@ def test_targeted_rerun_rejects_divergent_deterministic_output_and_rolls_back(
         step_name="b_transform",
         address="sub_001",
     )
+    rerun_plan = build_run_plan(
+        project_dir=project_dir,
+        context="cache",
+        workflow_name="main",
+        step_name="b_transform",
+        address="sub_001",
+    )
     assert execute_run_plan(first_plan, cores=1).all_selected_resolved
 
     row_before = _published_output_row(
@@ -4843,13 +5202,7 @@ def test_targeted_rerun_rejects_divergent_deterministic_output_and_rolls_back(
             "SELECT run_id FROM workflow_runs WHERE is_current = 1"
         ).fetchone()[0]
 
-    rerun_plan = build_run_plan(
-        project_dir=project_dir,
-        context="cache",
-        workflow_name="main",
-        step_name="b_transform",
-        address="sub_001",
-    )
+    run_snakemake = execution_module._run_snakemake
 
     def write_divergent_output(
         _run_plan: object,
@@ -4857,6 +5210,11 @@ def test_targeted_rerun_rejects_divergent_deterministic_output_and_rolls_back(
         cores: int,
         dry_run: bool,
     ) -> int:
+        returncode = run_snakemake(
+            _run_plan,
+            cores=cores,
+            dry_run=dry_run,
+        )
         output = next(
             job.outputs["b_out"]
             for job in rerun_plan.jobs
@@ -4867,11 +5225,7 @@ def test_targeted_rerun_rejects_divergent_deterministic_output_and_rolls_back(
             json.dumps({"address": "sub_001", "value": "divergent"}) + "\n",
             encoding="utf-8",
         )
-        (rerun_plan.run_workspace / "logs/snakemake.log").write_text(
-            "synthetic completed run\n",
-            encoding="utf-8",
-        )
-        return 0
+        return returncode
 
     monkeypatch.setattr("nipact.execution._run_snakemake", write_divergent_output)
     with pytest.raises(
@@ -4938,6 +5292,13 @@ def test_targeted_multi_output_rerun_rejects_one_divergent_sibling_atomically(
         step_name="multi_transform",
         address="sub_001",
     )
+    rerun_plan = build_run_plan(
+        project_dir=project_dir,
+        context="cache",
+        workflow_name="main",
+        step_name="multi_transform",
+        address="sub_001",
+    )
     assert execute_run_plan(first_plan, cores=1).all_selected_resolved
 
     rows_before = {
@@ -4960,13 +5321,7 @@ def test_targeted_multi_output_rerun_rejects_one_divergent_sibling_atomically(
     }
     counts_before = _registry_row_counts(runtime_dir)
 
-    rerun_plan = build_run_plan(
-        project_dir=project_dir,
-        context="cache",
-        workflow_name="main",
-        step_name="multi_transform",
-        address="sub_001",
-    )
+    run_snakemake = execution_module._run_snakemake
 
     def write_one_divergent_sibling(
         _run_plan: object,
@@ -4974,6 +5329,11 @@ def test_targeted_multi_output_rerun_rejects_one_divergent_sibling_atomically(
         cores: int,
         dry_run: bool,
     ) -> int:
+        returncode = run_snakemake(
+            _run_plan,
+            cores=cores,
+            dry_run=dry_run,
+        )
         job = next(
             job for job in rerun_plan.jobs if job.step_name == "multi_transform"
         )
@@ -4989,7 +5349,7 @@ def test_targeted_multi_output_rerun_rejects_one_divergent_sibling_atomically(
             + "\n",
             encoding="utf-8",
         )
-        return 0
+        return returncode
 
     monkeypatch.setattr(
         "nipact.execution._run_snakemake",
@@ -5100,7 +5460,6 @@ def test_recorded_divergence_precedes_missing_file_and_reports_first_run(
         step_name="b_transform",
         address="sub_001",
     )
-    assert execute_run_plan(first_plan, cores=1).all_selected_resolved
     second_plan = build_run_plan(
         project_dir=project_dir,
         context="cache",
@@ -5108,6 +5467,7 @@ def test_recorded_divergence_precedes_missing_file_and_reports_first_run(
         step_name="b_transform",
         address="sub_001",
     )
+    assert execute_run_plan(first_plan, cores=1).all_selected_resolved
     assert execute_run_plan(second_plan, cores=1).all_selected_resolved
     shared_path = runtime_dir / _published_output_row(
         runtime_dir,
@@ -5138,21 +5498,17 @@ def test_recorded_divergence_precedes_missing_file_and_reports_first_run(
                 (digest, digest[:16], int(row[0])),
             )
     shared_path.unlink()
-    rerun_plan = build_run_plan(
-        project_dir=project_dir,
-        context="cache",
-        workflow_name="main",
-        step_name="b_transform",
-        address="sub_001",
-    )
     with pytest.raises(
         ValidationError,
-        match=(
-            rf"new run \d+ conflicts with historical run {int(historical[0][1])}, "
-            rf"artifacts \({int(historical[0][0])},\)"
-        ),
+        match="divergent reusable artifact bundles",
     ):
-        execute_run_plan(rerun_plan, cores=1)
+        build_run_plan(
+            project_dir=project_dir,
+            context="cache",
+            workflow_name="main",
+            step_name="b_transform",
+            address="sub_001",
+        )
     assert not shared_path.exists()
 
 
@@ -5172,6 +5528,13 @@ def test_failed_targeted_rerun_preserves_prior_published_coordinate(
         step_name="b_transform",
         address="sub_001",
     )
+    plan_two = build_run_plan(
+        project_dir=project_dir,
+        context="cache",
+        workflow_name="main",
+        step_name="b_transform",
+        address="sub_001",
+    )
     assert execute_run_plan(plan_one, cores=1).all_selected_resolved
     row_before = _published_output_row(
         runtime_dir,
@@ -5183,13 +5546,6 @@ def test_failed_targeted_rerun_preserves_prior_published_coordinate(
     staged_output = plan_one.run_workspace / "staging/b_transform/b_out/sub_001.json"
     assert staged_output.is_file()
 
-    plan_two = build_run_plan(
-        project_dir=project_dir,
-        context="cache",
-        workflow_name="main",
-        step_name="b_transform",
-        address="sub_001",
-    )
     assert plan_two.run_workspace == plan_one.run_workspace
     stale_staging_seen: list[bool] = []
 

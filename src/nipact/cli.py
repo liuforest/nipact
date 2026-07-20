@@ -210,8 +210,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     workflow_run_parser = workflow_subparsers.add_parser(
         "run",
-        help="run a selected workflow step",
-        description="Run a selected workflow step through Snakemake.",
+        help="ensure a selected workflow output is available",
+        description=(
+            "Ensure a selected workflow output is available, reusing a valid "
+            "result or executing missing work."
+        ),
     )
     _add_project_context_args(workflow_run_parser)
     _add_workflow_step_args(workflow_run_parser)
@@ -333,6 +336,14 @@ def _run_workflow_command(args: argparse.Namespace) -> int | None:
             len(run_plan.selected_fresh_output_refs)
             + len(run_plan.selected_reused_output_refs),
         )
+        feedback.key_value(
+            "planned_selected_fresh_outputs",
+            len(run_plan.selected_fresh_output_refs),
+        )
+        feedback.key_value(
+            "planned_selected_reused_outputs",
+            len(run_plan.selected_reused_output_refs),
+        )
         # planned_jobs counts compiled fresh jobs population-wide even for a
         # targeted run; planned_reachable_fresh_jobs and the reuse counters
         # below are closure-scoped.
@@ -372,22 +383,24 @@ def _run_workflow_command(args: argparse.Namespace) -> int | None:
                 ),
             )
         feedback.key_value("run_workspace", _display_path(run_plan.run_workspace))
-        feedback.key_value(
-            "snakemake_log",
-            _display_path(run_plan.run_workspace / "logs" / "snakemake.log"),
-        )
+        if run_plan.selected_fresh_output_refs:
+            feedback.key_value(
+                "snakemake_log",
+                _display_path(run_plan.run_workspace / "logs" / "snakemake.log"),
+            )
         if run_plan.dry_run:
             feedback.key_value(
                 "note",
                 "Dry run: reused registered artifacts are referenced at their "
                 "validated registered paths; no hydration, publication, or "
-                "registry update occurs.",
+                "registry update occurs. Explicit recomputation is not available "
+                "in this release.",
             )
         else:
             feedback.key_value(
                 "note",
-                "Registered upstream artifacts can be hydrated into the current "
-                "run when their identity and digest checks pass.",
+                "Valid selected outputs are reused; missing work executes through "
+                "Snakemake. Explicit recomputation is not available in this release.",
             )
         feedback.line()
         feedback.flush()
@@ -410,6 +423,8 @@ def _run_workflow_command(args: argparse.Namespace) -> int | None:
                     active_spinner.stop()
                     active_spinner = None
                 feedback.line("Snakemake complete.")
+            elif event == "validating_selected_reuse":
+                feedback.line("Validating selected reused outputs...")
             elif event == "publishing_outputs":
                 feedback.line("Publishing outputs...")
             elif event == "registry_updated":
@@ -434,6 +449,12 @@ def _run_workflow_command(args: argparse.Namespace) -> int | None:
             feedback.key_value("registry", "not_updated")
         else:
             feedback.key_value("published_outputs", outcome.published_count)
+            feedback.key_value(
+                "selected_generated_outputs", outcome.selected_generated_count
+            )
+            feedback.key_value(
+                "selected_reused_outputs", outcome.selected_reused_count
+            )
             feedback.key_value("registry", "updated")
             for step_name, address, reason in outcome.failed_jobs:
                 feedback.key_value("failed_job", f"{step_name} {address} ({reason})")

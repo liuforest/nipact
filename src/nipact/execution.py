@@ -357,22 +357,52 @@ def build_run_plan(
         loaded=loaded,
         plan=plan,
         run_workspace=run_workspace,
-        selected_step_name=selected_step.step_name,
-        selected_output_name=selected_output.name,
-        selected_addresses=addresses,
     )
     output_refs_by_key = _output_refs_by_key(jobs)
-    selected_fresh_output_refs = tuple(
-        output_refs_by_key[(selected_step.step_name, selected_output.name, address)]
-        for address in addresses
-    )
-    selected_reused_output_refs: tuple[SelectedReusedBundleRef, ...] = ()
+    selected_fresh_output_refs: list[RunJobOutputRef] = []
+    selected_reused_output_refs: list[SelectedReusedBundleRef] = []
+    for selected_address in addresses:
+        key = (selected_step.step_name, selected_output.name, selected_address)
+        fresh_ref = output_refs_by_key.get(key)
+        reused_ref = reused_outputs_by_artifact.get(key)
+        if fresh_ref is not None:
+            selected_fresh_output_refs.append(fresh_ref)
+        elif reused_ref is not None:
+            sibling_refs = {
+                output_name: reused_outputs_by_artifact.get(
+                    (selected_step.step_name, output_name, selected_address)
+                )
+                for output_name in dict(reused_ref.reuse_request.sibling_outputs)
+            }
+            if any(ref is None for ref in sibling_refs.values()):
+                raise ValidationError(
+                    "selected reused bundle is missing a planned sibling"
+                )
+            selected_reused_output_refs.append(
+                SelectedReusedBundleRef(
+                    step_name=selected_step.step_name,
+                    output_name=selected_output.name,
+                    address=selected_address,
+                    reuse_request=reused_ref.reuse_request,
+                    planned_sibling_artifact_ids=tuple(
+                        sorted(
+                            (output_name, ref.source_artifact_id)
+                            for output_name, ref in sibling_refs.items()
+                            if ref is not None
+                        )
+                    ),
+                )
+            )
+        else:
+            raise ValidationError("run plan is missing selected output")
+    selected_fresh_output_refs_tuple = tuple(selected_fresh_output_refs)
+    selected_reused_output_refs_tuple = tuple(selected_reused_output_refs)
     _validate_selected_output_partition(
         selected_step_name=selected_step.step_name,
         selected_output_name=selected_output.name,
         selected_addresses=addresses,
-        selected_fresh_output_refs=selected_fresh_output_refs,
-        selected_reused_output_refs=selected_reused_output_refs,
+        selected_fresh_output_refs=selected_fresh_output_refs_tuple,
+        selected_reused_output_refs=selected_reused_output_refs_tuple,
     )
     # Hydration is scoped to the selected targets' reachable closure: a reused
     # registry artifact is retained only when a reachable fresh job consumes it.
@@ -380,7 +410,7 @@ def build_run_plan(
     # cohort ancestor can pull sibling-entity reuse back into scope.
     reachable_job_ids = _reachable_job_ids_for_outputs(
         jobs=jobs,
-        selected_output_refs=selected_fresh_output_refs,
+        selected_output_refs=selected_fresh_output_refs_tuple,
     )
     reused_outputs = _used_reused_outputs(
         jobs=tuple(job for job in jobs if job.job_id in reachable_job_ids),
@@ -389,7 +419,7 @@ def build_run_plan(
     reused_validation_outputs = _reused_validation_outputs(
         jobs=tuple(job for job in jobs if job.job_id in reachable_job_ids),
         reused_outputs_by_artifact=reused_outputs_by_artifact,
-        selected_reused_output_refs=selected_reused_output_refs,
+        selected_reused_output_refs=selected_reused_output_refs_tuple,
     )
     published_outputs = _published_output_specs(
         loaded=loaded,
@@ -411,8 +441,8 @@ def build_run_plan(
         manifest_bindings=plan.manifest_bindings,
         published_outputs=published_outputs,
         jobs=jobs,
-        selected_fresh_output_refs=selected_fresh_output_refs,
-        selected_reused_output_refs=selected_reused_output_refs,
+        selected_fresh_output_refs=selected_fresh_output_refs_tuple,
+        selected_reused_output_refs=selected_reused_output_refs_tuple,
         reused_outputs=reused_outputs,
         reused_validation_outputs=reused_validation_outputs,
         reachable_job_count=len(reachable_job_ids),
@@ -455,32 +485,47 @@ def execute_run_plan(
     cores: int = 1,
     status_callback: RunStatusCallback | None = None,
 ) -> RunOutcome:
-    """Run a workflow plan through Snakemake and publish completed jobs best-effort.
+    """Resolve a workflow plan, executing fresh selected work best-effort.
 
     Snakemake runs with ``--keep-going``, so a single failed job no longer aborts
     the run: every job whose declared outputs all landed in staging is published
     and recorded, the failures are skipped, and the survivors stay reusable. The
-    hard errors are a real run that published nothing while Snakemake exited
-    non-zero, and a dry run whose Snakemake invocation exited non-zero.
+    hard errors are a real fresh-only run that published nothing while Snakemake
+    exited non-zero, and a dry run whose Snakemake invocation exited non-zero.
     """
     if cores <= 0:
         raise ValidationError("cores must be a positive integer")
     _emit_status(status_callback, "building_workspace")
+    has_fresh_selection = bool(run_plan.selected_fresh_output_refs)
+    has_selected_reuse = bool(run_plan.selected_reused_output_refs)
+    _prepare_run_workspace(run_plan)
     actual_reused_artifacts: dict[int, ReusableArtifactCandidate] = {}
     if run_plan.dry_run:
-        # Dry runs never copy reused artifacts into staging: the generated
-        # Snakefile points reused inputs at the freshly re-resolved registered
-        # source files instead, so the mapping must exist before the workspace
-        # is written and a revalidation failure aborts before any file lands.
+        # Dry runs re-resolve the active reused closure using metadata only. A
+        # fresh plan needs the registered input paths in its Snakefile; a
+        # reuse-only plan writes no executor files at all.
+        if not has_fresh_selection:
+            _write_reuse_only_workspace(run_plan)
+        if has_selected_reuse:
+            _emit_status(status_callback, "validating_selected_reuse")
         reused_input_paths = _dry_run_reused_input_paths(run_plan)
-        _write_run_workspace(run_plan, reused_input_paths=reused_input_paths)
+        if has_fresh_selection:
+            _write_run_workspace(run_plan, reused_input_paths=reused_input_paths)
     else:
-        _write_run_workspace(run_plan)
+        if has_fresh_selection:
+            _write_run_workspace(run_plan)
+        else:
+            _write_reuse_only_workspace(run_plan)
+        if has_selected_reuse:
+            _emit_status(status_callback, "validating_selected_reuse")
         actual_reused_artifacts = _hydrate_reused_outputs(run_plan)
-        _remove_expected_staged_outputs(run_plan)
-    _emit_status(status_callback, "starting_snakemake")
-    returncode = _run_snakemake(run_plan, cores=cores, dry_run=run_plan.dry_run)
-    _emit_status(status_callback, "snakemake_complete")
+        if has_fresh_selection:
+            _remove_expected_staged_outputs(run_plan)
+    returncode = 0
+    if has_fresh_selection:
+        _emit_status(status_callback, "starting_snakemake")
+        returncode = _run_snakemake(run_plan, cores=cores, dry_run=run_plan.dry_run)
+        _emit_status(status_callback, "snakemake_complete")
     if run_plan.dry_run:
         if returncode != 0:
             log_path = run_plan.run_workspace / "logs" / "snakemake.log"
@@ -494,16 +539,21 @@ def execute_run_plan(
             failed_jobs=(),
             all_selected_resolved=True,
         )
-    _emit_status(status_callback, "publishing_outputs")
-    published_results, publish_failures = _publish_run_outputs(run_plan)
-    published_results, prune_failures = _prune_orphan_published_jobs(
-        run_plan,
-        published_results,
-    )
+    if has_fresh_selection:
+        _emit_status(status_callback, "publishing_outputs")
+        published_results, publish_failures = _publish_run_outputs(run_plan)
+        published_results, prune_failures = _prune_orphan_published_jobs(
+            run_plan,
+            published_results,
+        )
+    else:
+        published_results = ()
+        publish_failures = ()
+        prune_failures = ()
     failed_jobs = tuple(sorted(publish_failures + prune_failures))
     published_rows = tuple(result.row for result in published_results)
     created_rows = tuple(result.row for result in published_results if result.created)
-    if not published_rows and returncode != 0:
+    if not published_rows and returncode != 0 and not has_selected_reuse:
         log_path = run_plan.run_workspace / "logs" / "snakemake.log"
         raise ValidationError(
             f"Snakemake failed with exit code {returncode}; see {log_path}"
@@ -815,7 +865,7 @@ def _write_run_workspace(
     *,
     reused_input_paths: dict[str, str] | None = None,
 ) -> None:
-    run_plan.run_workspace.mkdir(parents=True, exist_ok=True)
+    _prepare_run_workspace(run_plan)
     (run_plan.run_workspace / "staging").mkdir(exist_ok=True)
     (run_plan.run_workspace / "logs").mkdir(exist_ok=True)
     _write_json_file(run_plan.run_workspace / "run_plan.json", _run_plan_payload(run_plan))
@@ -831,6 +881,25 @@ def _write_run_workspace(
         run_plan.run_workspace / "Snakefile",
         _snakefile_text(run_plan, reused_input_paths=reused_input_paths),
     )
+
+
+def _write_reuse_only_workspace(run_plan: RunPlan) -> None:
+    _prepare_run_workspace(run_plan)
+    _remove_stale_executor_file(run_plan.run_workspace / "Snakefile")
+    _remove_stale_executor_file(run_plan.run_workspace / "selected_outputs.txt")
+    _write_json_file(run_plan.run_workspace / "run_plan.json", _run_plan_payload(run_plan))
+
+
+def _prepare_run_workspace(run_plan: RunPlan) -> None:
+    run_plan.run_workspace.mkdir(parents=True, exist_ok=True)
+    _remove_stale_executor_file(run_plan.run_workspace / "logs" / "snakemake.log")
+
+
+def _remove_stale_executor_file(path: Path) -> None:
+    if path.is_dir():
+        raise ValidationError(f"executor-owned path is a directory: {path}")
+    if path.exists() or path.is_symlink():
+        path.unlink()
 
 
 def _dry_run_reused_input_paths(run_plan: RunPlan) -> dict[str, str]:
@@ -858,6 +927,10 @@ def _hydrate_reused_outputs(
     run_plan: RunPlan,
 ) -> dict[int, ReusableArtifactCandidate]:
     candidates = _reresolve_reused_bundles(run_plan)
+    verified_artifact_ids = _verify_selected_reused_outputs(
+        run_plan,
+        candidates=candidates,
+    )
     for output_ref in run_plan.reused_outputs:
         candidate = candidates[output_ref.source_artifact_id]
         source_path = run_plan.runtime_root / candidate.path
@@ -867,7 +940,10 @@ def _hydrate_reused_outputs(
             )
         if source_path.stat().st_size != candidate.file_size:
             raise ValidationError("reusable artifact file size mismatch during hydration")
-        if sha256_file_digest(source_path) != candidate.content_digest:
+        if (
+            candidate.artifact_id not in verified_artifact_ids
+            and sha256_file_digest(source_path) != candidate.content_digest
+        ):
             raise ValidationError("reusable artifact digest mismatch during hydration")
         output_ref.staging_path.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(source_path, output_ref.staging_path)
@@ -876,6 +952,41 @@ def _hydrate_reused_outputs(
         if sha256_file_digest(output_ref.staging_path) != candidate.content_digest:
             raise ValidationError("hydrated artifact digest mismatch")
     return candidates
+
+
+def _verify_selected_reused_outputs(
+    run_plan: RunPlan,
+    *,
+    candidates: dict[int, ReusableArtifactCandidate],
+) -> set[int]:
+    verified_artifact_ids: set[int] = set()
+    for selected_ref in run_plan.selected_reused_output_refs:
+        for output_name, planned_artifact_id in selected_ref.planned_sibling_artifact_ids:
+            try:
+                candidate = candidates[planned_artifact_id]
+            except KeyError as exc:
+                raise ValidationError(
+                    "selected reused bundle is missing its execution-time artifact"
+                ) from exc
+            if (
+                candidate.step_name != selected_ref.step_name
+                or candidate.output_name != output_name
+                or candidate.address != selected_ref.address
+            ):
+                raise ValidationError(
+                    "selected reused artifact has the wrong requested coordinate"
+                )
+            if candidate.artifact_id in verified_artifact_ids:
+                continue
+            path = run_plan.runtime_root / candidate.path
+            if not path.is_file():
+                raise ValidationError(f"missing reusable artifact file: {candidate.path}")
+            if path.stat().st_size != candidate.file_size:
+                raise ValidationError("selected reused artifact file size mismatch")
+            if sha256_file_digest(path) != candidate.content_digest:
+                raise ValidationError("selected reused artifact digest mismatch")
+            verified_artifact_ids.add(candidate.artifact_id)
+    return verified_artifact_ids
 
 
 def _reresolve_reused_bundles(
@@ -1648,9 +1759,6 @@ def _build_jobs(
     loaded: LoadedWorkflowProject,
     plan: WorkflowPlan,
     run_workspace: Path,
-    selected_step_name: str,
-    selected_output_name: str,
-    selected_addresses: tuple[str, ...],
 ) -> tuple[tuple[RunJob, ...], dict[tuple[str, str, str], ReusedRunJobOutputRef]]:
     jobs: list[RunJob] = []
     source_snapshots = read_registered_source_snapshots(
@@ -1666,11 +1774,6 @@ def _build_jobs(
         RunJobOutputRef | ReusedRunJobOutputRef,
     ] = {}
     reused_outputs_by_artifact: dict[tuple[str, str, str], ReusedRunJobOutputRef] = {}
-    selected_keys = {
-        (selected_step_name, selected_output_name, address)
-        for address in selected_addresses
-    }
-
     for step in plan.steps:
         outputs = _validated_step_outputs(step)
         addresses = _step_addresses(loaded, plan, step)
@@ -1713,10 +1816,6 @@ def _build_jobs(
                 projection_plan=projection_plan,
                 projection_state=projection_state,
             )
-            job_keys = {
-                (step.step_name, output_name, address)
-                for output_name in outputs
-            }
             for output_name in outputs:
                 projection_states_by_output[
                     RequestedOutputCoordinate(
@@ -1727,10 +1826,7 @@ def _build_jobs(
                     )
                 ] = projection_state
             reused_refs: dict[str, ReusedRunJobOutputRef] | None = None
-            if (
-                isinstance(projection_state, ResolvedRequestBundleProjectionV1)
-                and not job_keys.intersection(selected_keys)
-            ):
+            if isinstance(projection_state, ResolvedRequestBundleProjectionV1):
                 reused_refs = _reusable_output_refs_for_job(
                     loaded=loaded,
                     job=job,
@@ -1747,9 +1843,6 @@ def _build_jobs(
                     output_name
                 )
 
-    missing_selected = sorted(selected_keys - set(outputs_by_artifact))
-    if missing_selected:
-        raise ValidationError("run plan is missing selected job(s)")
     return tuple(jobs), reused_outputs_by_artifact
 
 
