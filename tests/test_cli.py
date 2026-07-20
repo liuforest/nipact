@@ -517,8 +517,9 @@ def test_workflow_run_help_documents_dry_run_forecast(
     # whitespace-normalized output.
     help_text = " ".join(capsys.readouterr().out.split())
     assert (
-        "Forecast the Snakemake DAG in an isolated dry-run workspace without "
-        "hydrating reused artifacts, running jobs, or publishing outputs."
+        "Forecast selected-output resolution and any required fresh Snakemake "
+        "work in an isolated dry-run workspace without hydrating reused "
+        "artifacts, running jobs, or publishing outputs."
     ) in help_text
 
 
