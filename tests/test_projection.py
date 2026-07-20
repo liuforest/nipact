@@ -1,5 +1,7 @@
 from dataclasses import fields, replace
 from datetime import date
+import hashlib
+import json
 
 import pytest
 
@@ -16,6 +18,7 @@ from nipact.projection import (
     RegisteredSourceSnapshot,
     RequestBundleProjectionV1,
     RequestBundleProjectionPlanV1,
+    ResolvedRequestBundleProjectionV1,
     RequestedOutputCoordinate,
     SiblingOutput,
     SourceBindingPlan,
@@ -24,7 +27,7 @@ from nipact.projection import (
     UnresolvedRequestBundleProjection,
     UpstreamRequestedOutputBinding,
     UpstreamRequestedOutputBindingPlan,
-    canonical_projection_json,
+    canonicalize_request_bundle_projection,
     resolve_request_bundle_projection_plan,
 )
 
@@ -97,9 +100,21 @@ def _upstream_binding(
 ) -> UpstreamRequestedOutputBinding:
     return UpstreamRequestedOutputBinding(
         role=role,
-        upstream_request_projection=_projection(address=address),
+        upstream_request_bundle_digest=_resolved(
+            _projection(address=address)
+        ).request_bundle_digest,
         output_name=output_name,
     )
+
+
+def _resolved(
+    projection: RequestBundleProjectionV1,
+) -> ResolvedRequestBundleProjectionV1:
+    return canonicalize_request_bundle_projection(projection)
+
+
+def _canonical_json(projection: RequestBundleProjectionV1) -> str:
+    return _resolved(projection).canonical_json
 
 
 def _projection_plan(
@@ -138,7 +153,9 @@ def test_canonical_projection_matches_golden_json() -> None:
         canonical_parameters={"label": "café", "threshold": 0.5, "enabled": True}
     )
 
-    assert canonical_projection_json(projection) == (
+    resolved = _resolved(projection)
+
+    assert resolved.canonical_json == (
         '{"address":"aac_027_m00","canonical_parameters":{"enabled":true,'
         '"label":"café","threshold":0.5},"determinism_contract":"deterministic",'
         '"identity_contract_version":1,"namespace":"clms","output_contract":'
@@ -152,6 +169,9 @@ def test_canonical_projection_matches_golden_json() -> None:
         '"clms.steps:t1_synthseg","runner_contract_version":"1",'
         '"step_contract_id":"t1_synthseg","step_contract_version":"1"}}'
     )
+    assert resolved.request_bundle_digest == hashlib.sha256(
+        resolved.canonical_json.encode("utf-8")
+    ).hexdigest()
 
 
 def test_canonical_projection_is_invariant_to_object_and_declared_set_order() -> None:
@@ -190,14 +210,14 @@ def test_canonical_projection_is_invariant_to_object_and_declared_set_order() ->
         ),
     )
 
-    assert canonical_projection_json(first) == canonical_projection_json(second)
+    assert _canonical_json(first) == _canonical_json(second)
 
 
 def test_canonical_projection_preserves_declared_sequence_order() -> None:
     first = _projection(canonical_parameters={"labels": ["left", "right"]})
     second = _projection(canonical_parameters={"labels": ["right", "left"]})
 
-    assert canonical_projection_json(first) != canonical_projection_json(second)
+    assert _canonical_json(first) != _canonical_json(second)
 
 
 @pytest.mark.parametrize(
@@ -214,7 +234,7 @@ def test_canonical_projection_preserves_scalar_types(
     value: object,
     expected: str,
 ) -> None:
-    serialized = canonical_projection_json(
+    serialized = _canonical_json(
         _projection(canonical_parameters={"value": value})
     )
 
@@ -222,23 +242,30 @@ def test_canonical_projection_preserves_scalar_types(
 
 
 def test_canonical_projection_serializes_collection_without_manifest() -> None:
+    first = _upstream_binding(role="images", address="subject-a")
+    second = _upstream_binding(role="images", address="subject-b")
     binding = CollectionBinding(
         role="images",
         collection_semantics="coordinate_set_v1",
         manifest_digest=None,
         members=(
-            _upstream_binding(role="images", address="subject-b"),
-            _upstream_binding(role="images", address="subject-a"),
+            second,
+            first,
         ),
     )
 
-    serialized = canonical_projection_json(
+    serialized = _canonical_json(
         _projection(role_labelled_bindings=(binding,))
     )
 
     assert '"manifest_digest":null' in serialized
-    assert serialized.index('"address":"subject-a"') < serialized.index(
-        '"address":"subject-b"'
+    payload = json.loads(serialized)
+    members = payload["role_labelled_bindings"][0]["members"]
+    assert [member["upstream_request_bundle_digest"] for member in members] == sorted(
+        [
+            first.upstream_request_bundle_digest,
+            second.upstream_request_bundle_digest,
+        ]
     )
 
 
@@ -246,7 +273,7 @@ def test_binding_role_is_identity_bearing() -> None:
     first = _projection(role_labelled_bindings=(_source_binding(role="image"),))
     second = _projection(role_labelled_bindings=(_source_binding(role="mask"),))
 
-    assert canonical_projection_json(first) != canonical_projection_json(second)
+    assert _canonical_json(first) != _canonical_json(second)
 
 
 @pytest.mark.parametrize(
@@ -266,14 +293,14 @@ def test_registered_source_path_must_be_normalized_posix_under_data(
     path: str,
 ) -> None:
     with pytest.raises(ValidationError, match="normalized POSIX path under data"):
-        canonical_projection_json(
+        _canonical_json(
             _projection(role_labelled_bindings=(_source_binding(path=path),))
         )
 
 
 def test_canonical_projection_rejects_duplicate_top_level_binding_roles() -> None:
     with pytest.raises(ValidationError, match="duplicate roles"):
-        canonical_projection_json(
+        _canonical_json(
             _projection(
                 role_labelled_bindings=(
                     _source_binding(role="image", path="data/first.nii.gz"),
@@ -286,7 +313,7 @@ def test_canonical_projection_rejects_duplicate_top_level_binding_roles() -> Non
 def test_canonical_projection_rejects_duplicate_collection_members() -> None:
     member = _upstream_binding(role="images", address="subject-a")
     with pytest.raises(ValidationError, match="duplicate requested outputs"):
-        canonical_projection_json(
+        _canonical_json(
             _projection(
                 role_labelled_bindings=(
                     CollectionBinding(
@@ -302,7 +329,7 @@ def test_canonical_projection_rejects_duplicate_collection_members() -> None:
 
 def test_canonical_projection_rejects_duplicate_sibling_output_names() -> None:
     with pytest.raises(ValidationError, match="duplicate output names"):
-        canonical_projection_json(
+        _canonical_json(
             _projection(
                 sibling_outputs=(
                     SiblingOutput("image", ".nii.gz"),
@@ -310,6 +337,40 @@ def test_canonical_projection_rejects_duplicate_sibling_output_names() -> None:
                 )
             )
         )
+
+
+@pytest.mark.parametrize(
+    "digest",
+    [
+        "a" * 63,
+        "a" * 65,
+        "A" * 64,
+        "g" * 64,
+        f"{'a' * 63} ",
+    ],
+)
+@pytest.mark.parametrize("digest_field", ["upstream", "source", "manifest"])
+def test_projection_rejects_invalid_full_digests(
+    digest: str,
+    digest_field: str,
+) -> None:
+    if digest_field == "upstream":
+        binding: object = replace(
+            _upstream_binding(role="image", address="subject-a"),
+            upstream_request_bundle_digest=digest,
+        )
+    elif digest_field == "source":
+        binding = replace(_source_binding(), registered_content_digest=digest)
+    else:
+        binding = CollectionBinding(
+            role="images",
+            collection_semantics="coordinate_set_v1",
+            manifest_digest=digest,
+            members=(_upstream_binding(role="images", address="subject-a"),),
+        )
+
+    with pytest.raises(ValidationError, match="64-character"):
+        _canonical_json(_projection(role_labelled_bindings=(binding,)))
 
 
 def _identity_matrix_projection(change: str) -> RequestBundleProjectionV1:
@@ -388,13 +449,10 @@ def _identity_matrix_projection(change: str) -> RequestBundleProjectionV1:
     if change == "collection_semantics":
         changed_binding = replace(second_binding, collection_semantics="ordered_v1")
         return replace(base, role_labelled_bindings=(first_binding, changed_binding))
-    if change == "nested_upstream_projection":
+    if change == "upstream_bundle_digest":
         changed_member = replace(
             member,
-            upstream_request_projection=replace(
-                member.upstream_request_projection,
-                address="subject-b",
-            ),
+            upstream_request_bundle_digest="d" * 64,
         )
         changed_binding = replace(second_binding, members=(changed_member,))
         return replace(base, role_labelled_bindings=(first_binding, changed_binding))
@@ -456,7 +514,7 @@ def _identity_matrix_projection(change: str) -> RequestBundleProjectionV1:
         ("source_extension", False),
         ("manifest_digest", False),
         ("collection_semantics", False),
-        ("nested_upstream_projection", False),
+        ("upstream_bundle_digest", False),
         ("settings", False),
         ("determinism", False),
         ("output_name", False),
@@ -474,7 +532,7 @@ def test_projection_identity_inclusion_and_exclusion_matrix(
     baseline = replace(baseline, canonical_parameters={"alpha": 1, "beta": 2})
     variant = _identity_matrix_projection(change)
 
-    assert (canonical_projection_json(baseline) == canonical_projection_json(variant)) is (
+    assert (_canonical_json(baseline) == _canonical_json(variant)) is (
         same_identity
     )
 
@@ -515,7 +573,7 @@ def test_projection_rejects_unknown_contract_versions(
             ),
         )
     with pytest.raises(ValidationError, match="contract_version must be 1"):
-        canonical_projection_json(projection)
+        _canonical_json(projection)
 
 
 @pytest.mark.parametrize(
@@ -543,7 +601,7 @@ def test_canonical_projection_rejects_non_json_parameter_values(
         parameters = {"labels": value}
 
     with pytest.raises(ValidationError, match=path.replace(".", r"\.")):
-        canonical_projection_json(_projection(canonical_parameters=parameters))
+        _canonical_json(_projection(canonical_parameters=parameters))
 
 
 def test_canonical_projection_rejects_invalid_result_affecting_setting() -> None:
@@ -556,7 +614,7 @@ def test_canonical_projection_rejects_invalid_result_affecting_setting() -> None
         ValidationError,
         match=r"result_affecting_settings\.locale",
     ):
-        canonical_projection_json(projection)
+        _canonical_json(projection)
 
 
 def test_projection_plan_resolves_registered_source_snapshot() -> None:
@@ -574,20 +632,24 @@ def test_projection_plan_resolves_registered_source_snapshot() -> None:
         upstream_states={},
     )
 
-    assert isinstance(state, RequestBundleProjectionV1)
-    assert state.output_contract.sibling_outputs == (
-        SiblingOutput("segmentation", ".nii.gz"),
-        SiblingOutput("volumes", ".csv"),
-    )
-    assert state.role_labelled_bindings == (
-        RegisteredSourceBinding(
-            role="t1w",
-            source_coordinate=coordinate,
-            registered_content_digest="b" * 64,
-            registered_file_size=456,
-            declared_extension=".nii.gz",
-        ),
-    )
+    assert isinstance(state, ResolvedRequestBundleProjectionV1)
+    payload = json.loads(state.canonical_json)
+    assert payload["output_contract"]["sibling_outputs"] == [
+        {"declared_extension": ".nii.gz", "output_name": "segmentation"},
+        {"declared_extension": ".csv", "output_name": "volumes"},
+    ]
+    assert payload["role_labelled_bindings"] == [
+        {
+            "role": "t1w",
+            "source_coordinate": {
+                "namespace": "clms",
+                "path": "data/aac_027_m00/t1w.nii.gz",
+            },
+            "registered_content_digest": "b" * 64,
+            "registered_file_size": 456,
+            "declared_extension": ".nii.gz",
+        }
+    ]
 
 
 def test_projection_plan_reports_missing_sources_in_deterministic_order() -> None:
@@ -641,8 +703,8 @@ def test_projection_plan_resolves_collection_members(
     second_coordinate = RequestedOutputCoordinate(
         "clms", "source_import", "image", "subject-b"
     )
-    first_projection = _projection(address="subject-a")
-    second_projection = _projection(address="subject-b")
+    first_projection = _resolved(_projection(address="subject-a"))
+    second_projection = _resolved(_projection(address="subject-b"))
 
     state = resolve_request_bundle_projection_plan(
         _projection_plan(
@@ -660,26 +722,17 @@ def test_projection_plan_resolves_collection_members(
         },
     )
 
-    assert isinstance(state, RequestBundleProjectionV1)
-    assert state.role_labelled_bindings == (
-        CollectionBinding(
-            role="images",
-            collection_semantics="coordinate_set_v1",
-            manifest_digest=manifest_digest,
-            members=(
-                UpstreamRequestedOutputBinding(
-                    role="images",
-                    upstream_request_projection=second_projection,
-                    output_name="image",
-                ),
-                UpstreamRequestedOutputBinding(
-                    role="images",
-                    upstream_request_projection=first_projection,
-                    output_name="image",
-                ),
-            ),
-        ),
-    )
+    assert isinstance(state, ResolvedRequestBundleProjectionV1)
+    members = json.loads(state.canonical_json)["role_labelled_bindings"][0][
+        "members"
+    ]
+    assert {
+        (member["upstream_request_bundle_digest"], member["output_name"])
+        for member in members
+    } == {
+        (first_projection.request_bundle_digest, "image"),
+        (second_projection.request_bundle_digest, "image"),
+    }
 
 
 def test_projection_plan_rejects_unavailable_upstream_coordinate() -> None:
@@ -699,4 +752,58 @@ def test_projection_plan_rejects_unavailable_upstream_coordinate() -> None:
 
 def test_projection_plan_is_not_a_canonical_projection() -> None:
     with pytest.raises(ValidationError, match="RequestBundleProjectionV1"):
-        canonical_projection_json(_projection_plan())  # type: ignore[arg-type]
+        canonicalize_request_bundle_projection(
+            _projection_plan()  # type: ignore[arg-type]
+        )
+
+
+def test_direct_projection_size_does_not_grow_with_lineage_depth() -> None:
+    upstream = _resolved(_projection(address="root"))
+    direct_sizes: list[int] = []
+
+    for depth in range(1, 21):
+        projection = _projection(
+            address=f"level-{depth}",
+            role_labelled_bindings=(
+                UpstreamRequestedOutputBinding(
+                    role="image",
+                    upstream_request_bundle_digest=upstream.request_bundle_digest,
+                    output_name="segmentation",
+                ),
+            ),
+        )
+        upstream = _resolved(projection)
+        direct_sizes.append(len(upstream.canonical_json.encode("utf-8")))
+
+    assert max(direct_sizes) - min(direct_sizes) < 10
+
+
+def test_collection_projection_size_grows_linearly_with_direct_fan_in() -> None:
+    def size_for(member_count: int) -> int:
+        members = tuple(
+            UpstreamRequestedOutputBinding(
+                role="images",
+                upstream_request_bundle_digest=f"{index:064x}",
+                output_name="image",
+            )
+            for index in range(member_count)
+        )
+        return len(
+            _canonical_json(
+                _projection(
+                    role_labelled_bindings=(
+                        CollectionBinding(
+                            role="images",
+                            collection_semantics="coordinate_set_v1",
+                            manifest_digest=None,
+                            members=members,
+                        ),
+                    )
+                )
+            ).encode("utf-8")
+        )
+
+    one_member = size_for(1)
+    ten_members = size_for(10)
+    twenty_members = size_for(20)
+    assert twenty_members - ten_members == 10 * (ten_members - one_member) // 9

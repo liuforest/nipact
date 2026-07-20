@@ -21,7 +21,7 @@ from nipact.execution import (
     execute_run_plan,
 )
 from nipact.hashing import sha256_file_digest, short_hash
-from nipact.projection import RequestBundleProjectionV1, canonical_projection_json
+from nipact.projection import ResolvedRequestBundleProjectionV1
 from nipact.registry import EnvironmentObservationV1
 from nipact.runtime import run_job
 from nipact.trace import build_trace_graph_for_workflow_coordinate
@@ -935,8 +935,11 @@ def test_multi_output_run_registers_sibling_outputs_and_exact_dependency(
         step_name="qc_echo",
     )
     for reused_output in equivalent_plan.reused_outputs:
-        assert isinstance(reused_output.projection_state, RequestBundleProjectionV1)
-        assert canonical_projection_json(reused_output.projection_state) in (
+        assert isinstance(
+            reused_output.projection_state,
+            ResolvedRequestBundleProjectionV1,
+        )
+        assert reused_output.projection_state.canonical_json in (
             source_projection_by_address[reused_output.address]
         )
 

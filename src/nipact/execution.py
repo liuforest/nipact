@@ -27,14 +27,13 @@ from .projection import (
     OutputContract,
     RequestBundleProjectionPlanV1,
     RequestBundleProjectionState,
-    RequestBundleProjectionV1,
+    ResolvedRequestBundleProjectionV1,
     RequestedOutputCoordinate,
     SiblingOutput,
     SourceBindingPlan,
     SourceCoordinate,
     StepContract,
     UpstreamRequestedOutputBindingPlan,
-    canonical_projection_json,
     resolve_request_bundle_projection_plan,
 )
 from .registry import (
@@ -1153,12 +1152,15 @@ def _reused_projection_seeds(
         )
         if requested_output not in required_coordinates:
             continue
-        if not isinstance(output_ref.projection_state, RequestBundleProjectionV1):
+        if not isinstance(
+            output_ref.projection_state,
+            ResolvedRequestBundleProjectionV1,
+        ):
             raise ValidationError("reused output has an unresolved request projection")
         seeds.append(
             ReusedProjectionSeed(
                 requested_output=requested_output,
-                projection=output_ref.projection_state,
+                resolved_projection=output_ref.projection_state,
             )
         )
     if {seed.requested_output for seed in seeds} != required_coordinates:
@@ -1533,7 +1535,7 @@ def _build_jobs(
                 ] = projection_state
             reused_refs: dict[str, ReusedRunJobOutputRef] | None = None
             if (
-                isinstance(projection_state, RequestBundleProjectionV1)
+                isinstance(projection_state, ResolvedRequestBundleProjectionV1)
                 and not job_keys.intersection(selected_keys)
             ):
                 reused_refs = _reusable_output_refs_for_job(
@@ -1733,15 +1735,14 @@ def _reusable_output_refs_for_job(
     loaded: LoadedWorkflowProject,
     job: RunJob,
 ) -> dict[str, ReusedRunJobOutputRef] | None:
-    if not isinstance(job.projection_state, RequestBundleProjectionV1):
+    if not isinstance(job.projection_state, ResolvedRequestBundleProjectionV1):
         return None
     registry_path = loaded.runtime_root / REGISTRY_DB_PATH
     request = ReusableArtifactBundleRequest(
         context=loaded.context,
         step_name=job.step_name,
         address=job.address,
-        identity_contract_version=job.projection_state.identity_contract_version,
-        request_bundle_projection_json=canonical_projection_json(job.projection_state),
+        resolved_projection=job.projection_state,
         sibling_outputs=tuple(
             sorted(
                 (output_name, output.declared_extension)

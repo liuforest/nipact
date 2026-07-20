@@ -20,10 +20,9 @@ from .projection import (
     IDENTITY_CONTRACT_VERSION,
     RegisteredSourceSnapshot,
     RequestBundleProjectionPlanV1,
-    RequestBundleProjectionV1,
+    ResolvedRequestBundleProjectionV1,
     RequestedOutputCoordinate,
     SourceCoordinate,
-    canonical_projection_json,
     resolve_request_bundle_projection_plan,
 )
 
@@ -96,7 +95,7 @@ class RetainedJobProjectionRecipe:
 @dataclass(frozen=True)
 class ReusedProjectionSeed:
     requested_output: RequestedOutputCoordinate
-    projection: RequestBundleProjectionV1
+    resolved_projection: ResolvedRequestBundleProjectionV1
 
 
 @dataclass(frozen=True)
@@ -198,8 +197,7 @@ class ReusableArtifactBundleRequest:
     context: str
     step_name: str
     address: str
-    identity_contract_version: int
-    request_bundle_projection_json: str
+    resolved_projection: ResolvedRequestBundleProjectionV1
     sibling_outputs: tuple[tuple[str, str], ...]
     input_records: tuple[ArtifactInputRow, ...]
 
@@ -1256,8 +1254,8 @@ def resolve_reusable_artifact_bundle(
                     request.context,
                     request.step_name,
                     request.address,
-                    request.identity_contract_version,
-                    request.request_bundle_projection_json,
+                    request.resolved_projection.identity_contract_version,
+                    request.resolved_projection.canonical_json,
                 ),
             ).fetchall()
             candidates_by_run: dict[int, dict[str, ReusableArtifactCandidate]] = {}
@@ -2277,26 +2275,24 @@ def _finalize_retained_job_projections(
     reused_projection_seeds: tuple[ReusedProjectionSeed, ...],
 ) -> dict[tuple[str, str], str]:
     source_snapshots = _read_registered_source_snapshots_conn(conn, context=context)
-    upstream_states: dict[RequestedOutputCoordinate, RequestBundleProjectionV1] = {}
+    upstream_states: dict[
+        RequestedOutputCoordinate,
+        ResolvedRequestBundleProjectionV1,
+    ] = {}
     for seed in reused_projection_seeds:
         if seed.requested_output.namespace != context:
             raise ValidationError("reused projection seed belongs to another context")
         if seed.requested_output in upstream_states:
             raise ValidationError("reused projection seed coordinate is duplicated")
-        canonical_projection_json(seed.projection)
-        sibling_names = {
-            sibling.output_name
-            for sibling in seed.projection.output_contract.sibling_outputs
-        }
         if (
-            seed.projection.namespace != context
-            or seed.projection.address != seed.requested_output.address
-            or seed.projection.step_contract.step_contract_id
-            != seed.requested_output.step_name
-            or seed.requested_output.output_name not in sibling_names
+            seed.resolved_projection.identity_contract_version
+            != IDENTITY_CONTRACT_VERSION
+            or not is_valid_digest(seed.resolved_projection.request_bundle_digest)
+            or sha256_digest(seed.resolved_projection.canonical_json.encode("utf-8"))
+            != seed.resolved_projection.request_bundle_digest
         ):
-            raise ValidationError("reused projection seed does not match its coordinate")
-        upstream_states[seed.requested_output] = seed.projection
+            raise ValidationError("reused projection seed identity is invalid")
+        upstream_states[seed.requested_output] = seed.resolved_projection
 
     artifact_outputs_by_job: dict[tuple[str, str], set[str]] = {}
     for row in artifact_rows:
@@ -2328,15 +2324,17 @@ def _finalize_retained_job_projections(
             raise ValidationError(
                 "retained projection recipe does not match complete sibling artifacts"
             )
-        projection = resolve_request_bundle_projection_plan(
+        projection_state = resolve_request_bundle_projection_plan(
             recipe.projection_plan,
             source_snapshots=source_snapshots,
             upstream_states=upstream_states,
         )
-        if not isinstance(projection, RequestBundleProjectionV1):
+        if not isinstance(
+            projection_state,
+            ResolvedRequestBundleProjectionV1,
+        ):
             raise ValidationError("retained projection remained unresolved after source upsert")
-        projection_json = canonical_projection_json(projection)
-        finalized[job_key] = projection_json
+        finalized[job_key] = projection_state.canonical_json
         for output_name in recipe.output_names:
             coordinate = RequestedOutputCoordinate(
                 namespace=context,
@@ -2346,7 +2344,7 @@ def _finalize_retained_job_projections(
             )
             if coordinate in upstream_states:
                 raise ValidationError("retained requested-output coordinate is duplicated")
-            upstream_states[coordinate] = projection
+            upstream_states[coordinate] = projection_state
 
     if set(finalized) != set(artifact_outputs_by_job):
         raise ValidationError("retained artifact is missing its projection recipe")
@@ -2365,8 +2363,8 @@ def _reused_projection_identities(
         if seed.requested_output in identities:
             raise ValidationError("reused projection seed coordinate is duplicated")
         identities[seed.requested_output] = (
-            seed.projection.identity_contract_version,
-            canonical_projection_json(seed.projection),
+            seed.resolved_projection.identity_contract_version,
+            seed.resolved_projection.canonical_json,
         )
     return identities
 

@@ -10,6 +10,7 @@ from pathlib import PurePosixPath
 from typing import Any, TypeAlias
 
 from .errors import ValidationError
+from .hashing import is_valid_digest, sha256_digest
 
 IDENTITY_CONTRACT_VERSION = 1
 OUTPUT_CONTRACT_VERSION = 1
@@ -52,7 +53,7 @@ class RegisteredSourceBinding:
 @dataclass(frozen=True)
 class UpstreamRequestedOutputBinding:
     role: str
-    upstream_request_projection: RequestBundleProjectionV1
+    upstream_request_bundle_digest: str
     output_name: str
 
 
@@ -92,6 +93,13 @@ class RequestBundleProjectionV1:
     result_affecting_settings: dict[str, JsonValue]
     determinism_contract: str
     output_contract: OutputContract
+
+
+@dataclass(frozen=True)
+class ResolvedRequestBundleProjectionV1:
+    identity_contract_version: int
+    canonical_json: str
+    request_bundle_digest: str
 
 
 @dataclass(frozen=True)
@@ -150,7 +158,7 @@ class UnresolvedRequestBundleProjection:
 
 
 RequestBundleProjectionState: TypeAlias = (
-    RequestBundleProjectionV1 | UnresolvedRequestBundleProjection
+    ResolvedRequestBundleProjectionV1 | UnresolvedRequestBundleProjection
 )
 
 
@@ -197,7 +205,9 @@ def resolve_request_bundle_projection_plan(
             resolved_bindings.append(
                 UpstreamRequestedOutputBinding(
                     role=binding_plan.role,
-                    upstream_request_projection=upstream_state,
+                    upstream_request_bundle_digest=(
+                        upstream_state.request_bundle_digest
+                    ),
                     output_name=binding_plan.requested_output.output_name,
                 )
             )
@@ -216,7 +226,9 @@ def resolve_request_bundle_projection_plan(
                 resolved_members.append(
                     UpstreamRequestedOutputBinding(
                         role=binding_plan.role,
-                        upstream_request_projection=upstream_state,
+                        upstream_request_bundle_digest=(
+                            upstream_state.request_bundle_digest
+                        ),
                         output_name=requested_output.output_name,
                     )
                 )
@@ -251,8 +263,7 @@ def resolve_request_bundle_projection_plan(
         determinism_contract=plan.determinism_contract,
         output_contract=plan.output_contract,
     )
-    canonical_projection_json(projection)
-    return projection
+    return canonicalize_request_bundle_projection(projection)
 
 
 def _required_upstream_state(
@@ -282,12 +293,19 @@ def _source_coordinate_sort_key(coordinate: SourceCoordinate) -> tuple[str, str]
     return coordinate.namespace, coordinate.path
 
 
-def canonical_projection_json(projection: RequestBundleProjectionV1) -> str:
-    """Serialize one V1 request projection to its canonical JSON form."""
+def canonicalize_request_bundle_projection(
+    projection: RequestBundleProjectionV1,
+) -> ResolvedRequestBundleProjectionV1:
+    """Validate, serialize, and identify one V1 request projection."""
     if not isinstance(projection, RequestBundleProjectionV1):
         raise ValidationError("projection must be a RequestBundleProjectionV1")
     payload = _projection_payload(projection, path="projection")
-    return _dump_json(payload)
+    canonical_json = _dump_json(payload)
+    return ResolvedRequestBundleProjectionV1(
+        identity_contract_version=projection.identity_contract_version,
+        canonical_json=canonical_json,
+        request_bundle_digest=sha256_digest(canonical_json.encode("utf-8")),
+    )
 
 
 def _projection_payload(
@@ -410,7 +428,7 @@ def _registered_source_payload(
             ),
             "path": source_path,
         },
-        "registered_content_digest": _require_string(
+        "registered_content_digest": _require_digest(
             binding.registered_content_digest,
             path=f"{path}.registered_content_digest",
         ),
@@ -431,16 +449,11 @@ def _upstream_output_payload(
         raise ValidationError(
             f"{path} must be an UpstreamRequestedOutputBinding"
         )
-    if not isinstance(binding.upstream_request_projection, RequestBundleProjectionV1):
-        raise ValidationError(
-            f"{path}.upstream_request_projection must be a "
-            "RequestBundleProjectionV1"
-        )
     return {
         "role": _require_string(binding.role, path=f"{path}.role"),
-        "upstream_request_projection": _projection_payload(
-            binding.upstream_request_projection,
-            path=f"{path}.upstream_request_projection",
+        "upstream_request_bundle_digest": _require_digest(
+            binding.upstream_request_bundle_digest,
+            path=f"{path}.upstream_request_bundle_digest",
         ),
         "output_name": _require_string(
             binding.output_name,
@@ -456,11 +469,9 @@ def _collection_payload(binding: CollectionBinding, *, path: str) -> dict[str, A
         for index, member in enumerate(binding.members)
     ]
     member_identities = [
-        _dump_json(
-            {
-                "upstream_request_projection": member["upstream_request_projection"],
-                "output_name": member["output_name"],
-            }
+        (
+            member["upstream_request_bundle_digest"],
+            member["output_name"],
         )
         for member in members
     ]
@@ -469,7 +480,7 @@ def _collection_payload(binding: CollectionBinding, *, path: str) -> dict[str, A
     members.sort(key=_requested_output_sort_key)
     manifest_digest = binding.manifest_digest
     if manifest_digest is not None:
-        manifest_digest = _require_string(
+        manifest_digest = _require_digest(
             manifest_digest,
             path=f"{path}.manifest_digest",
         )
@@ -537,7 +548,7 @@ def _binding_sort_key(payload: dict[str, Any]) -> tuple[str, str, str]:
 def _binding_kind(payload: dict[str, Any]) -> str:
     if "source_coordinate" in payload:
         return "registered_source"
-    if "upstream_request_projection" in payload:
+    if "upstream_request_bundle_digest" in payload:
         return "upstream_requested_output"
     if "collection_semantics" in payload:
         return "collection"
@@ -545,9 +556,10 @@ def _binding_kind(payload: dict[str, Any]) -> str:
 
 
 def _requested_output_sort_key(payload: dict[str, Any]) -> tuple[str, str]:
-    requested_output_identity = dict(payload)
-    role = requested_output_identity.pop("role")
-    return _dump_json(requested_output_identity), role
+    return (
+        payload["upstream_request_bundle_digest"],
+        payload["output_name"],
+    )
 
 
 def _json_value(value: Any, *, path: str) -> Any:
@@ -580,6 +592,14 @@ def _json_value(value: Any, *, path: str) -> Any:
 def _require_string(value: Any, *, path: str) -> str:
     if type(value) is not str or not value:
         raise ValidationError(f"{path} must be a non-empty string")
+    return value
+
+
+def _require_digest(value: Any, *, path: str) -> str:
+    if not is_valid_digest(value):
+        raise ValidationError(
+            f"{path} must be a lowercase 64-character hexadecimal SHA-256 digest"
+        )
     return value
 
 
