@@ -747,6 +747,14 @@ def record_workflow_run(
     ):
         raise ValidationError("selected-output resolution belongs to another run scope")
     if any(
+        row.step_name != selected_step_name
+        or row.output_name != selected_output_name
+        for row in selected_resolution_rows
+    ):
+        raise ValidationError(
+            "selected-output resolution does not match selected output"
+        )
+    if any(
         intent.row.context != context or intent.row.workflow_name != workflow_name
         for intent in membership_rows
     ):
@@ -763,6 +771,10 @@ def record_workflow_run(
     ]
     if len(membership_coordinates) != len(set(membership_coordinates)):
         raise ValidationError("membership intent coordinate is duplicated")
+    _validate_selected_resolution_memberships(
+        selected_resolution_rows,
+        membership_rows,
+    )
     now = _utc_now()
     try:
         with _connect(path) as conn:
@@ -793,14 +805,6 @@ def record_workflow_run(
                 ),
                 created_at=now,
             )
-            if any(
-                row.step_name != selected_step_name
-                or row.output_name != selected_output_name
-                for row in selected_resolution_rows
-            ):
-                raise ValidationError(
-                    "selected-output resolution does not match selected output"
-                )
             _upsert_source_artifacts_for_inputs(
                 conn,
                 context=context,
@@ -883,6 +887,64 @@ def record_workflow_run(
     except sqlite3.Error as exc:
         raise ValidationError(f"registry.db is malformed: {exc}") from exc
     return len(artifact_rows)
+
+
+def _validate_selected_resolution_memberships(
+    resolutions: tuple[SelectedOutputResolutionIntent, ...],
+    memberships: tuple[MembershipIntent, ...],
+) -> None:
+    """Require this invocation's selected resolutions to match its memberships."""
+    memberships_by_coordinate = {
+        (
+            intent.row.context,
+            intent.row.workflow_name,
+            intent.row.step_name,
+            intent.row.output_name,
+            intent.row.address,
+        ): intent
+        for intent in memberships
+    }
+    seen: set[tuple[str, str, str, str, str]] = set()
+    for resolution in resolutions:
+        coordinate = (
+            resolution.context,
+            resolution.workflow_name,
+            resolution.step_name,
+            resolution.output_name,
+            resolution.address,
+        )
+        if coordinate in seen:
+            raise ValidationError("selected-output resolution coordinate is duplicated")
+        seen.add(coordinate)
+        membership = memberships_by_coordinate.get(coordinate)
+        if resolution.outcome == "generated":
+            if resolution.existing_artifact_id is not None:
+                raise ValidationError(
+                    "generated selected-output resolution cannot name an existing artifact"
+                )
+            if membership is None or membership.existing_artifact_id is not None:
+                raise ValidationError(
+                    "generated selected-output resolution requires a fresh membership"
+                )
+        elif resolution.outcome == "reused":
+            if resolution.existing_artifact_id is None:
+                raise ValidationError(
+                    "reused selected-output resolution is missing its artifact"
+                )
+            if (
+                membership is None
+                or membership.existing_artifact_id != resolution.existing_artifact_id
+            ):
+                raise ValidationError(
+                    "reused selected-output resolution requires the same existing membership"
+                )
+        elif resolution.outcome is None:
+            if membership is not None:
+                raise ValidationError(
+                    "unresolved selected output cannot have a membership intent"
+                )
+        else:
+            raise ValidationError("selected-output resolution outcome is invalid")
 
 
 def read_published_outputs(

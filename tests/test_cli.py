@@ -283,8 +283,10 @@ def test_workflow_run_command_executes_step(
             status_callback(event)
         return RunOutcome(
             published_count=1,
+            selected_generated_count=1,
+            selected_reused_count=0,
             failed_jobs=(),
-            all_selected_published=True,
+            all_selected_resolved=True,
         )
 
     monkeypatch.setattr("nipact.execution.execute_run_plan", publish_stub)
@@ -377,8 +379,10 @@ def test_workflow_run_accepts_address_and_reports_targeted_summary(
         captured_plans.append(run_plan)
         return RunOutcome(
             published_count=1,
+            selected_generated_count=1,
+            selected_reused_count=0,
             failed_jobs=(),
-            all_selected_published=True,
+            all_selected_resolved=True,
         )
 
     monkeypatch.setattr("nipact.execution.execute_run_plan", publish_stub)
@@ -524,8 +528,10 @@ def test_workflow_run_targeted_summary_keeps_population_job_count(
     def publish_stub(*_args: object, **_kwargs: object) -> RunOutcome:
         return RunOutcome(
             published_count=1,
+            selected_generated_count=1,
+            selected_reused_count=0,
             failed_jobs=(),
-            all_selected_published=True,
+            all_selected_resolved=True,
         )
 
     monkeypatch.setattr("nipact.execution.execute_run_plan", publish_stub)
@@ -583,8 +589,10 @@ def test_workflow_run_partial_publish_exits_non_zero(
     def partial_stub(*_args: object, **_kwargs: object) -> RunOutcome:
         return RunOutcome(
             published_count=2,
+            selected_generated_count=2,
+            selected_reused_count=0,
             failed_jobs=(("color_sector_analysis", "sub_003", "missing staged output"),),
-            all_selected_published=False,
+            all_selected_resolved=False,
         )
 
     monkeypatch.setattr("nipact.execution.execute_run_plan", partial_stub)

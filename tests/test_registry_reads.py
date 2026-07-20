@@ -75,7 +75,7 @@ def _init_demo(
 def _write_all_staged_outputs(run_plan: object) -> None:
     selected_keys = {
         (job.step_name, job.output_name, job.address)
-        for job in run_plan.selected_jobs
+        for job in run_plan.selected_fresh_jobs
     }
     for job in run_plan.jobs:
         job.staging_path.parent.mkdir(parents=True, exist_ok=True)
@@ -760,6 +760,62 @@ def test_membership_intent_can_reference_one_existing_artifact_more_than_once(
                 """,
                 (path, digest, output_hash),
             )
+
+
+def test_selected_resolution_membership_invariant_covers_all_outcomes() -> None:
+    row = PublishedOutputRow(
+        context="colors",
+        workflow_name="base",
+        step_name="color_sector_analysis",
+        output_name="sector_counts",
+        address="init",
+        path="outputs/result.json",
+        output_digest="a" * 64,
+        output_hash="a" * 16,
+    )
+
+    def resolution(
+        outcome: str | None,
+        artifact_id: int | None = None,
+    ) -> SelectedOutputResolutionIntent:
+        return SelectedOutputResolutionIntent(
+            context=row.context,
+            workflow_name=row.workflow_name,
+            step_name=row.step_name,
+            output_name=row.output_name,
+            address=row.address,
+            outcome=outcome,
+            existing_artifact_id=artifact_id,
+        )
+
+    registry._validate_selected_resolution_memberships(
+        (resolution("generated"),),
+        (MembershipIntent(row=row),),
+    )
+    registry._validate_selected_resolution_memberships(
+        (resolution("reused", 7),),
+        (MembershipIntent(row=row, existing_artifact_id=7),),
+    )
+    registry._validate_selected_resolution_memberships(
+        (resolution(None),),
+        (),
+    )
+
+    with pytest.raises(ValidationError, match="requires a fresh membership"):
+        registry._validate_selected_resolution_memberships(
+            (resolution("generated"),),
+            (MembershipIntent(row=row, existing_artifact_id=7),),
+        )
+    with pytest.raises(ValidationError, match="same existing membership"):
+        registry._validate_selected_resolution_memberships(
+            (resolution("reused", 7),),
+            (MembershipIntent(row=row, existing_artifact_id=8),),
+        )
+    with pytest.raises(ValidationError, match="cannot have a membership"):
+        registry._validate_selected_resolution_memberships(
+            (resolution(None),),
+            (MembershipIntent(row=row),),
+        )
 
 
 def test_existing_membership_rejects_artifact_hash_inconsistent_with_digest(

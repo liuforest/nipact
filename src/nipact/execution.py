@@ -230,6 +230,49 @@ class ReusedRunJobOutputRef:
 
 
 @dataclass(frozen=True)
+class SelectedReusedBundleRef:
+    """Prospective reused resolution for one user-selected output coordinate."""
+
+    step_name: str
+    output_name: str
+    address: str
+    reuse_request: ReusableArtifactBundleRequest
+    planned_sibling_artifact_ids: tuple[tuple[str, int], ...]
+
+    def __post_init__(self) -> None:
+        if (
+            self.step_name != self.reuse_request.step_name
+            or self.address != self.reuse_request.address
+        ):
+            raise ValidationError(
+                "selected reused coordinate does not match the request bundle"
+            )
+        if self.planned_sibling_artifact_ids != tuple(
+            sorted(self.planned_sibling_artifact_ids)
+        ):
+            raise ValidationError(
+                "selected reused sibling artifacts must be ordered by output name"
+            )
+        output_names = tuple(
+            name for name, _artifact_id in self.planned_sibling_artifact_ids
+        )
+        if output_names != tuple(sorted(dict(self.reuse_request.sibling_outputs))):
+            raise ValidationError(
+                "selected reused sibling artifacts do not match the request bundle"
+            )
+        artifact_ids = tuple(
+            artifact_id
+            for _output_name, artifact_id in self.planned_sibling_artifact_ids
+        )
+        if (
+            self.output_name not in output_names
+            or any(artifact_id <= 0 for artifact_id in artifact_ids)
+            or len(artifact_ids) != len(set(artifact_ids))
+        ):
+            raise ValidationError("selected reused bundle reference is invalid")
+
+
+@dataclass(frozen=True)
 class RunPlan:
     project_root: Path
     runtime_root: Path
@@ -244,13 +287,17 @@ class RunPlan:
     manifest_bindings: tuple[WorkflowPlanManifestBinding, ...]
     published_outputs: tuple[PublishedOutputSpec, ...]
     jobs: tuple[RunJob, ...]
-    selected_jobs: tuple[RunJob, ...]
-    selected_output_refs: tuple[RunJobOutputRef, ...]
+    selected_fresh_output_refs: tuple[RunJobOutputRef, ...]
+    selected_reused_output_refs: tuple[SelectedReusedBundleRef, ...]
     reused_outputs: tuple[ReusedRunJobOutputRef, ...]
     reused_validation_outputs: tuple[ReusedRunJobOutputRef, ...]
     # Reporting statistic: fresh jobs in the selected targets' reachable
     # closure. jobs stays population-wide; this is the executed forecast.
     reachable_job_count: int
+
+    @property
+    def selected_fresh_jobs(self) -> tuple[RunJob, ...]:
+        return tuple(output_ref.job for output_ref in self.selected_fresh_output_refs)
 
 
 @dataclass(frozen=True)
@@ -258,8 +305,10 @@ class RunOutcome:
     """Result of a best-effort job-atomic run."""
 
     published_count: int
+    selected_generated_count: int
+    selected_reused_count: int
     failed_jobs: tuple[tuple[str, str, str], ...]  # (step, address, coarse reason)
-    all_selected_published: bool
+    all_selected_resolved: bool
 
 
 def build_run_plan(
@@ -313,12 +362,17 @@ def build_run_plan(
         selected_addresses=addresses,
     )
     output_refs_by_key = _output_refs_by_key(jobs)
-    selected_output_refs = tuple(
+    selected_fresh_output_refs = tuple(
         output_refs_by_key[(selected_step.step_name, selected_output.name, address)]
         for address in addresses
     )
-    selected_jobs = tuple(
-        output_ref.job for output_ref in selected_output_refs
+    selected_reused_output_refs: tuple[SelectedReusedBundleRef, ...] = ()
+    _validate_selected_output_partition(
+        selected_step_name=selected_step.step_name,
+        selected_output_name=selected_output.name,
+        selected_addresses=addresses,
+        selected_fresh_output_refs=selected_fresh_output_refs,
+        selected_reused_output_refs=selected_reused_output_refs,
     )
     # Hydration is scoped to the selected targets' reachable closure: a reused
     # registry artifact is retained only when a reachable fresh job consumes it.
@@ -326,7 +380,7 @@ def build_run_plan(
     # cohort ancestor can pull sibling-entity reuse back into scope.
     reachable_job_ids = _reachable_job_ids_for_outputs(
         jobs=jobs,
-        selected_output_refs=selected_output_refs,
+        selected_output_refs=selected_fresh_output_refs,
     )
     reused_outputs = _used_reused_outputs(
         jobs=tuple(job for job in jobs if job.job_id in reachable_job_ids),
@@ -335,6 +389,7 @@ def build_run_plan(
     reused_validation_outputs = _reused_validation_outputs(
         jobs=tuple(job for job in jobs if job.job_id in reachable_job_ids),
         reused_outputs_by_artifact=reused_outputs_by_artifact,
+        selected_reused_output_refs=selected_reused_output_refs,
     )
     published_outputs = _published_output_specs(
         loaded=loaded,
@@ -356,12 +411,42 @@ def build_run_plan(
         manifest_bindings=plan.manifest_bindings,
         published_outputs=published_outputs,
         jobs=jobs,
-        selected_jobs=selected_jobs,
-        selected_output_refs=selected_output_refs,
+        selected_fresh_output_refs=selected_fresh_output_refs,
+        selected_reused_output_refs=selected_reused_output_refs,
         reused_outputs=reused_outputs,
         reused_validation_outputs=reused_validation_outputs,
         reachable_job_count=len(reachable_job_ids),
     )
+
+
+def _validate_selected_output_partition(
+    *,
+    selected_step_name: str,
+    selected_output_name: str,
+    selected_addresses: tuple[str, ...],
+    selected_fresh_output_refs: tuple[RunJobOutputRef, ...],
+    selected_reused_output_refs: tuple[SelectedReusedBundleRef, ...],
+) -> None:
+    expected = {
+        (selected_step_name, selected_output_name, address)
+        for address in selected_addresses
+    }
+    fresh = [
+        (output_ref.step_name, output_ref.output_name, output_ref.address)
+        for output_ref in selected_fresh_output_refs
+    ]
+    reused = [
+        (output_ref.step_name, output_ref.output_name, output_ref.address)
+        for output_ref in selected_reused_output_refs
+    ]
+    if len(fresh) != len(set(fresh)) or len(reused) != len(set(reused)):
+        raise ValidationError("selected output coordinate is duplicated")
+    fresh_set = set(fresh)
+    reused_set = set(reused)
+    if fresh_set & reused_set:
+        raise ValidationError("selected output is both fresh and reused")
+    if fresh_set | reused_set != expected:
+        raise ValidationError("selected outputs do not cover the requested selection")
 
 
 def execute_run_plan(
@@ -404,8 +489,10 @@ def execute_run_plan(
             )
         return RunOutcome(
             published_count=0,
+            selected_generated_count=0,
+            selected_reused_count=0,
             failed_jobs=(),
-            all_selected_published=True,
+            all_selected_resolved=True,
         )
     _emit_status(status_callback, "publishing_outputs")
     published_results, publish_failures = _publish_run_outputs(run_plan)
@@ -439,6 +526,7 @@ def execute_run_plan(
         selected_resolution_intents = _selected_resolution_intents(
             run_plan,
             published_rows=published_rows,
+            actual_reused_artifacts=actual_reused_artifacts,
         )
         membership_intents = tuple(
             MembershipIntent(row=row) for row in published_rows
@@ -470,16 +558,20 @@ def execute_run_plan(
             membership_intents=membership_intents,
         )
         _emit_status(status_callback, "registry_updated")
-        selected_addresses = {
-            (job.step_name, job.address) for job in run_plan.selected_jobs
-        }
-        published_addresses = {
-            (result.row.step_name, result.row.address) for result in published_results
-        }
+        selected_generated_count = sum(
+            intent.outcome == "generated" for intent in selected_resolution_intents
+        )
+        selected_reused_count = sum(
+            intent.outcome == "reused" for intent in selected_resolution_intents
+        )
         return RunOutcome(
             published_count=published_count,
+            selected_generated_count=selected_generated_count,
+            selected_reused_count=selected_reused_count,
             failed_jobs=failed_jobs,
-            all_selected_published=selected_addresses <= published_addresses,
+            all_selected_resolved=all(
+                intent.outcome is not None for intent in selected_resolution_intents
+            ),
         )
     except Exception:
         _remove_published_output_files(run_plan.runtime_root, created_rows)
@@ -728,7 +820,8 @@ def _write_run_workspace(
     (run_plan.run_workspace / "logs").mkdir(exist_ok=True)
     _write_json_file(run_plan.run_workspace / "run_plan.json", _run_plan_payload(run_plan))
     selected_outputs = [
-        output_ref.staging_path_relative for output_ref in run_plan.selected_output_refs
+        output_ref.staging_path_relative
+        for output_ref in run_plan.selected_fresh_output_refs
     ]
     _write_text_file(
         run_plan.run_workspace / "selected_outputs.txt",
@@ -858,7 +951,8 @@ def _run_snakemake(run_plan: RunPlan, *, cores: int, dry_run: bool) -> int:
     if dry_run:
         command.append("--dry-run")
     command.extend(
-        output_ref.staging_path_relative for output_ref in run_plan.selected_output_refs
+        output_ref.staging_path_relative
+        for output_ref in run_plan.selected_fresh_output_refs
     )
     env = os.environ.copy()
     env.pop("SNAKEMAKE_PROFILE", None)
@@ -978,8 +1072,51 @@ def _run_plan_payload(run_plan: RunPlan) -> dict[str, Any]:
             }
             for job in run_plan.jobs
         },
-        "selected_outputs": [
-            output_ref.staging_path_relative for output_ref in run_plan.selected_output_refs
+        "selected_outputs": sorted(
+            (
+                {
+                    "step_name": output_ref.step_name,
+                    "output_name": output_ref.output_name,
+                    "address": output_ref.address,
+                }
+                for output_ref in (
+                    *run_plan.selected_fresh_output_refs,
+                    *run_plan.selected_reused_output_refs,
+                )
+            ),
+            key=lambda item: (
+                item["step_name"], item["output_name"], item["address"]
+            ),
+        ),
+        "selected_fresh_outputs": [
+            {
+                "step_name": output_ref.step_name,
+                "output_name": output_ref.output_name,
+                "address": output_ref.address,
+                "staging_path": output_ref.staging_path_relative,
+            }
+            for output_ref in sorted(
+                run_plan.selected_fresh_output_refs,
+                key=lambda value: (value.step_name, value.output_name, value.address),
+            )
+        ],
+        "selected_reused_outputs": [
+            {
+                "step_name": output_ref.step_name,
+                "output_name": output_ref.output_name,
+                "address": output_ref.address,
+                "request_bundle_digest": (
+                    output_ref.reuse_request.resolved_projection.request_bundle_digest
+                ),
+                "planned_sibling_artifacts": [
+                    {"output_name": output_name, "artifact_id": artifact_id}
+                    for output_name, artifact_id in output_ref.planned_sibling_artifact_ids
+                ],
+            }
+            for output_ref in sorted(
+                run_plan.selected_reused_output_refs,
+                key=lambda value: (value.step_name, value.output_name, value.address),
+            )
         ],
         "reused_outputs": [
             {
@@ -1037,7 +1174,7 @@ def _workflow_output_artifact_rows(
     published_jobs = {(row.step_name, row.address) for row in published_rows}
     selected_output_keys = {
         (output_ref.step_name, output_ref.output_name, output_ref.address)
-        for output_ref in run_plan.selected_output_refs
+        for output_ref in run_plan.selected_fresh_output_refs
     }
     reachable_job_ids = _reachable_job_ids(run_plan)
     rows: list[WorkflowOutputArtifactRow] = []
@@ -1207,6 +1344,11 @@ def _reused_membership_intents(
         if record.origin == "workflow_output"
         and record.registry_source_artifact_id is not None
     ]
+    pending.extend(
+        artifact_id
+        for selected_ref in run_plan.selected_reused_output_refs
+        for _output_name, artifact_id in selected_ref.planned_sibling_artifact_ids
+    )
     seen_requests: set[ReusableArtifactBundleRequest] = set()
     intents_by_coordinate: dict[tuple[str, str, str], MembershipIntent] = {}
     while pending:
@@ -1292,11 +1434,12 @@ def _selected_resolution_intents(
     run_plan: RunPlan,
     *,
     published_rows: tuple[PublishedOutputRow, ...],
+    actual_reused_artifacts: dict[int, ReusableArtifactCandidate],
 ) -> tuple[SelectedOutputResolutionIntent, ...]:
     published_keys = {
         (row.step_name, row.output_name, row.address) for row in published_rows
     }
-    return tuple(
+    fresh_intents = tuple(
         SelectedOutputResolutionIntent(
             context=run_plan.context,
             workflow_name=run_plan.workflow_name,
@@ -1314,7 +1457,44 @@ def _selected_resolution_intents(
                 else None
             ),
         )
-        for output_ref in run_plan.selected_output_refs
+        for output_ref in run_plan.selected_fresh_output_refs
+    )
+    reused_intents: list[SelectedOutputResolutionIntent] = []
+    for output_ref in run_plan.selected_reused_output_refs:
+        planned_ids = dict(output_ref.planned_sibling_artifact_ids)
+        try:
+            planned_artifact_id = planned_ids[output_ref.output_name]
+            actual_candidate = actual_reused_artifacts[planned_artifact_id]
+        except KeyError as exc:
+            raise ValidationError(
+                "selected reused output is missing its execution-time artifact"
+            ) from exc
+        if (
+            actual_candidate.step_name != output_ref.step_name
+            or actual_candidate.output_name != output_ref.output_name
+            or actual_candidate.address != output_ref.address
+        ):
+            raise ValidationError(
+                "selected reused artifact has the wrong requested coordinate"
+            )
+        reused_intents.append(
+            SelectedOutputResolutionIntent(
+                context=run_plan.context,
+                workflow_name=run_plan.workflow_name,
+                step_name=output_ref.step_name,
+                output_name=output_ref.output_name,
+                address=output_ref.address,
+                outcome="reused",
+                existing_artifact_id=actual_candidate.artifact_id,
+            )
+        )
+    return tuple(
+        sorted(
+            (*fresh_intents, *reused_intents),
+            key=lambda intent: (
+                intent.step_name, intent.output_name, intent.address
+            ),
+        )
     )
 
 
@@ -1330,7 +1510,7 @@ def _environment_observation() -> EnvironmentObservationV1:
 def _reachable_job_ids(run_plan: RunPlan) -> set[str]:
     return _reachable_job_ids_for_outputs(
         jobs=run_plan.jobs,
-        selected_output_refs=run_plan.selected_output_refs,
+        selected_output_refs=run_plan.selected_fresh_output_refs,
     )
 
 
@@ -1842,6 +2022,7 @@ def _reused_validation_outputs(
     *,
     jobs: tuple[RunJob, ...],
     reused_outputs_by_artifact: dict[tuple[str, str, str], ReusedRunJobOutputRef],
+    selected_reused_output_refs: tuple[SelectedReusedBundleRef, ...] = (),
 ) -> tuple[ReusedRunJobOutputRef, ...]:
     refs_by_id = {
         output_ref.source_artifact_id: output_ref
@@ -1853,6 +2034,11 @@ def _reused_validation_outputs(
         for record in job.input_records
         if record.registry_source_artifact_id is not None
     ]
+    pending.extend(
+        artifact_id
+        for selected_ref in selected_reused_output_refs
+        for _output_name, artifact_id in selected_ref.planned_sibling_artifact_ids
+    )
     seen_requests: set[ReusableArtifactBundleRequest] = set()
     validation_refs: list[ReusedRunJobOutputRef] = []
     while pending:

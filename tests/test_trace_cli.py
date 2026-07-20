@@ -50,7 +50,7 @@ def _init_demo(
 def _write_all_staged_outputs(run_plan: object) -> None:
     selected_keys = {
         (job.step_name, job.output_name, job.address)
-        for job in run_plan.selected_jobs
+        for job in run_plan.selected_fresh_jobs
     }
     for job in run_plan.jobs:
         job.staging_path.parent.mkdir(parents=True, exist_ok=True)
