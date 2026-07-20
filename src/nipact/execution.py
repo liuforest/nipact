@@ -51,6 +51,7 @@ from .registry import (
     SelectedOutputResolutionIntent,
     WorkflowOutputArtifactRow,
     record_workflow_run,
+    read_context_runtime_path,
     read_registered_source_snapshots,
     resolve_reusable_artifact_bundle,
 )
@@ -272,6 +273,12 @@ def build_run_plan(
 ) -> RunPlan:
     """Build the internal execution plan without running anything."""
     loaded = load_workflow_project(project_dir=project_dir, context=context)
+    registered_runtime_path = read_context_runtime_path(
+        loaded.runtime_root / REGISTRY_DB_PATH,
+        context=loaded.context,
+    )
+    if registered_runtime_path != str(loaded.runtime_root):
+        raise ValidationError("registry.db context runtime path is out of date")
     plan = compile_workflow_plan(
         loaded,
         workflow_name=workflow_name,

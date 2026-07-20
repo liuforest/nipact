@@ -3461,6 +3461,86 @@ def test_targeted_run_unaffected_by_same_size_corruption_outside_closure(
     assert c_payload == {"address": "sub_001", "value": "alpha-b-c"}
 
 
+def test_workflow_run_skips_exhaustive_validation_but_validate_remains_exhaustive(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    project_dir, runtime_dir, _log_path = _write_cache_project(
+        tmp_path,
+        monkeypatch,
+        entities=("sub_001", "sub_002"),
+    )
+    b_plan = build_run_plan(
+        project_dir=project_dir,
+        context="cache",
+        workflow_name="main",
+        step_name="b_transform",
+    )
+    assert execute_run_plan(b_plan, cores=1).published_count == len(
+        b_plan.published_outputs
+    )
+
+    unrelated_path = runtime_dir / _latest_registered_path(
+        runtime_dir,
+        step_name="b_transform",
+        output_name="b_out",
+        address="sub_002",
+    )
+    original = unrelated_path.read_bytes()
+    unrelated_path.write_bytes(b"#" + original[1:])
+
+    real_digest = execution_module.sha256_file_digest
+    hashed_paths: list[Path] = []
+
+    def recording_digest(path: Path) -> str:
+        hashed_paths.append(Path(path))
+        return real_digest(path)
+
+    monkeypatch.setattr(execution_module, "sha256_file_digest", recording_digest)
+    monkeypatch.setattr(registry_module, "sha256_file_digest", recording_digest)
+    capsys.readouterr()
+
+    assert (
+        main(
+            [
+                "workflow",
+                "run",
+                "--project-dir",
+                str(project_dir),
+                "--context",
+                "cache",
+                "--workflow",
+                "main",
+                "--step",
+                "c_transform",
+                "--address",
+                "sub_001",
+            ]
+        )
+        == 0
+    )
+    assert "PASS: workflow run" in capsys.readouterr().out
+    assert unrelated_path not in hashed_paths
+
+    hashed_paths.clear()
+    assert (
+        main(
+            [
+                "validate",
+                "--project-dir",
+                str(project_dir),
+                "--context",
+                "cache",
+            ]
+        )
+        == 1
+    )
+    captured = capsys.readouterr()
+    assert "published output artifact digest mismatch" in captured.err
+    assert unrelated_path in hashed_paths
+
+
 def test_targeted_plan_construction_still_fails_on_unrelated_missing_source(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
