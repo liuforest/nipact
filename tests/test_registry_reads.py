@@ -3,6 +3,7 @@ import os
 import sqlite3
 from contextlib import contextmanager
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -32,7 +33,7 @@ from nipact.registry import (
     read_registry_summary,
     resolve_registered_artifact_path,
 )
-from nipact.project_setup import validate_project
+from nipact.project_setup import ProjectSetupError, validate_project
 
 
 def _run_main_from(cwd: Path, argv: list[str]) -> int:
@@ -502,6 +503,163 @@ def test_project_validation_accepts_cross_workflow_membership_path(
     assert target_hashes == 1
 
 
+def test_accepted_artifact_validation_hashes_shared_occurrence_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = b"shared artifact\n"
+    digest = registry.sha256_digest(payload)
+    output_hash = digest[:16]
+    relative_path = (
+        f"outputs/colors/base/example/result/subject.{output_hash}.json"
+    )
+    artifact_path = tmp_path / relative_path
+    artifact_path.parent.mkdir(parents=True)
+    artifact_path.write_bytes(payload)
+    rows = [
+        (
+            artifact_id,
+            "colors",
+            "base",
+            "example",
+            "result",
+            "subject",
+            "workflow_output",
+            1,
+            relative_path,
+            relative_path,
+            digest,
+            output_hash,
+            len(payload),
+            ".json",
+        )
+        for artifact_id in (10, 11)
+    ]
+    loaded_project = SimpleNamespace(
+        steps={"example": SimpleNamespace(outputs={"result": SimpleNamespace(extension=".json")})}
+    )
+    hash_calls = 0
+    real_sha256_file_digest = registry.sha256_file_digest
+
+    def count_hashes(path: Path) -> str:
+        nonlocal hash_calls
+        hash_calls += 1
+        return real_sha256_file_digest(path)
+
+    monkeypatch.setattr(registry, "sha256_file_digest", count_hashes)
+    registry._validate_accepted_workflow_output_rows(
+        rows,
+        context="colors",
+        runtime_root=tmp_path,
+        loaded_workflow_project=loaded_project,
+        verified_occurrences=set(),
+    )
+
+    assert hash_calls == 1
+
+
+@pytest.mark.parametrize(
+    ("field_index", "bad_value", "message"),
+    [
+        (12, 999, "file size mismatch"),
+        (13, ".txt", "extension is invalid"),
+    ],
+)
+def test_accepted_artifact_validation_checks_size_and_extension(
+    tmp_path: Path,
+    field_index: int,
+    bad_value: object,
+    message: str,
+) -> None:
+    payload = b"artifact\n"
+    digest = registry.sha256_digest(payload)
+    output_hash = digest[:16]
+    relative_path = f"outputs/colors/base/example/result/subject.{output_hash}.json"
+    artifact_path = tmp_path / relative_path
+    artifact_path.parent.mkdir(parents=True)
+    artifact_path.write_bytes(payload)
+    row = list(
+        (
+            10,
+            "colors",
+            "base",
+            "example",
+            "result",
+            "subject",
+            "workflow_output",
+            1,
+            relative_path,
+            relative_path,
+            digest,
+            output_hash,
+            len(payload),
+            ".json",
+        )
+    )
+    row[field_index] = bad_value
+    loaded_project = SimpleNamespace(
+        steps={"example": SimpleNamespace(outputs={"result": SimpleNamespace(extension=".json")})}
+    )
+
+    with pytest.raises(ValidationError, match=message):
+        registry._validate_accepted_workflow_output_rows(
+            [tuple(row)],
+            context="colors",
+            runtime_root=tmp_path,
+            loaded_workflow_project=loaded_project,
+            verified_occurrences=set(),
+        )
+
+
+@pytest.mark.parametrize("artifact_state", ["intact", "missing", "corrupt"])
+def test_project_validation_covers_accepted_artifact_without_membership(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    artifact_state: str,
+) -> None:
+    project_dir, runtime_dir, run_plan = _successful_sector_run(
+        tmp_path,
+        capsys,
+        monkeypatch,
+    )
+    registry_path = runtime_dir / REGISTRY_DB_PATH
+    with sqlite3.connect(registry_path) as conn:
+        artifact_id, relative_path = conn.execute(
+            """
+            SELECT artifact_id, published_path
+            FROM artifacts
+            WHERE context = 'colors'
+              AND step_name = 'color_sector_analysis'
+              AND output_name = 'sector_counts'
+              AND address = 'init'
+              AND is_published = 1
+            """
+        ).fetchone()
+        conn.execute(
+            "DELETE FROM published_outputs WHERE artifact_id = ?",
+            (artifact_id,),
+        )
+
+    artifact_path = runtime_dir / relative_path
+    if artifact_state == "missing":
+        artifact_path.unlink()
+    elif artifact_state == "corrupt":
+        artifact_path.write_bytes(b"x" * artifact_path.stat().st_size)
+
+    if artifact_state == "intact":
+        result = validate_project(project_dir=project_dir, context="colors")
+        assert result.published_outputs == len(run_plan.published_outputs) - 1
+    else:
+        message = (
+            "missing published output artifact"
+            if artifact_state == "missing"
+            else "published output artifact digest mismatch"
+        )
+        with pytest.raises(ProjectSetupError, match=message):
+            validate_project(project_dir=project_dir, context="colors")
+
+
 def test_membership_intent_can_reference_one_existing_artifact_more_than_once(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
@@ -757,6 +915,42 @@ def test_registry_reads_reject_unknown_ids_runs_and_schema(
         list_upstream_dependencies(registry_path, artifact_id=999)
     with pytest.raises(ValidationError, match="unknown workflow run id"):
         list_run_manifest_bindings(registry_path, run_id=999)
+    with pytest.raises(ValidationError, match="unknown current published artifact"):
+        read_current_published_artifact(
+            registry_path,
+            context="colors",
+            workflow_name="base",
+            step_name="color_sector_analysis",
+            output_name="sector_counts",
+            address="init",
+        )
+
+
+def test_current_published_artifact_rejects_membership_hash_mismatch(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _project_dir, runtime_dir, _run_plan = _successful_sector_run(
+        tmp_path,
+        capsys,
+        monkeypatch,
+    )
+    registry_path = runtime_dir / REGISTRY_DB_PATH
+    with sqlite3.connect(registry_path) as conn:
+        conn.execute(
+            """
+            UPDATE published_outputs
+            SET output_hash = ?
+            WHERE context = 'colors'
+              AND workflow_name = 'base'
+              AND step_name = 'color_sector_analysis'
+              AND output_name = 'sector_counts'
+              AND address = 'init'
+            """,
+            ("f" * 16,),
+        )
+
     with pytest.raises(ValidationError, match="unknown current published artifact"):
         read_current_published_artifact(
             registry_path,

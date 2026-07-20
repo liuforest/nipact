@@ -325,6 +325,7 @@ def _validate_generic_prepared_project(
                 registry_db_path,
                 context=context,
                 runtime_root=runtime_root,
+                loaded_workflow_project=loaded_workflow_project,
             )
         except ValidationError as exc:
             raise ProjectSetupError(str(exc)) from exc

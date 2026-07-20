@@ -10,6 +10,7 @@ import nipact.registry as registry
 from nipact.cli import main
 from nipact.errors import ValidationError
 from nipact.execution import build_run_plan, execute_run_plan
+from nipact.gui.topology import build_observed_topology
 from nipact.registry import REGISTRY_DB_PATH, list_artifacts
 from nipact.trace import (
     build_trace_graph,
@@ -369,6 +370,77 @@ def test_trace_graph_by_workflow_coordinate_accepts_published_intermediate(
     )
     assert intermediate_node["is_published"] is True
     assert intermediate_node["is_selected_output"] is False
+
+
+def test_shared_membership_trace_and_gui_keep_generating_workflow_label(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _project_dir, runtime_dir, _run_plan = _successful_sector_run(
+        tmp_path,
+        capsys,
+        monkeypatch,
+    )
+    registry_path = runtime_dir / REGISTRY_DB_PATH
+    with sqlite3.connect(registry_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO published_outputs (
+                context, workflow_name, step_name, output_name, address, path,
+                output_digest, output_hash, artifact_id
+            )
+            SELECT context, 'red-qc-target', step_name, output_name, address,
+                   path, output_digest, output_hash, artifact_id
+            FROM published_outputs
+            WHERE context = 'colors'
+              AND workflow_name = 'base'
+              AND step_name = 'color_sector_analysis'
+              AND output_name = 'sector_counts'
+              AND address = 'init'
+            """
+        )
+        membership_count, artifact_count = conn.execute(
+            """
+            SELECT COUNT(*), COUNT(DISTINCT artifact_id)
+            FROM published_outputs
+            WHERE context = 'colors'
+              AND step_name = 'color_sector_analysis'
+              AND output_name = 'sector_counts'
+              AND address = 'init'
+            """
+        ).fetchone()
+
+    assert (membership_count, artifact_count) == (2, 1)
+    graph = build_trace_graph_for_workflow_coordinate(
+        registry_path,
+        context="colors",
+        workflow_name="red-qc-target",
+        step_name="color_sector_analysis",
+        output_name="sector_counts",
+        address="init",
+    )
+    selected_nodes = [
+        artifact for artifact in graph["artifacts"] if artifact["is_selected"]
+    ]
+    assert len(selected_nodes) == 1
+    assert selected_nodes[0]["workflow_name"] == "base"
+    assert sum(
+        artifact["artifact_id"] == graph["selected_artifact_id"]
+        for artifact in graph["artifacts"]
+    ) == 1
+
+    topology = build_observed_topology(graph)
+    selected_slots = [
+        node
+        for node in topology["nodes"]
+        if node["kind"] == "artifact_slot"
+        and node["step_name"] == "color_sector_analysis"
+        and node["output_name"] == "sector_counts"
+    ]
+    assert len(selected_slots) == 1
+    assert selected_slots[0]["workflow_name"] == "base"
+    assert selected_slots[0]["registry_artifact_count"] == 1
 
 
 def test_trace_graph_marks_damaged_dependency_as_degraded(
