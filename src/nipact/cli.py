@@ -237,9 +237,9 @@ def build_parser() -> argparse.ArgumentParser:
         "--dry-run",
         action="store_true",
         help=(
-            "Forecast the Snakemake DAG in an isolated dry-run workspace "
-            "without hydrating reused artifacts, running jobs, or publishing "
-            "outputs."
+            "Forecast selected-output resolution and any required fresh "
+            "Snakemake work in an isolated dry-run workspace without hydrating "
+            "reused artifacts, running jobs, or publishing outputs."
         ),
     )
     return parser
@@ -424,7 +424,7 @@ def _run_workflow_command(args: argparse.Namespace) -> int | None:
                     active_spinner = None
                 feedback.line("Snakemake complete.")
             elif event == "validating_selected_reuse":
-                feedback.line("Validating selected reused outputs...")
+                feedback.line("Resolving selected reused outputs...")
             elif event == "publishing_outputs":
                 feedback.line("Publishing outputs...")
             elif event == "registry_updated":

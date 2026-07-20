@@ -865,7 +865,6 @@ def _write_run_workspace(
     *,
     reused_input_paths: dict[str, str] | None = None,
 ) -> None:
-    _prepare_run_workspace(run_plan)
     (run_plan.run_workspace / "staging").mkdir(exist_ok=True)
     (run_plan.run_workspace / "logs").mkdir(exist_ok=True)
     _write_json_file(run_plan.run_workspace / "run_plan.json", _run_plan_payload(run_plan))
@@ -884,7 +883,6 @@ def _write_run_workspace(
 
 
 def _write_reuse_only_workspace(run_plan: RunPlan) -> None:
-    _prepare_run_workspace(run_plan)
     _remove_stale_executor_file(run_plan.run_workspace / "Snakefile")
     _remove_stale_executor_file(run_plan.run_workspace / "selected_outputs.txt")
     _write_json_file(run_plan.run_workspace / "run_plan.json", _run_plan_payload(run_plan))

@@ -1357,7 +1357,7 @@ def test_real_cli_reports_selected_reuse_without_snakemake(
     assert summary["selected_generated_outputs"] == "0"
     assert summary["selected_reused_outputs"] == "1"
     assert "snakemake_log" not in summary
-    assert "Validating selected reused outputs..." in lines
+    assert "Resolving selected reused outputs..." in lines
     assert "Starting Snakemake..." not in lines
     assert "Publishing outputs..." not in lines
     assert log_path.read_text(encoding="utf-8") == log_before
