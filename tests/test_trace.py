@@ -129,7 +129,7 @@ def test_trace_graph_by_artifact_id_includes_sources_and_manifest_bindings(
         artifact_id=selected.artifact_id,
     )
 
-    assert graph["schema_version"] == 1
+    assert graph["schema_version"] == 2
     assert graph["context"] == "colors"
     assert graph["selected_artifact_id"] == selected.artifact_id
     assert graph["provenance_status"] == "complete"
@@ -144,6 +144,7 @@ def test_trace_graph_by_artifact_id_includes_sources_and_manifest_bindings(
     assert source_artifacts[0]["workflow_artifact_ref"] is None
     assert len(artifacts) == len(run_plan.jobs) + 1
     assert len(dependencies) == sum(len(job.input_records) for job in run_plan.jobs)
+    assert len(graph["execution_populations"]) == 1
     assert len(graph["manifest_bindings"]) == len(run_plan.manifest_bindings)
 
 
@@ -180,6 +181,7 @@ def test_trace_graph_payload_shape_is_stable_for_gui_contract(
         "provenance_status",
         "artifacts",
         "dependencies",
+        "execution_populations",
         "manifest_bindings",
         "warnings",
     }
@@ -228,6 +230,7 @@ def test_trace_graph_payload_shape_is_stable_for_gui_contract(
         "source_file_size",
         "source_extension",
         "dependency_set_id",
+        "manifest_value_schema",
         "manifest_digest",
         "edge_cardinality",
     }
@@ -235,8 +238,18 @@ def test_trace_graph_payload_shape_is_stable_for_gui_contract(
         "run_id",
         "workflow_name",
         "step_name",
-        "role",
+        "manifest_usage_role",
         "manifest_name",
+        "manifest_value_schema",
+        "manifest_digest",
+        "manifest_hash",
+        "entity_count",
+    }
+    assert set(graph["execution_populations"][0]) == {
+        "run_id",
+        "workflow_name",
+        "manifest_name",
+        "manifest_value_schema",
         "manifest_digest",
         "manifest_hash",
         "entity_count",
@@ -244,7 +257,7 @@ def test_trace_graph_payload_shape_is_stable_for_gui_contract(
     selected_node = next(
         artifact for artifact in graph["artifacts"] if artifact["is_selected"]
     )
-    assert selected_node["job_id"] == "job__color_sector_analysis__sector_counts__init"
+    assert selected_node["job_id"] == "job__color_sector_analysis__sector_counts__cohort"
     assert selected_node["extension"] == ".json"
     assert selected_node["artifact_set_id"] is None
     assert selected_node["callable_ref"] == (
@@ -346,7 +359,7 @@ def test_trace_graph_by_workflow_coordinate_accepts_published_intermediate(
         workflow_name="base",
         step_name="color_sector_analysis",
         output_name="sector_counts",
-        address="init",
+        address="cohort",
     )
 
     selected_node = next(
@@ -397,7 +410,7 @@ def test_shared_membership_trace_and_gui_keep_generating_workflow_label(
               AND workflow_name = 'base'
               AND step_name = 'color_sector_analysis'
               AND output_name = 'sector_counts'
-              AND address = 'init'
+              AND address = 'cohort'
             """
         )
         membership_count, artifact_count = conn.execute(
@@ -407,7 +420,7 @@ def test_shared_membership_trace_and_gui_keep_generating_workflow_label(
             WHERE context = 'colors'
               AND step_name = 'color_sector_analysis'
               AND output_name = 'sector_counts'
-              AND address = 'init'
+              AND address = 'cohort'
             """
         ).fetchone()
 
@@ -418,7 +431,7 @@ def test_shared_membership_trace_and_gui_keep_generating_workflow_label(
         workflow_name="red-qc-target",
         step_name="color_sector_analysis",
         output_name="sector_counts",
-        address="init",
+        address="cohort",
     )
     selected_nodes = [
         artifact for artifact in graph["artifacts"] if artifact["is_selected"]

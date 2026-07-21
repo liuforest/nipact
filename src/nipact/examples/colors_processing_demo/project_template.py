@@ -157,10 +157,6 @@ def step_files() -> dict[str, dict[str, Any]]:
                 "value": DEFAULT_VALUE,
                 "seed": DEFAULT_SEED,
             },
-            "manifest_binding": {
-                "role": "source_population",
-                "manifest": ANALYSIS_COHORT_NAME,
-            },
             "outputs": {
                 "source_color": {
                     "extension": ".json",
@@ -345,6 +341,7 @@ def workflow_files() -> dict[str, dict[str, Any]]:
     return {
         "base": {
             "workflow_name": BASE_WORKFLOW_NAME,
+            "execution_population": ANALYSIS_COHORT_NAME,
             "steps": [
                 {"step_name": "color_source"},
                 {"step_name": "color_features"},

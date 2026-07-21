@@ -61,7 +61,11 @@ def test_build_manifest_exposes_derived_inspection_fields() -> None:
     assert manifest.entity_count == 3
     assert manifest.first_entity_id == "color_000"
     assert manifest.last_entity_id == "color_002"
-    assert manifest.manifest_digest == manifest_digest(manifest.entity_ids)
+    assert manifest.value == build_manifest_value(entities=manifest.entity_ids)
+    assert manifest.manifest_value_schema == MANIFEST_VALUE_SCHEMA
+    assert manifest.canonical_body == ENTITY_SET_V1_BODY
+    assert manifest.manifest_digest == ENTITY_SET_V1_DIGEST
+    assert manifest.manifest_digest != manifest_digest(manifest.entity_ids)
     assert manifest.manifest_hash == short_hash(manifest.manifest_digest)
 
 
@@ -114,10 +118,7 @@ def test_manifest_value_is_invariant_to_declaration_representation(tmp_path: Pat
 
     first_manifest = load_manifest(first_path)
     second_manifest = load_manifest(second_path)
-    first_value = build_manifest_value(entities=first_manifest.entity_ids)
-    second_value = build_manifest_value(entities=second_manifest.entity_ids)
-
-    assert first_value == second_value
+    assert first_manifest.value == second_manifest.value
 
 
 def test_manifest_value_references_deduplicate_by_schema_and_digest() -> None:

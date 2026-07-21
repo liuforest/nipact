@@ -52,13 +52,13 @@ class ManifestSummary(Dto):
     entity_count: int
     first_entity_id: str
     last_entity_id: str
+    manifest_value_schema: str
     manifest_digest: str
     manifest_hash: str
-    source_artifact_path: str | None
 
 
 class ManifestDetail(ManifestSummary):
-    manifest_body: str
+    canonical_body: str
 
 
 class ManifestsResponse(Dto):
@@ -170,6 +170,7 @@ class TraceDependency(Dto):
     source_file_size: int
     source_extension: str
     dependency_set_id: str | None
+    manifest_value_schema: str | None
     manifest_digest: str | None
     edge_cardinality: int | None
 
@@ -178,8 +179,19 @@ class TraceManifestBinding(Dto):
     run_id: int
     workflow_name: str
     step_name: str
-    role: str
+    manifest_usage_role: str
     manifest_name: str
+    manifest_value_schema: str
+    manifest_digest: str
+    manifest_hash: str
+    entity_count: int
+
+
+class TraceExecutionPopulation(Dto):
+    run_id: int
+    workflow_name: str
+    manifest_name: str
+    manifest_value_schema: str
     manifest_digest: str
     manifest_hash: str
     entity_count: int
@@ -199,6 +211,7 @@ class TraceGraphResponse(Dto):
     provenance_status: str
     artifacts: list[TraceArtifact]
     dependencies: list[TraceDependency]
+    execution_populations: list[TraceExecutionPopulation]
     manifest_bindings: list[TraceManifestBinding]
     warnings: list[TraceWarning]
 
@@ -213,7 +226,7 @@ class TraceGraphResponse(Dto):
 # Graph-local rendering IDs (node_id/edge_id like "n0"/"e0") are display keys
 # only — the structured coordinate fields carry drill-down identity.
 
-OBSERVED_TOPOLOGY_SCHEMA_VERSION = 1
+OBSERVED_TOPOLOGY_SCHEMA_VERSION = 2
 
 
 class TopologyStepNode(Dto):
@@ -297,14 +310,26 @@ TopologyEdge = Annotated[
 
 
 class TopologyManifestBindingSummary(Dto):
-    # one row per (workflow_name, step_name, role, manifest_name) coordinate
+    # one row per (workflow, step, usage role, manifest name) coordinate
     workflow_name: str
     step_name: str
-    role: str
+    manifest_usage_role: str
     manifest_name: str
+    manifest_value_schema: str
     distinct_run_count: NonNegativeInt
     distinct_manifest_digest_count: NonNegativeInt
     # carried through only when the grouped rows agree; otherwise null
+    manifest_digest: str | None
+    manifest_hash: str | None
+    entity_count: NonNegativeInt | None
+
+
+class TopologyExecutionPopulationSummary(Dto):
+    workflow_name: str
+    manifest_name: str
+    manifest_value_schema: str
+    distinct_run_count: NonNegativeInt
+    distinct_manifest_digest_count: NonNegativeInt
     manifest_digest: str | None
     manifest_hash: str | None
     entity_count: NonNegativeInt | None
@@ -336,5 +361,6 @@ class ObservedTopologyResponse(Dto):
     summary: TopologySummary
     nodes: list[TopologyNode]
     edges: list[TopologyEdge]
+    execution_populations: list[TopologyExecutionPopulationSummary]
     manifest_bindings: list[TopologyManifestBindingSummary]
     warnings: list[TopologyWarningSummary]

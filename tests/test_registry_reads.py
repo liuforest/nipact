@@ -13,8 +13,11 @@ from nipact.errors import ValidationError
 from nipact.execution import build_run_plan, execute_run_plan
 from nipact.projection import RegisteredSourceSnapshot, SourceCoordinate
 from nipact.registry import (
+    EnvironmentObservationV1,
     MembershipIntent,
     PublishedOutputRow,
+    RunExecutionPopulationRow,
+    RunManifestBindingRow,
     SelectedOutputResolutionIntent,
     REGISTRY_DB_PATH,
     _open_registry_read_session,
@@ -31,6 +34,8 @@ from nipact.registry import (
     read_published_outputs,
     read_registered_source_snapshots,
     read_registry_summary,
+    read_run_execution_population,
+    record_workflow_run,
     resolve_registered_artifact_path,
 )
 from nipact.project_setup import ProjectSetupError, validate_project
@@ -257,6 +262,10 @@ def test_registry_manifest_helpers_and_summary(
     assert {row.name for row in manifests} >= {"init"}
     assert manifest.name == "init"
     assert manifest.manifest_body.startswith("color_000")
+    assert manifest.canonical_body == manifest.manifest_body
+    assert manifest.manifest_value_schema == "entity_set_v1"
+    assert manifest.first_entity_id == "color_000"
+    assert manifest.last_entity_id == "color_199"
     assert manifest.entity_count == 200
     assert summary == {
         "manifest_count": len(manifests),
@@ -269,6 +278,124 @@ def test_registry_manifest_helpers_and_summary(
         read_manifest(registry_path, context="colors", manifest_name="missing")
     with pytest.raises(ValidationError, match="unknown context"):
         read_registry_summary(registry_path, context="missing")
+
+
+def test_registry_reads_schema_qualified_run_populations_and_bindings(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _project_dir, runtime_dir = _init_demo(tmp_path, capsys)
+    registry_path = runtime_dir / REGISTRY_DB_PATH
+
+    with sqlite3.connect(registry_path) as conn:
+        manifest_value_schema, manifest_digest = conn.execute(
+            """
+            SELECT last_validated_manifest_value_schema,
+                   last_validated_manifest_digest
+            FROM manifest_declarations
+            WHERE context = 'colors' AND manifest_name = 'init'
+            """
+        ).fetchone()
+    assert (
+        record_workflow_run(
+            registry_path,
+            runtime_root=runtime_dir,
+            context="colors",
+            workflow_name="base",
+            selected_step_name="color_sector_analysis",
+            selected_output_name="sector_counts",
+            run_workspace="runs/manual",
+            run_plan_path="runs/manual/run_plan.json",
+            run_plan_digest="a" * 64,
+            artifacts=(),
+            projection_recipes=(),
+            reused_projection_seeds=(),
+            selected_resolution_intents=(),
+            environment_observation=EnvironmentObservationV1(
+                nipact_version="test",
+                python_version="test",
+                platform="test",
+                snakemake_version="test",
+            ),
+            execution_population=RunExecutionPopulationRow(
+                manifest_name="init",
+                manifest_value_schema=manifest_value_schema,
+                manifest_digest=manifest_digest,
+            ),
+            manifest_bindings=(
+                RunManifestBindingRow(
+                    step_name="color_sector_analysis",
+                    manifest_usage_role="fit_cohort",
+                    manifest_name="init",
+                    manifest_value_schema=manifest_value_schema,
+                    manifest_digest=manifest_digest,
+                ),
+            ),
+            membership_intents=(),
+        )
+        == 0
+    )
+    with sqlite3.connect(registry_path) as conn:
+        run_id = conn.execute("SELECT MAX(run_id) FROM workflow_runs").fetchone()[0]
+
+    execution_population = read_run_execution_population(
+        registry_path,
+        run_id=int(run_id),
+        context="colors",
+    )
+    assert execution_population is not None
+    assert execution_population.manifest_name == "init"
+    assert execution_population.manifest_value_schema == "entity_set_v1"
+    assert execution_population.manifest_digest == manifest_digest
+    assert execution_population.entity_count == 200
+
+    bindings = list_run_manifest_bindings(
+        registry_path,
+        run_id=int(run_id),
+        context="colors",
+    )
+    assert len(bindings) == 1
+    assert bindings[0].manifest_usage_role == "fit_cohort"
+    assert bindings[0].manifest_name == "init"
+    assert bindings[0].manifest_value_schema == "entity_set_v1"
+    assert bindings[0].manifest_digest == manifest_digest
+    assert bindings[0].entity_count == 200
+
+    with pytest.raises(ValidationError, match="FOREIGN KEY constraint failed"):
+        record_workflow_run(
+            registry_path,
+            runtime_root=runtime_dir,
+            context="colors",
+            workflow_name="base",
+            selected_step_name="color_sector_analysis",
+            selected_output_name="sector_counts",
+            run_workspace="runs/invalid",
+            run_plan_path="runs/invalid/run_plan.json",
+            run_plan_digest="b" * 64,
+            artifacts=(),
+            projection_recipes=(),
+            reused_projection_seeds=(),
+            selected_resolution_intents=(),
+            environment_observation=EnvironmentObservationV1(
+                nipact_version="test",
+                python_version="test",
+                platform="test",
+                snakemake_version="test",
+            ),
+            execution_population=RunExecutionPopulationRow(
+                manifest_name="missing",
+                manifest_value_schema="entity_set_v1",
+                manifest_digest="f" * 64,
+            ),
+            manifest_bindings=(),
+            membership_intents=(),
+        )
+    with sqlite3.connect(registry_path) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM workflow_runs").fetchone()[0] == 1
+        assert conn.execute(
+            "SELECT is_current FROM workflow_runs WHERE run_id = ?",
+            (run_id,),
+        ).fetchone() == (1,)
 
 
 def test_registry_path_lookup_rejects_duplicate_rows(
@@ -374,7 +501,7 @@ def test_registry_reads_workflow_output_and_neighbors(
         workflow_name="base",
         step_name="color_sector_analysis",
         output_name="sector_counts",
-        address="init",
+        address="cohort",
     )
 
     assert selected.is_selected_output is True
@@ -439,7 +566,7 @@ def test_registry_reads_workflow_output_and_neighbors(
         run_id=selected.run_id,
     )
 
-    assert {row["address"] for row in published_lookup} == {"init"}
+    assert {row["address"] for row in published_lookup} == {"cohort"}
     assert published_lookup[0]["path"] == selected.published_path
     assert len(workflow_artifacts) == len(run_plan.jobs)
     assert selected in published_artifacts
@@ -470,7 +597,7 @@ def test_project_validation_accepts_cross_workflow_membership_path(
               AND workflow_name = 'base'
               AND step_name = 'color_sector_analysis'
               AND output_name = 'sector_counts'
-              AND address = 'init'
+              AND address = 'cohort'
             """
         ).fetchone()[0]
         conn.execute(
@@ -486,7 +613,7 @@ def test_project_validation_accepts_cross_workflow_membership_path(
               AND workflow_name = 'base'
               AND step_name = 'color_sector_analysis'
               AND output_name = 'sector_counts'
-              AND address = 'init'
+              AND address = 'cohort'
             """
         )
 
@@ -638,7 +765,7 @@ def test_project_validation_covers_accepted_artifact_without_membership(
             WHERE context = 'colors'
               AND step_name = 'color_sector_analysis'
               AND output_name = 'sector_counts'
-              AND address = 'init'
+              AND address = 'cohort'
               AND is_published = 1
             """
         ).fetchone()
@@ -685,7 +812,7 @@ def test_membership_intent_can_reference_one_existing_artifact_more_than_once(
             FROM artifacts
             WHERE step_name = 'color_sector_analysis'
               AND output_name = 'sector_counts'
-              AND address = 'init'
+              AND address = 'cohort'
             """
         ).fetchone()
         registry._insert_memberships(
@@ -697,7 +824,7 @@ def test_membership_intent_can_reference_one_existing_artifact_more_than_once(
                         workflow_name="derived",
                         step_name="color_sector_analysis",
                         output_name="sector_counts",
-                        address="init",
+                        address="cohort",
                         path=path,
                         output_digest=digest,
                         output_hash=output_hash,
@@ -719,7 +846,7 @@ def test_membership_intent_can_reference_one_existing_artifact_more_than_once(
                         workflow_name="derived",
                         step_name="color_sector_analysis",
                         output_name="sector_counts",
-                        address="init",
+                        address="cohort",
                         outcome="reused",
                         existing_artifact_id=artifact_id,
                     ),
@@ -836,7 +963,7 @@ def test_existing_membership_rejects_artifact_hash_inconsistent_with_digest(
             FROM artifacts
             WHERE step_name = 'color_sector_analysis'
               AND output_name = 'sector_counts'
-              AND address = 'init'
+              AND address = 'cohort'
             """
         ).fetchone()
         bad_hash = "f" * 16
@@ -858,7 +985,7 @@ def test_existing_membership_rejects_artifact_hash_inconsistent_with_digest(
                             workflow_name="derived",
                             step_name="color_sector_analysis",
                             output_name="sector_counts",
-                            address="init",
+                            address="cohort",
                             path=path,
                             output_digest=digest,
                             output_hash=bad_hash,
@@ -984,7 +1111,7 @@ def test_registry_reads_reject_unknown_ids_runs_and_schema(
             workflow_name="base",
             step_name="color_sector_analysis",
             output_name="sector_counts",
-            address="init",
+            address="cohort",
         )
 
 
@@ -1008,7 +1135,7 @@ def test_current_published_artifact_rejects_membership_hash_mismatch(
               AND workflow_name = 'base'
               AND step_name = 'color_sector_analysis'
               AND output_name = 'sector_counts'
-              AND address = 'init'
+              AND address = 'cohort'
             """,
             ("f" * 16,),
         )
@@ -1020,14 +1147,14 @@ def test_current_published_artifact_rejects_membership_hash_mismatch(
             workflow_name="base",
             step_name="color_sector_analysis",
             output_name="sector_counts",
-            address="init",
+            address="cohort",
         )
 
     incompatible_runtime = tmp_path / "incompatible"
     (incompatible_runtime / "database").mkdir(parents=True)
     incompatible_path = incompatible_runtime / REGISTRY_DB_PATH
     with sqlite3.connect(incompatible_path) as conn:
-        conn.execute("PRAGMA user_version = 14")
+        conn.execute("PRAGMA user_version = 15")
 
     with pytest.raises(ValidationError, match="schema version is incompatible"):
         read_published_outputs(
@@ -1080,7 +1207,7 @@ def test_read_session_reads_match_public_helpers(
         workflow_name="base",
         step_name="color_sector_analysis",
         output_name="sector_counts",
-        address="init",
+        address="cohort",
     )
 
     with _open_registry_read_session(registry_path) as session:
@@ -1120,7 +1247,7 @@ def test_read_session_opens_one_connection_and_validates_once(
         workflow_name="base",
         step_name="color_sector_analysis",
         output_name="sector_counts",
-        address="init",
+        address="cohort",
     )
     upstream = list_upstream_dependencies(
         registry_path,

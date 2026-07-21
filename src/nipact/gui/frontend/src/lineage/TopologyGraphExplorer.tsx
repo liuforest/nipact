@@ -2,6 +2,7 @@ import { Suspense, lazy, useEffect, useMemo, useState, type ReactNode } from "re
 import type {
   ObservedTopologyResponse,
   TopologyEdge,
+  TopologyExecutionPopulationSummary,
   TopologyManifestBindingSummary,
   TopologyNode,
 } from "../api/types";
@@ -116,17 +117,39 @@ export function TopologyGraphExplorer({
       </section>
       <WarningList warnings={warnings} />
       <section className="panel">
-        <h2>Manifest Bindings</h2>
+        <h2>Execution Populations</h2>
+        <DataTable<TopologyExecutionPopulationSummary>
+          rows={topology.execution_populations}
+          getRowKey={(row) => `${row.workflow_name}:${row.manifest_name}:${row.manifest_value_schema}`}
+          columns={[
+            { key: "workflow", label: "workflow", render: (row) => row.workflow_name },
+            { key: "manifest", label: "manifest", render: (row) => row.manifest_name },
+            { key: "schema", label: "schema", render: (row) => row.manifest_value_schema },
+            { key: "runs", label: "runs", render: (row) => row.distinct_run_count },
+            {
+              key: "digest",
+              label: "digest",
+              render: (row) => row.manifest_digest === null ? "varies" : (
+                <IdentifierValue value={row.manifest_digest} compact />
+              ),
+            },
+            { key: "entities", label: "entities", render: (row) => row.entity_count ?? "varies" },
+          ]}
+        />
+      </section>
+      <section className="panel">
+        <h2>Scientific Manifest Bindings</h2>
         <DataTable<TopologyManifestBindingSummary>
           rows={topology.manifest_bindings}
           getRowKey={(row) =>
-            `${row.workflow_name}:${row.step_name}:${row.role}:${row.manifest_name}`
+            `${row.workflow_name}:${row.step_name}:${row.manifest_usage_role}:${row.manifest_name}`
           }
           columns={[
             { key: "workflow", label: "workflow", render: (row) => row.workflow_name },
             { key: "step", label: "step", render: (row) => row.step_name },
-            { key: "role", label: "role", render: (row) => row.role },
+            { key: "role", label: "role", render: (row) => row.manifest_usage_role },
             { key: "manifest", label: "manifest", render: (row) => row.manifest_name },
+            { key: "schema", label: "schema", render: (row) => row.manifest_value_schema },
             { key: "runs", label: "runs", render: (row) => row.distinct_run_count },
             {
               key: "digests",

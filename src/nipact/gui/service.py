@@ -217,16 +217,16 @@ def _manifest_summary(manifest: RegistryManifest) -> models.ManifestSummary:
         entity_count=manifest.entity_count,
         first_entity_id=manifest.first_entity_id,
         last_entity_id=manifest.last_entity_id,
+        manifest_value_schema=manifest.manifest_value_schema,
         manifest_digest=manifest.manifest_digest,
         manifest_hash=manifest.manifest_hash,
-        source_artifact_path=manifest.source_artifact_path,
     )
 
 
 def _manifest_detail(manifest: RegistryManifest) -> models.ManifestDetail:
     return models.ManifestDetail(
         **_manifest_summary(manifest).model_dump(),
-        manifest_body=manifest.manifest_body,
+        canonical_body=manifest.canonical_body,
     )
 
 

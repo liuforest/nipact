@@ -41,15 +41,15 @@ export function ManifestDetailPage() {
             { label: "entities", value: manifest.entity_count },
             { label: "first", value: manifest.first_entity_id },
             { label: "last", value: manifest.last_entity_id },
+            { label: "value schema", value: manifest.manifest_value_schema },
             { label: "digest", value: <IdentifierValue value={manifest.manifest_digest} /> },
             { label: "hash", value: <IdentifierValue value={manifest.manifest_hash} /> },
-            { label: "source artifact", value: <PathValue value={manifest.source_artifact_path} /> },
           ]}
         />
       </section>
       <section className="panel">
         <h2>Body</h2>
-        <pre className="json-block">{manifest.manifest_body}</pre>
+        <pre className="json-block">{manifest.canonical_body}</pre>
       </section>
     </div>
   );

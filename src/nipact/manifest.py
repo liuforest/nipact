@@ -20,13 +20,34 @@ _MANIFEST_VALUE_DOMAIN_PREFIX = b"nipact.manifest.entity_set_v1\0"
 
 @dataclass(frozen=True)
 class Manifest:
-    """Validated manifest membership and derived identity."""
+    """One declaration description paired with an immutable manifest value."""
 
     description: str
-    entity_ids: tuple[str, ...]
-    manifest_body: str
-    manifest_digest: str
-    manifest_hash: str
+    value: "ManifestValue"
+
+    @property
+    def manifest_value_schema(self) -> str:
+        return self.value.value_schema
+
+    @property
+    def entity_ids(self) -> tuple[str, ...]:
+        return self.value.entity_ids
+
+    @property
+    def manifest_body(self) -> str:
+        return self.value.canonical_body
+
+    @property
+    def canonical_body(self) -> str:
+        return self.value.canonical_body
+
+    @property
+    def manifest_digest(self) -> str:
+        return self.value.manifest_digest
+
+    @property
+    def manifest_hash(self) -> str:
+        return self.value.manifest_hash
 
     @property
     def entity_count(self) -> int:
@@ -163,15 +184,9 @@ def build_manifest(*, description: str, entities: Iterable[object]) -> Manifest:
     """Build a validated manifest from a description and entity membership."""
     if not isinstance(description, str):
         raise ValidationError("manifest description must be a string")
-    canonical_ids = canonical_entity_ids(entities)
-    body = "\n".join(canonical_ids)
-    digest = sha256_digest(body.encode("utf-8"))
     return Manifest(
         description=description,
-        entity_ids=canonical_ids,
-        manifest_body=body,
-        manifest_digest=digest,
-        manifest_hash=short_hash(digest),
+        value=build_manifest_value(entities=entities),
     )
 
 

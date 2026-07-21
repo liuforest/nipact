@@ -25,9 +25,9 @@ from .projection import (
     RUNNER_CONTRACT_VERSION,
     CollectionBindingPlan,
     OutputContract,
-    RequestBundleProjectionPlanV1,
+    RequestBundleProjectionPlanV2,
     RequestBundleProjectionState,
-    ResolvedRequestBundleProjectionV1,
+    ResolvedRequestBundleProjectionV2,
     RequestedOutputCoordinate,
     SiblingOutput,
     SourceBindingPlan,
@@ -47,6 +47,7 @@ from .registry import (
     ReusableArtifactBundleRequest,
     ReusableArtifactCandidate,
     ReusedProjectionSeed,
+    RunExecutionPopulationRow,
     RunManifestBindingRow,
     SelectedOutputResolutionIntent,
     WorkflowOutputArtifactRow,
@@ -59,6 +60,7 @@ from .workflow import (
     LoadedWorkflowProject,
     SourceIndex,
     WorkflowPlan,
+    WorkflowPlanExecutionPopulation,
     WorkflowPlanManifestBinding,
     WorkflowPlanStep,
     compile_workflow_plan,
@@ -105,7 +107,7 @@ class RunJob:
     inputs: dict[str, tuple[str, ...]]
     input_records: tuple[ArtifactInputRow, ...]
     params: dict[str, object]
-    projection_plan: RequestBundleProjectionPlanV1
+    projection_plan: RequestBundleProjectionPlanV2
     projection_state: RequestBundleProjectionState
 
     @property
@@ -197,7 +199,7 @@ class RunJobOutputRef:
         return self.job.params
 
     @property
-    def projection_plan(self) -> RequestBundleProjectionPlanV1:
+    def projection_plan(self) -> RequestBundleProjectionPlanV2:
         return self.job.projection_plan
 
     @property
@@ -225,7 +227,7 @@ class ReusedRunJobOutputRef:
     content_digest: str
     file_size: int
     reuse_request: ReusableArtifactBundleRequest
-    projection_plan: RequestBundleProjectionPlanV1
+    projection_plan: RequestBundleProjectionPlanV2
     projection_state: RequestBundleProjectionState
 
 
@@ -284,6 +286,7 @@ class RunPlan:
     requested_address: str | None
     dry_run: bool
     run_workspace: Path
+    execution_population: WorkflowPlanExecutionPopulation | None
     manifest_bindings: tuple[WorkflowPlanManifestBinding, ...]
     published_outputs: tuple[PublishedOutputSpec, ...]
     jobs: tuple[RunJob, ...]
@@ -339,7 +342,7 @@ def build_run_plan(
     run_workspace = loaded.runtime_root / "runs" / context / plan.workflow_name / plan.selected_step_name
     if len(selected_step.outputs) > 1:
         run_workspace = run_workspace / selected_output.name
-    addresses = _selected_addresses(loaded, plan, selected_step, requested_address=address)
+    addresses = _selected_addresses(plan, selected_step, requested_address=address)
     if address is not None:
         # Targeted runs get an address-partitioned workspace so runs for
         # different addresses cannot overwrite each other's plan, staging,
@@ -438,6 +441,7 @@ def build_run_plan(
         requested_address=address,
         dry_run=dry_run,
         run_workspace=run_workspace,
+        execution_population=plan.execution_population,
         manifest_bindings=plan.manifest_bindings,
         published_outputs=published_outputs,
         jobs=jobs,
@@ -604,6 +608,7 @@ def execute_run_plan(
             reused_projection_seeds=reused_projection_seeds,
             selected_resolution_intents=selected_resolution_intents,
             environment_observation=_environment_observation(),
+            execution_population=_run_execution_population_row(run_plan),
             manifest_bindings=_run_manifest_binding_rows(run_plan),
             membership_intents=membership_intents,
         )
@@ -1164,6 +1169,13 @@ def _run_plan_payload(run_plan: RunPlan) -> dict[str, Any]:
         "selected_output": run_plan.selected_output_name,
         "requested_address": run_plan.requested_address,
         "runtime_root": str(run_plan.runtime_root),
+        "execution_population": _execution_population_payload(
+            run_plan.execution_population
+        ),
+        "manifest_bindings": [
+            _manifest_binding_payload(binding)
+            for binding in run_plan.manifest_bindings
+        ],
         "jobs": {
             job.job_id: {
                 "step_name": job.step_name,
@@ -1245,6 +1257,36 @@ def _run_plan_payload(run_plan: RunPlan) -> dict[str, Any]:
     }
 
 
+def _execution_population_payload(
+    population: WorkflowPlanExecutionPopulation | None,
+) -> dict[str, Any] | None:
+    if population is None:
+        return None
+    return {
+        "manifest_name": population.manifest_name,
+        "manifest_value_schema": population.manifest_value_schema,
+        "manifest_digest": population.manifest_digest,
+        "manifest_hash": population.manifest_hash,
+        "entity_ids": list(population.entity_ids),
+        "entity_count": population.entity_count,
+    }
+
+
+def _manifest_binding_payload(
+    binding: WorkflowPlanManifestBinding,
+) -> dict[str, Any]:
+    return {
+        "step_name": binding.step_name,
+        "manifest_usage_role": binding.manifest_usage_role,
+        "manifest_name": binding.manifest_name,
+        "manifest_value_schema": binding.manifest_value_schema,
+        "manifest_digest": binding.manifest_digest,
+        "manifest_hash": binding.manifest_hash,
+        "entity_ids": list(binding.entity_ids),
+        "entity_count": binding.entity_count,
+    }
+
+
 def _input_record_payload(record: ArtifactInputRow) -> dict[str, Any]:
     return {
         "binding_name": record.binding_name,
@@ -1260,6 +1302,7 @@ def _input_record_payload(record: ArtifactInputRow) -> dict[str, Any]:
         "source_execution_role": record.source_execution_role,
         "source_is_reused": record.source_is_reused,
         "source_artifact_path": record.source_artifact_path,
+        "manifest_value_schema": record.manifest_value_schema,
         "manifest_digest": record.manifest_digest,
         "edge_cardinality": record.edge_cardinality,
         "registry_source_artifact_id": record.registry_source_artifact_id,
@@ -1407,7 +1450,7 @@ def _reused_projection_seeds(
         )
         if requested_output not in required_coordinates:
             continue
-        if not isinstance(output_ref.projection_state, ResolvedRequestBundleProjectionV1):
+        if not isinstance(output_ref.projection_state, ResolvedRequestBundleProjectionV2):
             raise ValidationError("reused output has an unresolved request projection")
         try:
             actual_candidate = actual_reused_artifacts[output_ref.source_artifact_id]
@@ -1702,13 +1745,25 @@ def _run_manifest_binding_rows(run_plan: RunPlan) -> tuple[RunManifestBindingRow
     return tuple(
         RunManifestBindingRow(
             step_name=binding.step_name,
-            role=binding.role,
+            manifest_usage_role=binding.manifest_usage_role,
             manifest_name=binding.manifest_name,
+            manifest_value_schema=binding.manifest_value_schema,
             manifest_digest=binding.manifest_digest,
-            manifest_hash=binding.manifest_hash,
-            entity_count=binding.entity_count,
         )
         for binding in run_plan.manifest_bindings
+    )
+
+
+def _run_execution_population_row(
+    run_plan: RunPlan,
+) -> RunExecutionPopulationRow | None:
+    population = run_plan.execution_population
+    if population is None:
+        return None
+    return RunExecutionPopulationRow(
+        manifest_name=population.manifest_name,
+        manifest_value_schema=population.manifest_value_schema,
+        manifest_digest=population.manifest_digest,
     )
 
 
@@ -1774,7 +1829,7 @@ def _build_jobs(
     reused_outputs_by_artifact: dict[tuple[str, str, str], ReusedRunJobOutputRef] = {}
     for step in plan.steps:
         outputs = _validated_step_outputs(step)
-        addresses = _step_addresses(loaded, plan, step)
+        addresses = _step_addresses(plan, step)
         for address in addresses:
             input_paths, input_records = _job_inputs(
                 loaded,
@@ -1824,7 +1879,7 @@ def _build_jobs(
                     )
                 ] = projection_state
             reused_refs: dict[str, ReusedRunJobOutputRef] | None = None
-            if isinstance(projection_state, ResolvedRequestBundleProjectionV1):
+            if isinstance(projection_state, ResolvedRequestBundleProjectionV2):
                 reused_refs = _reusable_output_refs_for_job(
                     loaded=loaded,
                     job=job,
@@ -1851,8 +1906,8 @@ def _request_projection_plan(
     address: str,
     outputs: dict[str, Any],
     input_records: tuple[ArtifactInputRow, ...],
-) -> RequestBundleProjectionPlanV1:
-    return RequestBundleProjectionPlanV1(
+) -> RequestBundleProjectionPlanV2:
+    return RequestBundleProjectionPlanV2(
         identity_contract_version=IDENTITY_CONTRACT_VERSION,
         namespace=context,
         step_contract=StepContract(
@@ -1947,16 +2002,25 @@ def _projection_binding_plans(
             )
             continue
         if dependency_role in {"fit_input", "analysis_input"}:
+            manifest_schemas = {record.manifest_value_schema for record in records}
             manifest_digests = {record.manifest_digest for record in records}
-            if len(manifest_digests) != 1:
+            if len(manifest_schemas) != 1 or len(manifest_digests) != 1:
                 raise ValidationError(
                     f"collection input binding {binding_name!r} has inconsistent manifests"
+                )
+            manifest_value_schema = next(iter(manifest_schemas))
+            manifest_digest = next(iter(manifest_digests))
+            if manifest_value_schema is None or manifest_digest is None:
+                raise ValidationError(
+                    f"collection input binding {binding_name!r} is missing its "
+                    "scientific manifest value"
                 )
             binding_plans.append(
                 CollectionBindingPlan(
                     role=binding_name,
                     collection_semantics="coordinate_set_v1",
-                    manifest_digest=next(iter(manifest_digests)),
+                    manifest_value_schema=manifest_value_schema,
+                    manifest_digest=manifest_digest,
                     members=requested_outputs,
                 )
             )
@@ -2019,7 +2083,7 @@ def _reusable_output_refs_for_job(
     loaded: LoadedWorkflowProject,
     job: RunJob,
 ) -> dict[str, ReusedRunJobOutputRef] | None:
-    if not isinstance(job.projection_state, ResolvedRequestBundleProjectionV1):
+    if not isinstance(job.projection_state, ResolvedRequestBundleProjectionV2):
         return None
     registry_path = loaded.runtime_root / REGISTRY_DB_PATH
     request = ReusableArtifactBundleRequest(
@@ -2233,16 +2297,15 @@ def _job_inputs(
                 )
             )
         elif step_input.dependency_role in {"fit_input", "analysis_input"}:
-            allowed_addresses: set[str] | None = None
-            manifest_digest: str | None = None
-            manifest_name: str | None = None
-            if step.manifest_binding is not None:
-                manifest_name = step.manifest_binding.manifest_name
-                manifest = loaded.manifests[manifest_name]
-                allowed_addresses = set(manifest.entity_ids)
-                manifest_digest = manifest.manifest_digest
-            matching_outputs = [
-                output_ref
+            manifest_binding = step.manifest_binding
+            if manifest_binding is None:
+                raise ValidationError(
+                    f"input {input_name!r} for step {step.step_name!r} requires "
+                    "a scientific manifest binding"
+                )
+            allowed_addresses = set(manifest_binding.entity_ids)
+            matching_outputs_with_addresses = [
+                (_source_address, output_ref)
                 for (
                     source_step,
                     source_output,
@@ -2250,24 +2313,26 @@ def _job_inputs(
                 ), output_ref in outputs_by_artifact.items()
                 if source_step == step_input.source_step_name
                 and source_output == step_input.source_output_name
-                and (
-                    allowed_addresses is None
-                    or _source_address in allowed_addresses
-                )
+                and _source_address in allowed_addresses
             ]
-            matching_outputs = sorted(matching_outputs, key=lambda item: item.address)
-            if not matching_outputs:
-                manifest_label = (
-                    f"manifest {manifest_name!r}"
-                    if manifest_name is not None
-                    else "no manifest binding"
-                )
-                raise ValidationError(
-                    f"input {input_name!r} for step {step.step_name!r} selected "
-                    "no upstream artifacts from "
-                    f"{step_input.source_step_name}.{step_input.source_output_name} "
-                    f"using {manifest_label}"
-                )
+            matching_outputs_with_addresses.sort(key=lambda item: item[0])
+            _validate_exact_scientific_fan_in(
+                step_name=step.step_name,
+                input_name=input_name,
+                expected_addresses=manifest_binding.entity_ids,
+                collected_addresses=tuple(
+                    source_address
+                    for source_address, _output_ref in matching_outputs_with_addresses
+                ),
+                output_addresses=tuple(
+                    output_ref.address
+                    for _source_address, output_ref in matching_outputs_with_addresses
+                ),
+            )
+            matching_outputs = tuple(
+                output_ref
+                for _source_address, output_ref in matching_outputs_with_addresses
+            )
             inputs[input_name] = tuple(
                 output_ref.staging_path_relative
                 for output_ref in matching_outputs
@@ -2279,7 +2344,10 @@ def _job_inputs(
                     input_path=output_ref.staging_path_relative,
                     dependency_role=step_input.dependency_role,
                     source_output=output_ref,
-                    manifest_digest=manifest_digest,
+                    manifest_value_schema=(
+                        manifest_binding.manifest_value_schema
+                    ),
+                    manifest_digest=manifest_binding.manifest_digest,
                     edge_cardinality=edge_cardinality,
                 )
                 for output_ref in matching_outputs
@@ -2289,6 +2357,48 @@ def _job_inputs(
                 f"unsupported dependency role for execution: {step_input.dependency_role}"
             )
     return inputs, tuple(input_records)
+
+
+def _validate_exact_scientific_fan_in(
+    *,
+    step_name: str,
+    input_name: str,
+    expected_addresses: tuple[str, ...],
+    collected_addresses: tuple[str, ...],
+    output_addresses: tuple[str, ...] | None = None,
+) -> None:
+    """Require one correctly addressed collected output per manifest member."""
+    seen_addresses: set[str] = set()
+    duplicate_address_set: set[str] = set()
+    for address in collected_addresses:
+        if address in seen_addresses:
+            duplicate_address_set.add(address)
+        seen_addresses.add(address)
+    duplicate_addresses = sorted(duplicate_address_set)
+    if duplicate_addresses:
+        raise ValidationError(
+            f"scientific fan-in {step_name}.{input_name} contains duplicate "
+            f"addresses: {', '.join(duplicate_addresses)}"
+        )
+    expected = set(expected_addresses)
+    collected = set(collected_addresses)
+    missing = sorted(expected - collected)
+    extra = sorted(collected - expected)
+    if missing or extra:
+        details: list[str] = []
+        if missing:
+            details.append(f"missing: {', '.join(missing)}")
+        if extra:
+            details.append(f"extra: {', '.join(extra)}")
+        raise ValidationError(
+            f"scientific fan-in {step_name}.{input_name} does not exactly match "
+            f"manifest membership ({'; '.join(details)})"
+        )
+    if output_addresses is not None and output_addresses != collected_addresses:
+        raise ValidationError(
+            f"scientific fan-in {step_name}.{input_name} contains a wrongly "
+            "addressed upstream output"
+        )
 
 
 def _source_artifact_path_for_binding(
@@ -2330,6 +2440,7 @@ def _workflow_input_record(
     input_path: str,
     dependency_role: str,
     source_output: RunJobOutputRef | ReusedRunJobOutputRef,
+    manifest_value_schema: str | None = None,
     manifest_digest: str | None = None,
     edge_cardinality: int | None = None,
 ) -> ArtifactInputRow:
@@ -2352,6 +2463,7 @@ def _workflow_input_record(
         source_extension=source_output.declared_extension,
         source_execution_role=source_output.execution_role,
         source_is_reused=isinstance(source_output, ReusedRunJobOutputRef),
+        manifest_value_schema=manifest_value_schema,
         manifest_digest=manifest_digest,
         edge_cardinality=edge_cardinality,
         registry_source_artifact_id=(
@@ -2388,23 +2500,18 @@ def _cohort_input_address(
 
 
 def _step_addresses(
-    loaded: LoadedWorkflowProject,
     plan: WorkflowPlan,
     step: WorkflowPlanStep,
 ) -> tuple[str, ...]:
     output_scope = next(iter(_validated_step_outputs(step).values())).address_scope
     if output_scope == "entity":
-        manifest_name = _entity_manifest_name(plan)
+        population = _required_execution_population(plan)
         return tuple(
             validate_path_token(entity_id, label="entity_id")
-            for entity_id in loaded.manifests[manifest_name].entity_ids
+            for entity_id in population.entity_ids
         )
     if output_scope == "cohort":
-        if step.manifest_binding is None:
-            raise ValidationError(
-                f"cohort step {step.step_name!r} must have a manifest binding"
-            )
-        return (step.manifest_binding.manifest_name,)
+        return ("cohort",)
     raise ValidationError(f"unsupported address_scope: {output_scope!r}")
 
 
@@ -2430,7 +2537,6 @@ def _job_id(step_name: str, address: str, outputs: dict[str, Any]) -> str:
 
 
 def _selected_addresses(
-    loaded: LoadedWorkflowProject,
     plan: WorkflowPlan,
     selected_step: WorkflowPlanStep,
     *,
@@ -2444,45 +2550,30 @@ def _selected_addresses(
                 f"{selected_step.step_name!r} is cohort-addressed and cannot be "
                 "targeted by entity address"
             )
-        if selected_step.manifest_binding is None:
-            raise ValidationError(
-                "cohort workflow steps must have a selected-step manifest binding"
-            )
-        return (selected_step.manifest_binding.manifest_name,)
+        return ("cohort",)
     if output.address_scope == "entity":
-        manifest_name = _entity_manifest_name(plan)
-        try:
-            manifest = loaded.manifests[manifest_name]
-        except KeyError as exc:
-            raise ValidationError(f"unknown manifest for entity step: {manifest_name}") from exc
+        population = _required_execution_population(plan)
         if requested_address is not None:
             address = validate_path_token(requested_address, label="address")
-            if address not in manifest.entity_ids:
+            if address not in population.entity_ids:
                 raise ValidationError(
-                    f"address {address!r} is not a member of source-population "
-                    f"manifest {manifest_name!r}"
+                    f"address {address!r} is not a member of execution_population "
+                    f"{population.manifest_name!r}"
                 )
             return (address,)
         return tuple(
             validate_path_token(entity_id, label="entity_id")
-            for entity_id in manifest.entity_ids
+            for entity_id in population.entity_ids
         )
     raise ValidationError(f"unsupported workflow step address_scope: {output.address_scope}")
 
 
-def _entity_manifest_name(plan: WorkflowPlan) -> str:
-    source_population_bindings = [
-        binding.manifest_name
-        for binding in plan.manifest_bindings
-        if binding.role == "source_population"
-    ]
-    if len(source_population_bindings) != 1:
-        found = ", ".join(source_population_bindings) or "none"
-        raise ValidationError(
-            "entity workflow steps require exactly one source_population "
-            f"manifest binding; found {len(source_population_bindings)}: {found}"
-        )
-    return source_population_bindings[0]
+def _required_execution_population(
+    plan: WorkflowPlan,
+) -> WorkflowPlanExecutionPopulation:
+    if plan.execution_population is None:
+        raise ValidationError("entity workflow steps require an execution_population")
+    return plan.execution_population
 
 
 def _plan_step(plan: WorkflowPlan, step_name: str) -> WorkflowPlanStep:

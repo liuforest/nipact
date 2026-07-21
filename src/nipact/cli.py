@@ -505,10 +505,21 @@ def _run_workflow_command(args: argparse.Namespace) -> int | None:
                 f"step={step.step_name} pattern={step.pattern_kind} "
                 f"role={step.execution_role} outputs={outputs}"
             )
+        if plan.execution_population is not None:
+            population = plan.execution_population
+            print(
+                "execution_population "
+                f"manifest={population.manifest_name} "
+                f"manifest_value_schema={population.manifest_value_schema} "
+                f"manifest_hash={population.manifest_hash} "
+                f"entities={population.entity_count}"
+            )
         for binding in plan.manifest_bindings:
             print(
-                f"manifest_binding step={binding.step_name} role={binding.role} "
+                f"manifest_binding step={binding.step_name} "
+                f"usage_role={binding.manifest_usage_role} "
                 f"manifest={binding.manifest_name} "
+                f"manifest_value_schema={binding.manifest_value_schema} "
                 f"manifest_hash={binding.manifest_hash} entities={binding.entity_count}"
             )
         _print_workflow_overrides(loaded.workflows[plan.workflow_name].step_overrides)

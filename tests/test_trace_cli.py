@@ -195,7 +195,7 @@ def test_trace_command_prints_text_summary_for_artifact_id(
     assert "workflow=base" in lines
     assert "step=color_sector_analysis" in lines
     assert "output=sector_counts" in lines
-    assert "address=init" in lines
+    assert "address=cohort" in lines
     assert any(line.startswith("parameter_hash=") for line in lines)
     assert not any(line.startswith("parameters=") for line in lines)
     assert "provenance_status=complete" in lines
@@ -299,7 +299,7 @@ def test_trace_command_context_guards_non_artifact_id_selectors(
             "--output",
             "sector_counts",
             "--address",
-            "init",
+            "cohort",
         ]
 
     assert (

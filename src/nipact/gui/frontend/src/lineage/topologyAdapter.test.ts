@@ -3,7 +3,7 @@ import type { ObservedTopologyResponse } from "../api/types";
 import { buildTopologyElements, topologyNodeLabel } from "./topologyAdapter";
 
 const topology: ObservedTopologyResponse = {
-  schema_version: 1,
+  schema_version: 2,
   perspective: "observed",
   scope: "ancestor_closure",
   context: "colors",
@@ -62,6 +62,7 @@ const topology: ObservedTopologyResponse = {
       target_node_id: "n2",
     },
   ],
+  execution_populations: [],
   manifest_bindings: [],
   warnings: [],
 };

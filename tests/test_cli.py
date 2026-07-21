@@ -215,12 +215,13 @@ def test_workflow_plan_command(
         "outputs=sector_counts"
     ) in output
     assert (
-        "manifest_binding step=color_source role=source_population manifest=init "
-        "manifest_hash=287318ee136c4518 entities=200"
+        "execution_population manifest=init manifest_value_schema=entity_set_v1 "
+        "manifest_hash=90ddcf303284f890 entities=200"
     ) in output
     assert (
-        "manifest_binding step=color_cohort_fit role=fit_cohort manifest=demo-40 "
-        "manifest_hash=9db06e41af119408 entities=40"
+        "manifest_binding step=color_cohort_fit usage_role=fit_cohort "
+        "manifest=demo-40 manifest_value_schema=entity_set_v1 "
+        "manifest_hash=45863852fb99eda5 entities=40"
     ) in output
     assert "overrides=0" in output
     assert output[-1] == "PASS: workflow plan"
@@ -255,8 +256,10 @@ def test_workflow_graph_command_prints_json_only(
     assert graph["selected_step_name"] == "color_sector_analysis"
     assert graph["terminal_step_kind"] == "analysis"
     assert len(graph["nodes"]) == 8
-    assert {binding["role"] for binding in graph["manifest_bindings"]} == {
-        "source_population",
+    assert graph["execution_population"]["manifest_name"] == "init"
+    assert {
+        binding["manifest_usage_role"] for binding in graph["manifest_bindings"]
+    } == {
         "fit_cohort",
         "analysis_cohort",
     }

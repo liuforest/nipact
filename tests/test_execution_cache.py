@@ -19,8 +19,9 @@ from nipact.execution import (
     execute_run_plan,
 )
 from nipact.hashing import sha256_file_digest
+from nipact.manifest import load_manifest
 from nipact.projection import (
-    ResolvedRequestBundleProjectionV1,
+    ResolvedRequestBundleProjectionV2,
     SourceCoordinate,
     UnresolvedRequestBundleProjection,
 )
@@ -224,10 +225,6 @@ def step_apply_file(*, inputs, outputs, params, address):
             "address_scope": "entity",
             "callable": "cache_runtime:step_a_file",
             "source_inputs": ["seed"],
-            "manifest_binding": {
-                "role": "source_population",
-                "manifest": "subjects",
-            },
             "outputs": {
                 "a_out": {
                     "extension": ".json",
@@ -422,6 +419,7 @@ def step_apply_file(*, inputs, outputs, params, address):
         project_dir / "workflows/main.yaml",
         {
             "workflow_name": "main",
+            "execution_population": "subjects",
             "steps": [
                 {
                     "step_name": "a_source",
@@ -458,6 +456,7 @@ def step_apply_file(*, inputs, outputs, params, address):
         project_dir / "workflows/derivative.yaml",
         {
             "workflow_name": "derivative",
+            "execution_population": "subjects",
             "steps": [
                 {
                     "step_name": "a_source",
@@ -485,12 +484,15 @@ def step_apply_file(*, inputs, outputs, params, address):
             encoding="utf-8",
         )
 
-    with sqlite3.connect(runtime_dir / "database/registry.db") as conn:
-        registry_module._create_schema(conn)
-        conn.execute(
-            "INSERT INTO contexts (context, runtime_path) VALUES (?, ?)",
-            ("cache", str(runtime_dir)),
-        )
+    registry_module.initialize_prepared_demo_registry_db(
+        runtime_dir / "database/registry.db",
+        context="cache",
+        runtime_root=runtime_dir,
+        manifests={
+            "subjects": load_manifest(project_dir / "manifests/subjects.yaml")
+        },
+        manifest_paths={"subjects": "manifests/subjects.yaml"},
+    )
     return project_dir, runtime_dir, log_path
 
 
@@ -514,6 +516,13 @@ def _add_cache_entity(
     (runtime_dir / f"data/source/{address}.txt").write_text(
         f"{seed}\n",
         encoding="utf-8",
+    )
+    registry_module.initialize_prepared_demo_registry_db(
+        runtime_dir / "database/registry.db",
+        context="cache",
+        runtime_root=runtime_dir,
+        manifests={"subjects": load_manifest(manifest_path)},
+        manifest_paths={"subjects": "manifests/subjects.yaml"},
     )
 
 
@@ -566,6 +575,7 @@ def _write_sibling_workflow(
         project_dir / f"workflows/{workflow_name}.yaml",
         {
             "workflow_name": workflow_name,
+            "execution_population": "subjects",
             "steps": [
                 {"step_name": name, "output_name": _STEP_SELECTED_OUTPUT[name]}
                 for name in step_names
@@ -889,7 +899,7 @@ def test_projection_planning_uses_prospective_upstream_request_identity(
     )
     c_job = _workflow_input_job(c_plan, step_name="c_transform")
     assert reused_b.projection_state == fresh_b_projection
-    assert isinstance(c_job.projection_state, ResolvedRequestBundleProjectionV1)
+    assert isinstance(c_job.projection_state, ResolvedRequestBundleProjectionV2)
     c_bindings = json.loads(c_job.projection_state.canonical_json)[
         "role_labelled_bindings"
     ]
@@ -947,7 +957,7 @@ def test_projection_planning_uses_prospective_upstream_request_identity(
     after_edit_c = _workflow_input_job(after_edit_plan, step_name="c_transform")
     assert isinstance(
         after_edit_c.projection_state,
-        ResolvedRequestBundleProjectionV1,
+        ResolvedRequestBundleProjectionV2,
     )
     assert after_edit_c.projection_state.canonical_json == before_edit
 
@@ -981,11 +991,11 @@ def test_projection_planning_uses_prospective_upstream_request_identity(
     )
     assert isinstance(
         changed_b.projection_state,
-        ResolvedRequestBundleProjectionV1,
+        ResolvedRequestBundleProjectionV2,
     )
     assert isinstance(
         changed_c.projection_state,
-        ResolvedRequestBundleProjectionV1,
+        ResolvedRequestBundleProjectionV2,
     )
     assert unchanged_a_projection == a_projection
     assert changed_b.projection_state != fresh_b_projection
@@ -1023,13 +1033,17 @@ def test_projection_planning_covers_collection_cohort_and_sibling_outputs(
         step_name="fit_transform",
     )
     fit_job = _workflow_input_job(fit_plan, step_name="fit_transform")
-    assert fit_job.address == "subjects"
-    assert isinstance(fit_job.projection_state, ResolvedRequestBundleProjectionV1)
+    assert fit_job.address == "cohort"
+    assert isinstance(fit_job.projection_state, ResolvedRequestBundleProjectionV2)
     collection = json.loads(fit_job.projection_state.canonical_json)[
         "role_labelled_bindings"
     ][0]
     assert collection["collection_semantics"] == "coordinate_set_v1"
+    assert collection["manifest_value_schema"] == "entity_set_v1"
     assert collection["manifest_digest"] is not None
+    assert {
+        record.manifest_value_schema for record in fit_job.input_records
+    } == {"entity_set_v1"}
     expected_member_digests = sorted(
         {
             output.projection_state.request_bundle_digest
@@ -1037,7 +1051,7 @@ def test_projection_planning_covers_collection_cohort_and_sibling_outputs(
             if output.step_name == "b_transform"
             and isinstance(
                 output.projection_state,
-                ResolvedRequestBundleProjectionV1,
+                ResolvedRequestBundleProjectionV2,
             )
         }
     )
@@ -1059,7 +1073,7 @@ def test_projection_planning_covers_collection_cohort_and_sibling_outputs(
     for apply_job in apply_jobs:
         assert isinstance(
             apply_job.projection_state,
-            ResolvedRequestBundleProjectionV1,
+            ResolvedRequestBundleProjectionV2,
         )
         assert {
             binding["role"]
@@ -1078,7 +1092,7 @@ def test_projection_planning_covers_collection_cohort_and_sibling_outputs(
     multi_job = _workflow_input_job(multi_plan, step_name="multi_transform")
     assert isinstance(
         multi_job.projection_state,
-        ResolvedRequestBundleProjectionV1,
+        ResolvedRequestBundleProjectionV2,
     )
     assert [
         sibling["output_name"]
@@ -1088,6 +1102,65 @@ def test_projection_planning_covers_collection_cohort_and_sibling_outputs(
     ] == ["left_out", "right_out"]
     assert multi_job.output_ref("left_out").projection_plan is multi_job.projection_plan
     assert multi_job.output_ref("right_out").projection_state is multi_job.projection_state
+
+
+def test_manifest_labels_are_nonidentity_but_collection_input_name_is_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project_dir, _runtime_dir, _log_path = _write_cache_project(
+        tmp_path,
+        monkeypatch,
+        entities=("sub_001", "sub_002"),
+    )
+    b_plan = build_run_plan(
+        project_dir=project_dir,
+        context="cache",
+        workflow_name="main",
+        step_name="b_transform",
+    )
+    assert execute_run_plan(b_plan, cores=1).all_selected_resolved
+
+    def fit_digest() -> str:
+        plan = build_run_plan(
+            project_dir=project_dir,
+            context="cache",
+            workflow_name="main",
+            step_name="fit_transform",
+        )
+        state = _workflow_input_job(
+            plan,
+            step_name="fit_transform",
+        ).projection_state
+        assert isinstance(state, ResolvedRequestBundleProjectionV2)
+        return state.request_bundle_digest
+
+    baseline_digest = fit_digest()
+    manifest_payload = yaml.safe_load(
+        (project_dir / "manifests/subjects.yaml").read_text(encoding="utf-8")
+    )
+    _write_yaml(project_dir / "manifests/renamed.yaml", manifest_payload)
+    config_path = project_dir / "nipact.yaml"
+    config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    config["manifests"]["renamed"] = "manifests/renamed.yaml"
+    _write_yaml(config_path, config)
+    workflow_path = project_dir / "workflows/main.yaml"
+    workflow = yaml.safe_load(workflow_path.read_text(encoding="utf-8"))
+    workflow["execution_population"] = "renamed"
+    _write_yaml(workflow_path, workflow)
+    step_path = project_dir / "steps/fit_transform.yaml"
+    step = yaml.safe_load(step_path.read_text(encoding="utf-8"))
+    step["manifest_binding"]["manifest"] = "renamed"
+    _write_yaml(step_path, step)
+    assert fit_digest() == baseline_digest
+
+    step["manifest_binding"]["role"] = "reference_cohort"
+    _write_yaml(step_path, step)
+    assert fit_digest() == baseline_digest
+
+    step["inputs"]["training_data"] = step["inputs"].pop("b_inputs")
+    _write_yaml(step_path, step)
+    assert fit_digest() != baseline_digest
 
 
 def test_dependency_free_workflow_output_remains_reusable_as_an_input(
@@ -1104,10 +1177,6 @@ def test_dependency_free_workflow_output_remains_reusable_as_an_input(
             "execution_role": "transform",
             "address_scope": "entity",
             "callable": "cache_runtime:step_a_file",
-            "manifest_binding": {
-                "role": "source_population",
-                "manifest": "subjects",
-            },
             "outputs": {
                 "constant_out": {
                     "extension": ".json",
@@ -1147,6 +1216,7 @@ def test_dependency_free_workflow_output_remains_reusable_as_an_input(
         project_dir / "workflows/constant_flow.yaml",
         {
             "workflow_name": "constant_flow",
+            "execution_population": "subjects",
             "steps": [
                 {"step_name": "constant_value", "output_name": "constant_out"},
                 {"step_name": "use_constant", "output_name": "used_out"},
@@ -1500,7 +1570,7 @@ def test_real_run_cli_reports_planned_hydration_bytes_fanout_once(
         for step_name, output_name, address in (
             ("b_transform", "b_out", "sub_001"),
             ("b_transform", "b_out", "sub_002"),
-            ("fit_transform", "fit_out", "subjects"),
+            ("fit_transform", "fit_out", "cohort"),
         )
     )
 
@@ -3381,12 +3451,12 @@ def test_sibling_cohort_collection_mixes_sources(
     )
 
     # The recomputed cohort output reflects both entities, drawn from the mixed but
-    # content-validated inputs (cohort address is the manifest name, "subjects").
+    # content-validated inputs under the stable cohort address.
     fit_payload = _latest_workflow_payload(
         runtime_dir,
         step_name="fit_transform",
         output_name="fit_out",
-        address="subjects",
+        address="cohort",
     )
     assert fit_payload["count"] == 2
     assert fit_payload["values"] == ["alpha-b", "beta-b"]
@@ -3960,7 +4030,7 @@ def test_targeted_apply_reuses_registered_cohort_fit_without_executing_sibling(
     assert execute_run_plan(fit_plan, cores=1).published_count == len(
         fit_plan.published_outputs
     )
-    assert log_path.read_text(encoding="utf-8").count("FIT subjects 2") == 1
+    assert log_path.read_text(encoding="utf-8").count("FIT cohort 2") == 1
 
     apply_plan = build_run_plan(
         project_dir=project_dir,
@@ -3973,13 +4043,13 @@ def test_targeted_apply_reuses_registered_cohort_fit_without_executing_sibling(
     # apply job: only its direct inputs hydrate, and sub_002 never executes.
     assert _reused_keys(apply_plan) == {
         ("b_transform", "b_out", "sub_001"),
-        ("fit_transform", "fit_out", "subjects"),
+        ("fit_transform", "fit_out", "cohort"),
     }
     assert execute_run_plan(apply_plan, cores=1).all_selected_resolved
     lines = log_path.read_text(encoding="utf-8").splitlines()
     assert lines.count("B sub_001") == 1
     assert lines.count("B sub_002") == 1
-    assert lines.count("FIT subjects 2") == 1
+    assert lines.count("FIT cohort 2") == 1
     assert lines.count("APPLY sub_001") == 1
     assert "APPLY sub_002" not in lines
     apply_payload = _latest_workflow_payload(
@@ -4031,7 +4101,7 @@ def test_targeted_apply_dry_run_maps_registered_cohort_fit(
     )
     assert _reused_keys(apply_plan) == {
         ("b_transform", "b_out", "sub_001"),
-        ("fit_transform", "fit_out", "subjects"),
+        ("fit_transform", "fit_out", "cohort"),
     }
     assert execute_run_plan(apply_plan, cores=1).published_count == 0
 
@@ -4099,20 +4169,20 @@ def test_targeted_apply_executes_fresh_cohort_ancestor_with_population_fan_in(
         for spec in apply_plan.published_outputs
     } == {
         ("apply_transform", "apply_out", "sub_001"),
-        ("fit_transform", "fit_out", "subjects"),
+        ("fit_transform", "fit_out", "cohort"),
     }
     assert execute_run_plan(apply_plan, cores=1).all_selected_resolved
     lines = log_path.read_text(encoding="utf-8").splitlines()
     assert lines.count("B sub_001") == 1
     assert lines.count("B sub_002") == 1
-    assert lines.count("FIT subjects 2") == 1
+    assert lines.count("FIT cohort 2") == 1
     assert lines.count("APPLY sub_001") == 1
     assert "APPLY sub_002" not in lines
     fit_payload = _latest_workflow_payload(
         runtime_dir,
         step_name="fit_transform",
         output_name="fit_out",
-        address="subjects",
+        address="cohort",
     )
     assert fit_payload["count"] == 2
     assert fit_payload["values"] == ["alpha-b", "beta-b"]
@@ -4149,7 +4219,7 @@ def test_targeted_apply_with_empty_registry_executes_fresh_population_fan_in(
         ("a_source", "a_out", "sub_002"),
         ("b_transform", "b_out", "sub_001"),
         ("b_transform", "b_out", "sub_002"),
-        ("fit_transform", "fit_out", "subjects"),
+        ("fit_transform", "fit_out", "cohort"),
         ("apply_transform", "apply_out", "sub_001"),
     }
     assert {
@@ -4163,7 +4233,7 @@ def test_targeted_apply_with_empty_registry_executes_fresh_population_fan_in(
     lines = log_path.read_text(encoding="utf-8").splitlines()
     assert lines.count("B sub_001") == 1
     assert lines.count("B sub_002") == 1
-    assert lines.count("FIT subjects 2") == 1
+    assert lines.count("FIT cohort 2") == 1
     assert lines.count("APPLY sub_001") == 1
     assert "APPLY sub_002" not in lines
     with sqlite3.connect(runtime_dir / "database/registry.db") as conn:
@@ -4181,7 +4251,7 @@ def test_targeted_apply_with_empty_registry_executes_fresh_population_fan_in(
         runtime_dir,
         step_name="fit_transform",
         output_name="fit_out",
-        address="subjects",
+        address="cohort",
     )
     assert fit_payload["count"] == 2
     assert fit_payload["values"] == ["alpha-b", "beta-b"]
@@ -5718,7 +5788,7 @@ def test_targeted_dry_run_maps_only_reachable_reused_inputs(
     assert _registry_row_counts(runtime_dir) == counts_before
 
 
-def test_targeted_run_becomes_current_and_keeps_full_manifest_binding(
+def test_targeted_run_becomes_current_and_keeps_full_execution_population(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -5758,13 +5828,16 @@ def test_targeted_run_becomes_current_and_keeps_full_manifest_binding(
             ORDER BY run_id
             """
         ).fetchall()
-        binding_rows_by_run = {
+        population_rows_by_run = {
             run_id: conn.execute(
                 """
-                SELECT step_name, role, manifest_name, manifest_digest, entity_count
-                FROM run_manifest_bindings
-                WHERE run_id = ?
-                ORDER BY step_name, role, manifest_name
+                SELECT p.manifest_name, p.manifest_value_schema,
+                       p.manifest_digest, v.entity_count
+                FROM run_execution_population p
+                JOIN manifest_values v
+                  ON v.value_schema = p.manifest_value_schema
+                 AND v.manifest_digest = p.manifest_digest
+                WHERE p.run_id = ?
                 """,
                 (run_id,),
             ).fetchall()
@@ -5786,12 +5859,10 @@ def test_targeted_run_becomes_current_and_keeps_full_manifest_binding(
         address="sub_002",
     )
     assert _artifact_run_id(runtime_dir, artifact_id=sibling_row[0]) == full_run[0]
-    # The targeted run records the original two-entity source-population
-    # binding, not a synthetic one-entity manifest.
-    targeted_bindings = binding_rows_by_run[targeted_run[0]]
-    assert targeted_bindings == binding_rows_by_run[full_run[0]]
-    assert ("a_source", "source_population", "subjects") in {
-        (step, role, manifest)
-        for step, role, manifest, _digest, _count in targeted_bindings
-    }
-    assert all(count == 2 for *_rest, count in targeted_bindings)
+    # The targeted run records the original two-entity execution population,
+    # not a synthetic one-entity manifest value.
+    targeted_population = population_rows_by_run[targeted_run[0]]
+    assert targeted_population == population_rows_by_run[full_run[0]]
+    assert len(targeted_population) == 1
+    assert targeted_population[0][0:2] == ("subjects", "entity_set_v1")
+    assert targeted_population[0][3] == 2

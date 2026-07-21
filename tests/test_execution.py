@@ -17,11 +17,13 @@ from nipact.execution import (
     _run_plan_payload,
     _run_snakemake,
     _snakefile_text,
+    _validate_exact_scientific_fan_in,
     build_run_plan,
     execute_run_plan,
 )
 from nipact.hashing import is_valid_digest, sha256_digest, sha256_file_digest, short_hash
-from nipact.projection import ResolvedRequestBundleProjectionV1
+from nipact.manifest import load_manifest
+from nipact.projection import ResolvedRequestBundleProjectionV2
 from nipact.registry import EnvironmentObservationV1
 from nipact.runtime import run_job
 from nipact.trace import build_trace_graph_for_workflow_coordinate
@@ -219,10 +221,6 @@ def uppercase_text_file(*, inputs, outputs, params, address):
             "address_scope": "entity",
             "callable": "mini_runtime:import_text_file",
             "source_inputs": ["source_text"],
-            "manifest_binding": {
-                "role": "source_population",
-                "manifest": "subjects",
-            },
             "outputs": {
                 "raw_text": {
                     "extension": ".json",
@@ -258,6 +256,7 @@ def uppercase_text_file(*, inputs, outputs, params, address):
         project_dir / "workflows/main.yaml",
         {
             "workflow_name": "main",
+            "execution_population": "subjects",
             "steps": [
                 "source_text",
                 {
@@ -278,12 +277,15 @@ def uppercase_text_file(*, inputs, outputs, params, address):
             encoding="utf-8",
         )
 
-    with sqlite3.connect(runtime_dir / "database/registry.db") as conn:
-        registry_module._create_schema(conn)
-        conn.execute(
-            "INSERT INTO contexts (context, runtime_path) VALUES (?, ?)",
-            ("mini", str(runtime_dir)),
-        )
+    registry_module.initialize_prepared_demo_registry_db(
+        runtime_dir / "database/registry.db",
+        context="mini",
+        runtime_root=runtime_dir,
+        manifests={
+            "subjects": load_manifest(project_dir / "manifests/subjects.yaml")
+        },
+        manifest_paths={"subjects": "manifests/subjects.yaml"},
+    )
     return project_dir, runtime_dir
 
 
@@ -409,10 +411,6 @@ def consume_qc_file(*, inputs, outputs, params, address):
             "address_scope": "entity",
             "callable": "mini_multi_runtime:import_source_pair",
             "source_inputs": ["source_text"],
-            "manifest_binding": {
-                "role": "source_population",
-                "manifest": "subjects",
-            },
             "outputs": {
                 "raw_text": {
                     "extension": ".json",
@@ -452,6 +450,7 @@ def consume_qc_file(*, inputs, outputs, params, address):
         project_dir / "workflows/import_raw.yaml",
         {
             "workflow_name": "import_raw",
+            "execution_population": "subjects",
             "steps": [
                 {
                     "step_name": "source_text",
@@ -464,6 +463,7 @@ def consume_qc_file(*, inputs, outputs, params, address):
         project_dir / "workflows/consume_qc.yaml",
         {
             "workflow_name": "consume_qc",
+            "execution_population": "subjects",
             "steps": [
                 "source_text",
                 {
@@ -480,12 +480,15 @@ def consume_qc_file(*, inputs, outputs, params, address):
             encoding="utf-8",
         )
 
-    with sqlite3.connect(runtime_dir / "database/registry.db") as conn:
-        registry_module._create_schema(conn)
-        conn.execute(
-            "INSERT INTO contexts (context, runtime_path) VALUES (?, ?)",
-            ("multi", str(runtime_dir)),
-        )
+    registry_module.initialize_prepared_demo_registry_db(
+        runtime_dir / "database/registry.db",
+        context="multi",
+        runtime_root=runtime_dir,
+        manifests={
+            "subjects": load_manifest(project_dir / "manifests/subjects.yaml")
+        },
+        manifest_paths={"subjects": "manifests/subjects.yaml"},
+    )
     return project_dir, runtime_dir
 
 
@@ -567,7 +570,7 @@ def test_build_run_plan_for_base_cohort_step(
     assert (
         "color_sector_analysis",
         "sector_counts",
-        "init",
+        "cohort",
     ) in {
         (spec.step_name, spec.output_name, spec.address)
         for spec in run_plan.published_outputs
@@ -610,7 +613,6 @@ def test_build_run_plan_with_address_selects_one_entity(
         step_name="uppercase_text",
         address="sub_001",
     )
-
     assert run_plan.requested_address == "sub_001"
     assert len(run_plan.selected_fresh_output_refs) == 1
     assert run_plan.selected_fresh_output_refs[0].address == "sub_001"
@@ -668,6 +670,36 @@ def test_selected_output_partition_rejects_duplicates_and_missing_coordinates(
             selected_addresses=("sub_001",),
             selected_fresh_output_refs=(),
             selected_reused_output_refs=(),
+        )
+
+
+@pytest.mark.parametrize(
+    ("expected", "collected", "output_addresses", "error"),
+    [
+        (("a", "b"), ("a",), None, "missing: b"),
+        (("a",), ("a", "b"), None, "extra: b"),
+        (("a", "b"), ("a", "a", "b"), None, "duplicate addresses: a"),
+        (
+            ("a", "b"),
+            ("a", "b"),
+            ("a", "wrong"),
+            "wrongly addressed upstream output",
+        ),
+    ],
+)
+def test_exact_scientific_fan_in_rejects_invalid_collections(
+    expected: tuple[str, ...],
+    collected: tuple[str, ...],
+    output_addresses: tuple[str, ...] | None,
+    error: str,
+) -> None:
+    with pytest.raises(ValidationError, match=error):
+        _validate_exact_scientific_fan_in(
+            step_name="fit",
+            input_name="training_data",
+            expected_addresses=expected,
+            collected_addresses=collected,
+            output_addresses=output_addresses,
         )
 
 
@@ -757,7 +789,7 @@ def test_build_run_plan_rejects_address_not_in_manifest(
 
     with pytest.raises(
         ValidationError,
-        match="not a member of source-population manifest 'subjects'",
+        match="not a member of execution_population 'subjects'",
     ):
         build_run_plan(
             project_dir=project_dir,
@@ -1050,7 +1082,7 @@ def test_multi_output_run_registers_sibling_outputs_and_exact_dependency(
     for reused_output in equivalent_plan.reused_outputs:
         assert isinstance(
             reused_output.projection_state,
-            ResolvedRequestBundleProjectionV1,
+            ResolvedRequestBundleProjectionV2,
         )
         assert reused_output.projection_state.canonical_json in (
             source_projection_by_address[reused_output.address]
@@ -1120,7 +1152,7 @@ def test_execute_run_plan_publishes_selected_outputs_without_real_snakemake(
     output_dir = runtime_dir / "outputs/colors/base/color_sector_analysis/sector_counts"
     outputs = sorted(output_dir.glob("*.json"))
     assert len(outputs) == 1
-    assert outputs[0].name.startswith("init.")
+    assert outputs[0].name.startswith("cohort.")
     with sqlite3.connect(runtime_dir / "database/registry.db") as conn:
         rows = conn.execute(
             """
@@ -1153,7 +1185,7 @@ def test_execute_run_plan_publishes_selected_outputs_without_real_snakemake(
             row
             for row in rows
             if row[:4]
-            == ("base", "color_sector_analysis", "sector_counts", "init")
+            == ("base", "color_sector_analysis", "sector_counts", "cohort")
         )
         selected_artifact = conn.execute(
             """
@@ -1176,7 +1208,7 @@ def test_execute_run_plan_publishes_selected_outputs_without_real_snakemake(
         "base",
         "color_sector_analysis",
         "sector_counts",
-        "init",
+        "cohort",
         f"outputs/colors/base/color_sector_analysis/sector_counts/{outputs[0].name}",
     )
     assert selected_row[5] is not None
@@ -1194,7 +1226,7 @@ def test_execute_run_plan_publishes_selected_outputs_without_real_snakemake(
         1,
         1,
         f"outputs/colors/base/color_sector_analysis/sector_counts/{outputs[0].name}",
-        "runs/colors/base/color_sector_analysis/staging/color_sector_analysis/sector_counts/init.json",
+        "runs/colors/base/color_sector_analysis/staging/color_sector_analysis/sector_counts/cohort.json",
     )
     assert json.loads(run_observations[0]) == {
         "schema_version": 1,
@@ -1206,7 +1238,7 @@ def test_execute_run_plan_publishes_selected_outputs_without_real_snakemake(
                 "workflow_name": "base",
                 "step_name": "color_sector_analysis",
                 "output_name": "sector_counts",
-                "address": "init",
+                "address": "cohort",
                 "resolution": {
                     "artifact_id": selected_row[5],
                     "outcome": "generated",

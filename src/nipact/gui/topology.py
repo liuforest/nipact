@@ -70,6 +70,9 @@ def build_observed_topology(trace_graph: dict[str, Any]) -> dict[str, Any]:
         },
         "nodes": nodes,
         "edges": edges,
+        "execution_populations": _group_execution_populations(
+            trace_graph["execution_populations"]
+        ),
         "manifest_bindings": _group_manifest_bindings(
             trace_graph["manifest_bindings"]
         ),
@@ -297,13 +300,14 @@ def _build_edges(
 def _group_manifest_bindings(
     manifest_bindings: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    groups: dict[tuple[str, str, str, str], dict[str, set[Any]]] = {}
+    groups: dict[tuple[str, str, str, str, str], dict[str, set[Any]]] = {}
     for binding in manifest_bindings:
         key = (
             binding["workflow_name"],
             binding["step_name"],
-            binding["role"],
+            binding["manifest_usage_role"],
             binding["manifest_name"],
+            binding["manifest_value_schema"],
         )
         group = groups.setdefault(
             key,
@@ -315,14 +319,71 @@ def _group_manifest_bindings(
         group["entity_counts"].add(binding["entity_count"])
 
     summaries: list[dict[str, Any]] = []
-    for workflow_name, step_name, role, manifest_name in sorted(groups):
-        group = groups[(workflow_name, step_name, role, manifest_name)]
+    for (
+        workflow_name,
+        step_name,
+        manifest_usage_role,
+        manifest_name,
+        manifest_value_schema,
+    ) in sorted(groups):
+        group = groups[
+            (
+                workflow_name,
+                step_name,
+                manifest_usage_role,
+                manifest_name,
+                manifest_value_schema,
+            )
+        ]
         summaries.append(
             {
                 "workflow_name": workflow_name,
                 "step_name": step_name,
-                "role": role,
+                "manifest_usage_role": manifest_usage_role,
                 "manifest_name": manifest_name,
+                "manifest_value_schema": manifest_value_schema,
+                "distinct_run_count": len(group["run_ids"]),
+                "distinct_manifest_digest_count": len(group["digests"]),
+                "manifest_digest": _agreed_value(group["digests"]),
+                "manifest_hash": _agreed_value(group["hashes"]),
+                "entity_count": _agreed_value(group["entity_counts"]),
+            }
+        )
+    return summaries
+
+
+def _group_execution_populations(
+    populations: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    groups: dict[tuple[str, str, str], dict[str, set[Any]]] = {}
+    for population in populations:
+        key = (
+            population["workflow_name"],
+            population["manifest_name"],
+            population["manifest_value_schema"],
+        )
+        group = groups.setdefault(
+            key,
+            {
+                "run_ids": set(),
+                "digests": set(),
+                "hashes": set(),
+                "entity_counts": set(),
+            },
+        )
+        group["run_ids"].add(population["run_id"])
+        group["digests"].add(population["manifest_digest"])
+        group["hashes"].add(population["manifest_hash"])
+        group["entity_counts"].add(population["entity_count"])
+
+    summaries: list[dict[str, Any]] = []
+    for workflow_name, manifest_name, manifest_value_schema in sorted(groups):
+        group = groups[(workflow_name, manifest_name, manifest_value_schema)]
+        summaries.append(
+            {
+                "workflow_name": workflow_name,
+                "manifest_name": manifest_name,
+                "manifest_value_schema": manifest_value_schema,
                 "distinct_run_count": len(group["run_ids"]),
                 "distinct_manifest_digest_count": len(group["digests"]),
                 "manifest_digest": _agreed_value(group["digests"]),

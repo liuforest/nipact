@@ -9,7 +9,7 @@ import {
 } from "./lineageInteraction";
 
 const graph: TraceGraphResponse = {
-  schema_version: 1,
+  schema_version: 2,
   context: "colors",
   selected_artifact_id: 2,
   provenance_status: "complete",
@@ -94,10 +94,12 @@ const graph: TraceGraphResponse = {
       source_file_size: 100,
       source_extension: ".json",
       dependency_set_id: null,
+      manifest_value_schema: null,
       manifest_digest: null,
       edge_cardinality: null,
     },
   ],
+  execution_populations: [],
   manifest_bindings: [],
   warnings: [],
 };

@@ -96,8 +96,9 @@ def _manifest_binding() -> dict:
     return {
         "workflow_name": "wf",
         "step_name": "fit",
-        "role": "source_population",
+        "manifest_usage_role": "fit_cohort",
         "manifest_name": "cohort",
+        "manifest_value_schema": "entity_set_v1",
         "distinct_run_count": 2,
         "distinct_manifest_digest_count": 1,
         "manifest_digest": "deadbeef",
@@ -128,6 +129,7 @@ def _full_response() -> dict:
             _source_root_node(),
         ],
         "edges": [_consumes_edge(), _produces_edge()],
+        "execution_populations": [],
         "manifest_bindings": [_manifest_binding()],
         "warnings": [{"warning_type": "missing_artifact", "occurrence_count": 2}],
     }

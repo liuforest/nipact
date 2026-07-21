@@ -10,6 +10,7 @@ from .errors import ValidationError
 from .registry import (
     RegistryArtifact,
     RegistryDependency,
+    RegistryExecutionPopulation,
     RegistryManifestBinding,
     _open_registry_read_session,
     _RegistryReadSession,
@@ -20,7 +21,7 @@ from .registry import (
 )
 
 
-TRACE_SCHEMA_VERSION = 1
+TRACE_SCHEMA_VERSION = 2
 
 
 def build_trace_graph_for_artifact_id(
@@ -167,6 +168,12 @@ def build_trace_graph(
             artifacts=artifacts.values(),
             warnings=warnings,
         )
+        execution_populations = _execution_population_payloads(
+            session,
+            context=selected_artifact.context,
+            artifacts=artifacts.values(),
+            warnings=warnings,
+        )
     return {
         "schema_version": TRACE_SCHEMA_VERSION,
         "context": selected_artifact.context,
@@ -183,6 +190,7 @@ def build_trace_graph(
             ),
             key=lambda row: row["edge_id"],
         ),
+        "execution_populations": execution_populations,
         "manifest_bindings": manifest_bindings,
         "warnings": warnings,
     }
@@ -302,6 +310,42 @@ def _manifest_binding_payloads(
     return sorted(bindings.values(), key=_manifest_binding_sort_key)
 
 
+def _execution_population_payloads(
+    session: _RegistryReadSession,
+    *,
+    context: str,
+    artifacts: Iterable[dict[str, Any]],
+    warnings: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    run_ids = sorted(
+        {
+            artifact["run_id"]
+            for artifact in artifacts
+            if artifact["run_id"] is not None
+        }
+    )
+    populations: dict[int, dict[str, Any]] = {}
+    for run_id in run_ids:
+        try:
+            population = session.read_run_execution_population(
+                run_id=run_id,
+                context=context,
+            )
+        except ValidationError as exc:
+            warnings.append(
+                {
+                    "warning_type": "missing_execution_population",
+                    "message": str(exc),
+                    "artifact_id": None,
+                    "input_path": None,
+                }
+            )
+            continue
+        if population is not None:
+            populations[run_id] = _execution_population_payload(population)
+    return [populations[run_id] for run_id in sorted(populations)]
+
+
 def _artifact_payload(
     artifact: RegistryArtifact,
     *,
@@ -362,6 +406,7 @@ def _dependency_payload(
         "source_file_size": dependency.source_file_size,
         "source_extension": dependency.source_extension,
         "dependency_set_id": dependency.dependency_set_id,
+        "manifest_value_schema": dependency.manifest_value_schema,
         "manifest_digest": dependency.manifest_digest,
         "edge_cardinality": dependency.edge_cardinality,
     }
@@ -394,11 +439,26 @@ def _manifest_binding_payload(
         "run_id": binding.run_id,
         "workflow_name": binding.workflow_name,
         "step_name": binding.step_name,
-        "role": binding.role,
+        "manifest_usage_role": binding.manifest_usage_role,
         "manifest_name": binding.manifest_name,
+        "manifest_value_schema": binding.manifest_value_schema,
         "manifest_digest": binding.manifest_digest,
         "manifest_hash": binding.manifest_hash,
         "entity_count": binding.entity_count,
+    }
+
+
+def _execution_population_payload(
+    population: RegistryExecutionPopulation,
+) -> dict[str, Any]:
+    return {
+        "run_id": population.run_id,
+        "workflow_name": population.workflow_name,
+        "manifest_name": population.manifest_name,
+        "manifest_value_schema": population.manifest_value_schema,
+        "manifest_digest": population.manifest_digest,
+        "manifest_hash": population.manifest_hash,
+        "entity_count": population.entity_count,
     }
 
 
@@ -434,7 +494,7 @@ def _manifest_binding_key(
     return (
         binding.run_id,
         binding.step_name,
-        binding.role,
+        binding.manifest_usage_role,
         binding.manifest_name,
     )
 
@@ -443,6 +503,6 @@ def _manifest_binding_sort_key(row: dict[str, Any]) -> tuple[int, str, str, str]
     return (
         row["run_id"],
         row["step_name"],
-        row["role"],
+        row["manifest_usage_role"],
         row["manifest_name"],
     )

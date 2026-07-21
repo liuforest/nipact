@@ -102,6 +102,7 @@ def test_generated_colors_demo_workflow_files_load(tmp_path: Path) -> None:
 
     base = loaded.workflows["base"]
     assert base.base_workflow is None
+    assert base.execution_population_name == "init"
     assert base.steps == expected_step_order
     assert base.step_outputs == {
         "color_local_transform": "local_color",
@@ -113,6 +114,7 @@ def test_generated_colors_demo_workflow_files_load(tmp_path: Path) -> None:
 
     variant = loaded.workflows["red-qc-target"]
     assert variant.base_workflow == "base"
+    assert variant.execution_population_name == "init"
     assert variant.steps == base.steps
     assert variant.step_outputs == base.step_outputs
     assert variant.step_overrides["color_candidate_select"].params == {
@@ -212,12 +214,133 @@ def test_loader_merges_chained_workflow_inheritance(tmp_path: Path) -> None:
     leaf = loaded.workflows["leaf-qc-target"]
 
     assert leaf.base_workflow == "mid-qc-target"
+    assert leaf.execution_population_name == "init"
     assert leaf.steps == base.steps
     assert leaf.step_outputs == base.step_outputs
     assert leaf.step_overrides["color_candidate_select"].params == {
         "mid_param": "yes",
         "qc_target_theta": 0.5,
     }
+
+
+def test_derived_workflow_can_override_execution_population(tmp_path: Path) -> None:
+    project_dir, _runtime_dir = _init_demo(tmp_path)
+    workflow_path = project_dir / "workflows/red-qc-target.yaml"
+    payload = _read_yaml(workflow_path)
+    payload["execution_population"] = "demo-40"
+    _write_yaml(workflow_path, payload)
+
+    loaded = _load(project_dir)
+    plan = compile_workflow_plan(
+        loaded,
+        workflow_name="red-qc-target",
+        step_name="color_local_transform",
+    )
+
+    assert loaded.workflows["red-qc-target"].execution_population_name == "demo-40"
+    assert plan.execution_population is not None
+    assert plan.execution_population.manifest_name == "demo-40"
+
+
+def test_loader_rejects_unknown_execution_population(tmp_path: Path) -> None:
+    project_dir, _runtime_dir = _init_demo(tmp_path)
+    workflow_path = project_dir / "workflows/base.yaml"
+    payload = _read_yaml(workflow_path)
+    payload["execution_population"] = "missing"
+    _write_yaml(workflow_path, payload)
+
+    with pytest.raises(ValidationError, match="unknown execution_population"):
+        _load(project_dir)
+
+
+def test_compile_requires_execution_population_for_entity_path(tmp_path: Path) -> None:
+    project_dir, _runtime_dir = _init_demo(tmp_path)
+    workflow_path = project_dir / "workflows/base.yaml"
+    payload = _read_yaml(workflow_path)
+    del payload["execution_population"]
+    _write_yaml(workflow_path, payload)
+
+    with pytest.raises(ValidationError, match="requires an execution_population"):
+        _compile(project_dir, step_name="color_local_transform")
+
+
+def test_population_free_cohort_only_workflow_is_valid(tmp_path: Path) -> None:
+    project_dir, _runtime_dir = _init_demo(tmp_path)
+    config_path = project_dir / "nipact.yaml"
+    config = _read_yaml(config_path)
+    config["workflows"]["cohort-only"] = "workflows/cohort-only.yaml"
+    _write_yaml(config_path, config)
+    _write_yaml(
+        project_dir / "steps/cohort_summary.yaml",
+        {
+            "step_name": "cohort_summary",
+            "step_contract_version": "1",
+            "pattern_kind": "analysis",
+            "execution_role": "analysis",
+            "address_scope": "cohort",
+            "callable": (
+                "nipact.examples.colors_processing_demo.runtime:"
+                "color_sector_analysis_file"
+            ),
+            "outputs": {
+                "summary": {"extension": ".json", "address_scope": "cohort"}
+            },
+        },
+    )
+    _write_yaml(
+        project_dir / "workflows/cohort-only.yaml",
+        {
+            "workflow_name": "cohort-only",
+            "steps": [{"step_name": "cohort_summary", "output_name": "summary"}],
+        },
+    )
+
+    plan = _compile(
+        project_dir,
+        workflow_name="cohort-only",
+        step_name="cohort_summary",
+    )
+
+    assert plan.execution_population is None
+    assert plan.manifest_bindings == ()
+
+
+def test_loader_rejects_reserved_source_population_role(tmp_path: Path) -> None:
+    project_dir, _runtime_dir = _init_demo(tmp_path)
+    step_path = project_dir / "steps/color_source.yaml"
+    payload = _read_yaml(step_path)
+    payload["manifest_binding"] = {
+        "role": "source_population",
+        "manifest": "init",
+    }
+    _write_yaml(step_path, payload)
+
+    with pytest.raises(ValidationError, match="role 'source_population' is reserved"):
+        _load(project_dir)
+
+
+def test_loader_requires_scientific_manifest_for_collection_input(tmp_path: Path) -> None:
+    project_dir, _runtime_dir = _init_demo(tmp_path)
+    step_path = project_dir / "steps/color_cohort_fit.yaml"
+    payload = _read_yaml(step_path)
+    del payload["manifest_binding"]
+    _write_yaml(step_path, payload)
+
+    with pytest.raises(ValidationError, match="requires a scientific manifest_binding"):
+        _load(project_dir)
+
+
+def test_compile_rejects_scientific_manifest_outside_execution_population(
+    tmp_path: Path,
+) -> None:
+    project_dir, _runtime_dir = _init_demo(tmp_path)
+    manifest_path = project_dir / "manifests/demo-40.yaml"
+    payload = _read_yaml(manifest_path)
+    payload["entities"].append("outside_entity")
+    _write_yaml(manifest_path, payload)
+
+    with pytest.raises(ValidationError, match="is not a subset"):
+        _compile(project_dir, step_name="color_cohort_fit")
 
 
 def test_compile_base_sector_analysis_plan_includes_expected_steps(tmp_path: Path) -> None:
@@ -238,8 +361,10 @@ def test_compile_base_sector_analysis_plan_includes_expected_steps(tmp_path: Pat
         "color_sector_label",
         "color_sector_analysis",
     ]
-    assert [binding.role for binding in plan.manifest_bindings] == [
-        "source_population",
+    assert plan.execution_population is not None
+    assert plan.execution_population.manifest_name == "init"
+    assert plan.execution_population.manifest_value_schema == "entity_set_v1"
+    assert [binding.manifest_usage_role for binding in plan.manifest_bindings] == [
         "fit_cohort",
         "analysis_cohort",
     ]
@@ -257,7 +382,9 @@ def test_compile_base_local_transform_plan_trims_downstream_steps(tmp_path: Path
         "color_features",
         "color_local_transform",
     ]
-    assert [binding.role for binding in plan.manifest_bindings] == ["source_population"]
+    assert plan.execution_population is not None
+    assert plan.execution_population.manifest_name == "init"
+    assert plan.manifest_bindings == ()
 
 
 def test_compile_variant_applies_step_override(tmp_path: Path) -> None:
@@ -310,18 +437,26 @@ def test_compile_manifest_binding_facts_match_loaded_manifests(tmp_path: Path) -
         workflow_name="base",
         step_name="color_sector_analysis",
     )
-    bindings = {(binding.step_name, binding.role): binding for binding in plan.manifest_bindings}
+    bindings = {
+        (binding.step_name, binding.manifest_usage_role): binding
+        for binding in plan.manifest_bindings
+    }
 
-    source_binding = bindings[("color_source", "source_population")]
-    source_manifest = loaded.manifests[source_binding.manifest_name]
-    assert source_binding.manifest_digest == source_manifest.manifest_digest
-    assert source_binding.manifest_hash == source_manifest.manifest_hash
-    assert source_binding.entity_count == source_manifest.entity_count
+    execution_population = plan.execution_population
+    assert execution_population is not None
+    source_manifest = loaded.manifests[execution_population.manifest_name]
+    assert execution_population.manifest_value_schema == source_manifest.manifest_value_schema
+    assert execution_population.manifest_digest == source_manifest.manifest_digest
+    assert execution_population.manifest_hash == source_manifest.manifest_hash
+    assert execution_population.entity_ids == source_manifest.entity_ids
+    assert execution_population.entity_count == source_manifest.entity_count
 
     fit_binding = bindings[("color_cohort_fit", "fit_cohort")]
     fit_manifest = loaded.manifests[fit_binding.manifest_name]
     assert fit_binding.manifest_digest == fit_manifest.manifest_digest
+    assert fit_binding.manifest_value_schema == fit_manifest.manifest_value_schema
     assert fit_binding.manifest_hash == fit_manifest.manifest_hash
+    assert fit_binding.entity_ids == fit_manifest.entity_ids
     assert fit_binding.entity_count == fit_manifest.entity_count
 
 
@@ -430,12 +565,16 @@ def test_graph_projection_includes_manifest_bindings_from_dependency_path(
     project_dir, _runtime_dir = _init_demo(tmp_path)
 
     graph = _graph(project_dir)
-    bindings = {binding["role"]: binding for binding in graph["manifest_bindings"]}
+    population = graph["execution_population"]
+    assert population["manifest_name"] == "init"
+    assert population["manifest_value_schema"] == "entity_set_v1"
+    assert population["entity_count"] == 200
+    bindings = {
+        binding["manifest_usage_role"]: binding
+        for binding in graph["manifest_bindings"]
+    }
 
-    assert list(bindings) == ["source_population", "fit_cohort", "analysis_cohort"]
-    assert bindings["source_population"]["node_id"] == "step:color_source"
-    assert bindings["source_population"]["manifest_name"] == "init"
-    assert bindings["source_population"]["entity_count"] == 200
+    assert list(bindings) == ["fit_cohort", "analysis_cohort"]
     assert bindings["fit_cohort"]["node_id"] == "step:color_cohort_fit"
     assert bindings["fit_cohort"]["manifest_name"] == "demo-40"
     assert bindings["analysis_cohort"]["node_id"] == "step:color_sector_analysis"
@@ -458,9 +597,8 @@ def test_graph_projection_for_trimmed_step_omits_downstream_steps(tmp_path: Path
         "color_features",
         "color_local_transform",
     ]
-    assert [binding["role"] for binding in graph["manifest_bindings"]] == [
-        "source_population"
-    ]
+    assert graph["execution_population"]["manifest_name"] == "init"
+    assert graph["manifest_bindings"] == []
 
 
 def test_graph_validation_rejects_duplicate_ids(tmp_path: Path) -> None:
