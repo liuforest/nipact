@@ -34,10 +34,6 @@ class Manifest:
         return self.value.entity_ids
 
     @property
-    def manifest_body(self) -> str:
-        return self.value.canonical_body
-
-    @property
     def canonical_body(self) -> str:
         return self.value.canonical_body
 
@@ -153,21 +149,6 @@ def canonical_entity_ids(entity_ids: Iterable[object]) -> tuple[str, ...]:
             "manifest contains duplicate entity_id values: " + ", ".join(sorted(duplicates))
         )
     return tuple(sorted(cleaned))
-
-
-def manifest_body(entity_ids: Iterable[object]) -> str:
-    """Return the canonical manifest body used for identity hashing."""
-    return "\n".join(canonical_entity_ids(entity_ids))
-
-
-def manifest_digest(entity_ids: Iterable[object]) -> str:
-    """Return the full 64-character manifest_digest for membership."""
-    return sha256_digest(manifest_body(entity_ids).encode("utf-8"))
-
-
-def manifest_hash(entity_ids: Iterable[object]) -> str:
-    """Return the 16-character manifest_hash for membership."""
-    return short_hash(manifest_digest(entity_ids))
 
 
 def build_manifest_value(*, entities: Iterable[object]) -> ManifestValue:

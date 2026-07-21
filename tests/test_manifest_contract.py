@@ -12,7 +12,6 @@ from nipact.manifest import (
     build_manifest,
     build_manifest_value,
     load_manifest,
-    manifest_digest,
     parse_manifest,
 )
 
@@ -46,8 +45,8 @@ def test_manifest_identity_uses_sorted_membership_only() -> None:
     )
 
     assert first.entity_ids == ("color_000", "color_001", "color_002")
-    assert first.manifest_body == "color_000\ncolor_001\ncolor_002"
-    assert second.manifest_body == first.manifest_body
+    assert first.canonical_body == "color_000\ncolor_001\ncolor_002"
+    assert second.canonical_body == first.canonical_body
     assert second.manifest_digest == first.manifest_digest
     assert second.manifest_hash == first.manifest_hash
 
@@ -65,7 +64,7 @@ def test_build_manifest_exposes_derived_inspection_fields() -> None:
     assert manifest.manifest_value_schema == MANIFEST_VALUE_SCHEMA
     assert manifest.canonical_body == ENTITY_SET_V1_BODY
     assert manifest.manifest_digest == ENTITY_SET_V1_DIGEST
-    assert manifest.manifest_digest != manifest_digest(manifest.entity_ids)
+    assert manifest.manifest_digest != sha256_digest(manifest.canonical_body.encode("utf-8"))
     assert manifest.manifest_hash == short_hash(manifest.manifest_digest)
 
 
@@ -87,7 +86,7 @@ def test_manifest_value_uses_frozen_entity_set_v1_contract() -> None:
 def test_manifest_value_digest_is_domain_separated_from_legacy_digest() -> None:
     value = build_manifest_value(entities=["color_000", "color_001", "color_002"])
 
-    assert manifest_digest(value.entity_ids) == LEGACY_MANIFEST_DIGEST
+    assert sha256_digest(value.canonical_body.encode("utf-8")) == LEGACY_MANIFEST_DIGEST
     assert value.manifest_digest != LEGACY_MANIFEST_DIGEST
 
 
