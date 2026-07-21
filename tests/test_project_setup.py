@@ -148,6 +148,7 @@ def _write_generic_prepared_project(
         project_dir / "steps/source_text.yaml",
         {
             "step_name": "source_text",
+            "step_contract_version": "1",
             "pattern_kind": "pattern_a",
             "execution_role": "source_import",
             "address_scope": "entity",
@@ -455,6 +456,9 @@ def test_init_creates_project_runtime_databases_and_validates(
     ]
     assert len(list((project_dir / "steps").glob("*.yaml"))) == 8
     assert len(list((project_dir / "workflows").glob("*.yaml"))) == 2
+    for step_path in (project_dir / "steps").glob("*.yaml"):
+        step_payload = yaml.safe_load(step_path.read_text(encoding="utf-8"))
+        assert step_payload["step_contract_version"] == "1"
 
     config = _read_project_config(project_dir)
     assert config["sources"] == {
@@ -605,6 +609,9 @@ def test_init_creates_prepared_neuro_demo_project_and_registry(
     assert (runtime_dir / "manifests/generated").is_dir()
     assert len(list((project_dir / "steps").glob("*.yaml"))) == step_count
     assert len(list((project_dir / "workflows").glob("*.yaml"))) == 1
+    for step_path in (project_dir / "steps").glob("*.yaml"):
+        step_payload = yaml.safe_load(step_path.read_text(encoding="utf-8"))
+        assert step_payload["step_contract_version"] == "1"
 
     config = _read_project_config(project_dir)
     assert config["sources"] == {"index": "sources.yaml"}

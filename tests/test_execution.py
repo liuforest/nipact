@@ -213,6 +213,7 @@ def uppercase_text_file(*, inputs, outputs, params, address):
         project_dir / "steps/source_text.yaml",
         {
             "step_name": "source_text",
+            "step_contract_version": "1",
             "pattern_kind": "pattern_a",
             "execution_role": "source_import",
             "address_scope": "entity",
@@ -234,6 +235,7 @@ def uppercase_text_file(*, inputs, outputs, params, address):
         project_dir / "steps/uppercase_text.yaml",
         {
             "step_name": "uppercase_text",
+            "step_contract_version": "1",
             "pattern_kind": "pattern_a",
             "execution_role": "transform",
             "address_scope": "entity",
@@ -401,6 +403,7 @@ def consume_qc_file(*, inputs, outputs, params, address):
         project_dir / "steps/source_text.yaml",
         {
             "step_name": "source_text",
+            "step_contract_version": "1",
             "pattern_kind": "pattern_a",
             "execution_role": "source_import",
             "address_scope": "entity",
@@ -426,6 +429,7 @@ def consume_qc_file(*, inputs, outputs, params, address):
         project_dir / "steps/qc_echo.yaml",
         {
             "step_name": "qc_echo",
+            "step_contract_version": "1",
             "pattern_kind": "pattern_a",
             "execution_role": "transform",
             "address_scope": "entity",

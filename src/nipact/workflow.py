@@ -37,6 +37,7 @@ REQUIRED_STEP_FIELDS = frozenset(
         "execution_role",
         "address_scope",
         "callable",
+        "step_contract_version",
         "outputs",
     }
 )
@@ -1036,11 +1037,11 @@ def _load_step(path: Path, *, manifest_names: set[str]) -> StepDefinition:
     )
     callable_ref = _required_string(payload, "callable", f"step {step_name} callable")
     _validate_callable(callable_ref, label=f"step {step_name} callable")
-    step_contract_version = payload.get("step_contract_version", "1")
-    if not isinstance(step_contract_version, str) or not step_contract_version:
-        raise ValidationError(
-            f"step {step_name} step_contract_version must be a non-empty string"
-        )
+    step_contract_version = _required_string(
+        payload,
+        "step_contract_version",
+        f"step {step_name} step_contract_version",
+    )
     pattern_kind = _allowed_value(
         _required_string(payload, "pattern_kind", f"step {step_name} pattern_kind"),
         allowed=PATTERN_KINDS,

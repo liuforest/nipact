@@ -95,6 +95,7 @@ def step_files() -> dict[str, dict[str, Any]]:
     return {
         "fmri_source": {
             "step_name": "fmri_source",
+            "step_contract_version": "1",
             "pattern_kind": "pattern_a",
             "execution_role": "source_import",
             "address_scope": "entity",
@@ -120,6 +121,7 @@ def step_files() -> dict[str, dict[str, Any]]:
         },
         "fmri_registration": {
             "step_name": "fmri_registration",
+            "step_contract_version": "1",
             "pattern_kind": "pattern_a",
             "execution_role": "transform",
             "address_scope": "entity",
