@@ -11,10 +11,11 @@ from typing import Any, TypeAlias
 
 from .errors import ValidationError
 from .hashing import is_valid_digest, sha256_digest
+from .manifest import MANIFEST_VALUE_SCHEMA
 
-IDENTITY_CONTRACT_VERSION = 1
+IDENTITY_CONTRACT_VERSION = 2
 OUTPUT_CONTRACT_VERSION = 1
-RUNNER_CONTRACT_VERSION = "1"
+RUNNER_CONTRACT_VERSION = "2"
 
 JsonScalar: TypeAlias = None | bool | int | float | str
 JsonValue: TypeAlias = JsonScalar | list["JsonValue"] | dict[str, "JsonValue"]
@@ -63,6 +64,7 @@ class CollectionBinding:
     collection_semantics: str
     manifest_digest: str | None
     members: tuple[UpstreamRequestedOutputBinding, ...]
+    manifest_value_schema: str | None = None
 
 
 ProjectionBinding: TypeAlias = (
@@ -83,7 +85,7 @@ class OutputContract:
 
 
 @dataclass(frozen=True)
-class RequestBundleProjectionV1:
+class RequestBundleProjectionV2:
     identity_contract_version: int
     namespace: str
     step_contract: StepContract
@@ -96,15 +98,15 @@ class RequestBundleProjectionV1:
 
 
 @dataclass(frozen=True)
-class ResolvedRequestBundleProjectionV1:
+class ResolvedRequestBundleProjectionV2:
     identity_contract_version: int
     canonical_json: str
     request_bundle_digest: str
 
 
 @dataclass(frozen=True)
-class ValidatedStoredRequestBundleProjectionV1:
-    resolved_projection: ResolvedRequestBundleProjectionV1
+class ValidatedStoredRequestBundleProjectionV2:
+    resolved_projection: ResolvedRequestBundleProjectionV2
     direct_upstream_request_bundle_digests: tuple[str, ...]
 
 
@@ -134,6 +136,7 @@ class CollectionBindingPlan:
     collection_semantics: str
     manifest_digest: str | None
     members: tuple[RequestedOutputCoordinate, ...]
+    manifest_value_schema: str | None = None
 
 
 ProjectionBindingPlan: TypeAlias = (
@@ -144,7 +147,7 @@ ProjectionBindingPlan: TypeAlias = (
 
 
 @dataclass(frozen=True)
-class RequestBundleProjectionPlanV1:
+class RequestBundleProjectionPlanV2:
     """Planning recipe for a projection whose source snapshots may be absent."""
 
     identity_contract_version: int
@@ -164,12 +167,12 @@ class UnresolvedRequestBundleProjection:
 
 
 RequestBundleProjectionState: TypeAlias = (
-    ResolvedRequestBundleProjectionV1 | UnresolvedRequestBundleProjection
+    ResolvedRequestBundleProjectionV2 | UnresolvedRequestBundleProjection
 )
 
 
 def resolve_request_bundle_projection_plan(
-    plan: RequestBundleProjectionPlanV1,
+    plan: RequestBundleProjectionPlanV2,
     *,
     source_snapshots: Mapping[SourceCoordinate, RegisteredSourceSnapshot],
     upstream_states: Mapping[
@@ -178,8 +181,8 @@ def resolve_request_bundle_projection_plan(
     ],
 ) -> RequestBundleProjectionState:
     """Resolve one planning recipe without reading the registry or filesystem."""
-    if not isinstance(plan, RequestBundleProjectionPlanV1):
-        raise ValidationError("plan must be a RequestBundleProjectionPlanV1")
+    if not isinstance(plan, RequestBundleProjectionPlanV2):
+        raise ValidationError("plan must be a RequestBundleProjectionPlanV2")
 
     resolved_bindings: list[ProjectionBinding] = []
     missing_sources: set[SourceCoordinate] = set()
@@ -243,6 +246,7 @@ def resolve_request_bundle_projection_plan(
                     CollectionBinding(
                         role=binding_plan.role,
                         collection_semantics=binding_plan.collection_semantics,
+                        manifest_value_schema=binding_plan.manifest_value_schema,
                         manifest_digest=binding_plan.manifest_digest,
                         members=tuple(resolved_members),
                     )
@@ -258,7 +262,7 @@ def resolve_request_bundle_projection_plan(
             )
         )
 
-    projection = RequestBundleProjectionV1(
+    projection = RequestBundleProjectionV2(
         identity_contract_version=plan.identity_contract_version,
         namespace=plan.namespace,
         step_contract=plan.step_contract,
@@ -300,26 +304,26 @@ def _source_coordinate_sort_key(coordinate: SourceCoordinate) -> tuple[str, str]
 
 
 def canonicalize_request_bundle_projection(
-    projection: RequestBundleProjectionV1,
-) -> ResolvedRequestBundleProjectionV1:
-    """Validate, serialize, and identify one V1 request projection."""
-    if not isinstance(projection, RequestBundleProjectionV1):
-        raise ValidationError("projection must be a RequestBundleProjectionV1")
+    projection: RequestBundleProjectionV2,
+) -> ResolvedRequestBundleProjectionV2:
+    """Validate, serialize, and identify one V2 request projection."""
+    if not isinstance(projection, RequestBundleProjectionV2):
+        raise ValidationError("projection must be a RequestBundleProjectionV2")
     payload = _projection_payload(projection, path="projection")
     canonical_json = _dump_json(payload)
-    return ResolvedRequestBundleProjectionV1(
+    return ResolvedRequestBundleProjectionV2(
         identity_contract_version=projection.identity_contract_version,
         canonical_json=canonical_json,
         request_bundle_digest=sha256_digest(canonical_json.encode("utf-8")),
     )
 
 
-def validate_stored_request_bundle_projection_v1(
+def validate_stored_request_bundle_projection_v2(
     *,
     request_bundle_digest: str,
     projection_json: str,
-) -> ValidatedStoredRequestBundleProjectionV1:
-    """Validate one stored V1 payload against its canonical bytes and digest."""
+) -> ValidatedStoredRequestBundleProjectionV2:
+    """Validate one stored V2 payload against its canonical bytes and digest."""
     digest = _require_digest(
         request_bundle_digest,
         path="request_bundle_digest",
@@ -343,7 +347,7 @@ def validate_stored_request_bundle_projection_v1(
             for upstream_digest in _binding_upstream_digests(binding)
         }
     )
-    return ValidatedStoredRequestBundleProjectionV1(
+    return ValidatedStoredRequestBundleProjectionV2(
         resolved_projection=resolved,
         direct_upstream_request_bundle_digests=tuple(upstream_digests),
     )
@@ -360,7 +364,7 @@ def _unique_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     return payload
 
 
-def _projection_from_payload(payload: Any, *, path: str) -> RequestBundleProjectionV1:
+def _projection_from_payload(payload: Any, *, path: str) -> RequestBundleProjectionV2:
     obj = _require_object_shape(
         payload,
         path=path,
@@ -383,7 +387,7 @@ def _projection_from_payload(payload: Any, *, path: str) -> RequestBundleProject
     settings = obj["result_affecting_settings"]
     if type(settings) is not dict:
         raise ValidationError(f"{path}.result_affecting_settings must be an object")
-    return RequestBundleProjectionV1(
+    return RequestBundleProjectionV2(
         identity_contract_version=_require_int(
             obj["identity_contract_version"],
             path=f"{path}.identity_contract_version",
@@ -515,19 +519,26 @@ def _collection_from_payload(payload: Any, *, path: str) -> CollectionBinding:
     obj = _require_object_shape(
         payload,
         path=path,
-        keys={"role", "collection_semantics", "manifest_digest", "members"},
+        keys={
+            "role",
+            "collection_semantics",
+            "manifest_value_schema",
+            "manifest_digest",
+            "members",
+        },
     )
     members = _require_list(obj["members"], path=f"{path}.members")
-    manifest_digest = obj["manifest_digest"]
-    if manifest_digest is not None:
-        manifest_digest = _require_digest(
-            manifest_digest, path=f"{path}.manifest_digest"
-        )
+    manifest_value_schema, manifest_digest = _manifest_value_reference(
+        value_schema=obj["manifest_value_schema"],
+        manifest_digest=obj["manifest_digest"],
+        path=path,
+    )
     return CollectionBinding(
         role=_require_string(obj["role"], path=f"{path}.role"),
         collection_semantics=_require_string(
             obj["collection_semantics"], path=f"{path}.collection_semantics"
         ),
+        manifest_value_schema=manifest_value_schema,
         manifest_digest=manifest_digest,
         members=tuple(
             _upstream_output_from_payload(member, path=f"{path}.members[{index}]")
@@ -605,7 +616,7 @@ def _require_list(value: Any, *, path: str) -> list[Any]:
 
 
 def _projection_payload(
-    projection: RequestBundleProjectionV1,
+    projection: RequestBundleProjectionV2,
     *,
     path: str,
 ) -> dict[str, Any]:
@@ -774,18 +785,18 @@ def _collection_payload(binding: CollectionBinding, *, path: str) -> dict[str, A
     if len(member_identities) != len(set(member_identities)):
         raise ValidationError(f"{path}.members contains duplicate requested outputs")
     members.sort(key=_requested_output_sort_key)
-    manifest_digest = binding.manifest_digest
-    if manifest_digest is not None:
-        manifest_digest = _require_digest(
-            manifest_digest,
-            path=f"{path}.manifest_digest",
-        )
+    manifest_value_schema, manifest_digest = _manifest_value_reference(
+        value_schema=binding.manifest_value_schema,
+        manifest_digest=binding.manifest_digest,
+        path=path,
+    )
     return {
         "role": _require_string(binding.role, path=f"{path}.role"),
         "collection_semantics": _require_string(
             binding.collection_semantics,
             path=f"{path}.collection_semantics",
         ),
+        "manifest_value_schema": manifest_value_schema,
         "manifest_digest": manifest_digest,
         "members": members,
     }
@@ -897,6 +908,27 @@ def _require_digest(value: Any, *, path: str) -> str:
             f"{path} must be a lowercase 64-character hexadecimal SHA-256 digest"
         )
     return value
+
+
+def _manifest_value_reference(
+    *,
+    value_schema: Any,
+    manifest_digest: Any,
+    path: str,
+) -> tuple[str | None, str | None]:
+    if (value_schema is None) != (manifest_digest is None):
+        raise ValidationError(
+            f"{path}.manifest_value_schema and {path}.manifest_digest "
+            "must both be null or both be present"
+        )
+    if value_schema is None:
+        return None, None
+    schema = _require_string(value_schema, path=f"{path}.manifest_value_schema")
+    if schema != MANIFEST_VALUE_SCHEMA:
+        raise ValidationError(
+            f"{path}.manifest_value_schema must be {MANIFEST_VALUE_SCHEMA!r}"
+        )
+    return schema, _require_digest(manifest_digest, path=f"{path}.manifest_digest")
 
 
 def _require_int(value: Any, *, path: str) -> int:

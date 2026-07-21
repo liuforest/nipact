@@ -9,6 +9,7 @@ export function traceGraphElementCount(graph: TraceGraphResponse): number {
   return (
     graph.artifacts.length +
     graph.dependencies.length +
+    graph.execution_populations.length +
     graph.manifest_bindings.length
   );
 }
@@ -19,6 +20,7 @@ export function topologyElementCount(
   return (
     topology.nodes.length +
     topology.edges.length +
+    topology.execution_populations.length +
     topology.manifest_bindings.length
   );
 }

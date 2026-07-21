@@ -13,7 +13,7 @@ import yaml
 from .errors import ValidationError
 from .hashing import SHORT_HASH_LENGTH, is_valid_digest
 from .identity import validate_path_token
-from .manifest import Manifest, load_manifest
+from .manifest import MANIFEST_VALUE_SCHEMA, Manifest, load_manifest
 
 STEP_FIELDS = frozenset(
     {
@@ -44,8 +44,14 @@ REQUIRED_STEP_FIELDS = frozenset(
 INPUT_FIELDS = frozenset({"artifact", "dependency_role"})
 OUTPUT_FIELDS = frozenset({"extension", "address_scope"})
 MANIFEST_BINDING_FIELDS = frozenset({"role", "manifest"})
-BASE_WORKFLOW_FIELDS = frozenset({"workflow_name", "steps"})
+BASE_WORKFLOW_FIELDS = frozenset(
+    {"workflow_name", "execution_population", "steps"}
+)
+REQUIRED_BASE_WORKFLOW_FIELDS = frozenset({"workflow_name", "steps"})
 VARIANT_WORKFLOW_FIELDS = frozenset(
+    {"workflow_name", "base_workflow", "execution_population", "step_overrides"}
+)
+REQUIRED_VARIANT_WORKFLOW_FIELDS = frozenset(
     {"workflow_name", "base_workflow", "step_overrides"}
 )
 WORKFLOW_STEP_FIELDS = frozenset({"step_name", "output_name"})
@@ -126,6 +132,7 @@ class WorkflowStepOverride:
 class WorkflowDefinition:
     name: str
     base_workflow: str | None
+    execution_population_name: str | None
     steps: tuple[str, ...]
     step_outputs: dict[str, str]
     step_overrides: dict[str, WorkflowStepOverride]
@@ -153,10 +160,22 @@ class LoadedWorkflowProject:
 @dataclass(frozen=True)
 class WorkflowPlanManifestBinding:
     step_name: str
-    role: str
+    manifest_usage_role: str
     manifest_name: str
+    manifest_value_schema: str
     manifest_digest: str
     manifest_hash: str
+    entity_ids: tuple[str, ...]
+    entity_count: int
+
+
+@dataclass(frozen=True)
+class WorkflowPlanExecutionPopulation:
+    manifest_name: str
+    manifest_value_schema: str
+    manifest_digest: str
+    manifest_hash: str
+    entity_ids: tuple[str, ...]
     entity_count: int
 
 
@@ -181,6 +200,7 @@ class WorkflowPlan:
     selected_step_name: str
     selected_output_name: str
     steps: tuple[WorkflowPlanStep, ...]
+    execution_population: WorkflowPlanExecutionPopulation | None
     manifest_bindings: tuple[WorkflowPlanManifestBinding, ...]
     warnings: tuple[str, ...]
 
@@ -226,6 +246,7 @@ def load_workflow_project(*, project_dir: Path, context: str) -> LoadedWorkflowP
         for name, path in sorted(workflow_paths.items())
     }
     workflows = _resolve_workflows(raw_workflows, steps=steps)
+    _validate_execution_population_names(workflows, manifests=manifests)
 
     return LoadedWorkflowProject(
         project_root=project_root,
@@ -272,6 +293,17 @@ def compile_workflow_plan(
             root_step_name=selected_step_name,
         )
     )
+    execution_population = _compile_execution_population(loaded, workflow)
+    required_definitions = tuple(
+        _workflow_step(loaded, workflow, required_step_name)
+        for required_step_name in workflow.steps
+        if required_step_name in required_steps
+    )
+    if _requires_execution_population(required_definitions) and execution_population is None:
+        raise ValidationError(
+            f"workflow {workflow.name!r} requires an execution_population for "
+            "the selected dependency path"
+        )
     plan_steps: list[WorkflowPlanStep] = []
     manifest_bindings: list[WorkflowPlanManifestBinding] = []
 
@@ -281,6 +313,22 @@ def compile_workflow_plan(
         step = _workflow_step(loaded, workflow, step_name)
         manifest_binding = _compile_manifest_binding(loaded, step)
         if manifest_binding is not None:
+            if execution_population is None:
+                raise ValidationError(
+                    f"step {step.name!r} scientific manifest requires an "
+                    "execution_population"
+                )
+            missing_members = sorted(
+                set(manifest_binding.entity_ids)
+                - set(execution_population.entity_ids)
+            )
+            if missing_members:
+                preview = ", ".join(missing_members[:5])
+                raise ValidationError(
+                    f"step {step.name!r} scientific manifest is not a subset of "
+                    f"execution_population {execution_population.manifest_name!r}: "
+                    f"{preview}"
+                )
             manifest_bindings.append(manifest_binding)
         params = dict(step.params)
         if step_name in workflow.step_overrides:
@@ -306,6 +354,7 @@ def compile_workflow_plan(
         selected_step_name=selected_step_name,
         selected_output_name=selected_output_name,
         steps=tuple(plan_steps),
+        execution_population=execution_population,
         manifest_bindings=tuple(manifest_bindings),
         warnings=(),
     )
@@ -403,8 +452,9 @@ def workflow_plan_to_graph(plan: WorkflowPlan) -> dict[str, Any]:
         {
             "node_id": _graph_node_id(binding.step_name),
             "group_id": None,
-            "role": binding.role,
+            "manifest_usage_role": binding.manifest_usage_role,
             "manifest_name": binding.manifest_name,
+            "manifest_value_schema": binding.manifest_value_schema,
             "manifest_digest": binding.manifest_digest,
             "manifest_hash": binding.manifest_hash,
             "entity_count": binding.entity_count,
@@ -412,6 +462,17 @@ def workflow_plan_to_graph(plan: WorkflowPlan) -> dict[str, Any]:
         }
         for binding in plan.manifest_bindings
     ]
+    execution_population = None
+    if plan.execution_population is not None:
+        execution_population = {
+            "manifest_name": plan.execution_population.manifest_name,
+            "manifest_value_schema": (
+                plan.execution_population.manifest_value_schema
+            ),
+            "manifest_digest": plan.execution_population.manifest_digest,
+            "manifest_hash": plan.execution_population.manifest_hash,
+            "entity_count": plan.execution_population.entity_count,
+        }
 
     graph = {
         "workflow_name": plan.workflow_name,
@@ -421,6 +482,7 @@ def workflow_plan_to_graph(plan: WorkflowPlan) -> dict[str, Any]:
         "nodes": nodes,
         "artifacts": artifacts,
         "edges": edges,
+        "execution_population": execution_population,
         "manifest_bindings": manifest_bindings,
         "warnings": list(plan.warnings),
     }
@@ -447,6 +509,16 @@ def validate_workflow_graph(graph: Mapping[str, Any]) -> None:
     nodes = _graph_list(graph, "nodes")
     artifacts = _graph_list(graph, "artifacts")
     edges = _graph_list(graph, "edges")
+    execution_population = graph.get("execution_population")
+    if execution_population is not None:
+        if not isinstance(execution_population, Mapping):
+            raise ValidationError(
+                "workflow graph execution_population must be a mapping or null"
+            )
+        _validate_graph_manifest_value(
+            execution_population,
+            label="execution population",
+        )
     manifest_bindings = _graph_list(graph, "manifest_bindings")
     _graph_list_of_strings(graph, "warnings")
 
@@ -596,28 +668,45 @@ def validate_workflow_graph(graph: Mapping[str, Any]) -> None:
                 raise ValidationError(
                     f"workflow graph manifest binding references unknown group: {group_id}"
                 )
-        role = validate_path_token(binding.get("role"), label="manifest binding role")
+        manifest_usage_role = validate_path_token(
+            binding.get("manifest_usage_role"),
+            label="manifest binding usage role",
+        )
         manifest_name = validate_path_token(
             _graph_string(binding, "manifest_name", label="manifest binding"),
             label="manifest_name",
         )
-        manifest_digest = _graph_digest(binding, "manifest_digest", label="manifest binding")
-        manifest_hash = _graph_hash(binding, "manifest_hash", label="manifest binding")
-        if not manifest_digest.startswith(manifest_hash):
-            raise ValidationError(
-                "workflow graph manifest binding manifest_hash must prefix manifest_digest"
-            )
-        _graph_positive_int(binding, "entity_count", label="manifest binding")
+        _validate_graph_manifest_value(binding, label="manifest binding")
         _graph_allowed_string(
             binding,
             "binding_source",
             allowed=MANIFEST_BINDING_SOURCES,
             label="manifest binding",
         )
-        binding_key = (node_id, group_id, role, manifest_name)
+        binding_key = (node_id, group_id, manifest_usage_role, manifest_name)
         if binding_key in binding_keys:
             raise ValidationError("workflow graph duplicate manifest binding")
         binding_keys.add(binding_key)
+
+
+def _validate_graph_manifest_value(
+    payload: Mapping[str, Any],
+    *,
+    label: str,
+) -> None:
+    value_schema = _graph_string(payload, "manifest_value_schema", label=label)
+    if value_schema != MANIFEST_VALUE_SCHEMA:
+        raise ValidationError(
+            f"workflow graph {label} manifest_value_schema must be "
+            f"{MANIFEST_VALUE_SCHEMA!r}"
+        )
+    manifest_digest = _graph_digest(payload, "manifest_digest", label=label)
+    manifest_hash = _graph_hash(payload, "manifest_hash", label=label)
+    if not manifest_digest.startswith(manifest_hash):
+        raise ValidationError(
+            f"workflow graph {label} manifest_hash must prefix manifest_digest"
+        )
+    _graph_positive_int(payload, "entity_count", label=label)
 
 
 def _graph_node_id(step_name: str) -> str:
@@ -1071,6 +1160,16 @@ def _load_step(path: Path, *, manifest_names: set[str]) -> StepDefinition:
         manifest_names=manifest_names,
         label=f"step {step_name} manifest_binding",
     )
+    collection_roles = {
+        step_input.dependency_role
+        for step_input in inputs.values()
+        if step_input.dependency_role in {"fit_input", "analysis_input"}
+    }
+    if collection_roles and manifest_binding is None:
+        raise ValidationError(
+            f"step {step_name!r} with {', '.join(sorted(collection_roles))} "
+            "requires a scientific manifest_binding"
+        )
     params = _parse_params(payload.get("params"), label=f"step {step_name} params")
 
     return StepDefinition(
@@ -1218,6 +1317,11 @@ def _parse_manifest_binding(
         _required_string(payload, "role", f"{label} role"),
         label="manifest binding role",
     )
+    if role == "source_population":
+        raise ValidationError(
+            f"{label} role 'source_population' is reserved; declare the "
+            "workflow execution_population instead"
+        )
     manifest_name = validate_path_token(
         _required_string(payload, "manifest", f"{label} manifest"),
         label="manifest name",
@@ -1255,7 +1359,7 @@ def _load_workflow(path: Path, *, configured_name: str) -> WorkflowDefinition:
         _check_fields(
             payload,
             allowed=BASE_WORKFLOW_FIELDS,
-            required=BASE_WORKFLOW_FIELDS,
+            required=REQUIRED_BASE_WORKFLOW_FIELDS,
             label=f"workflow {workflow_name}",
         )
         steps = _parse_workflow_steps(payload["steps"], label=f"workflow {workflow_name} steps")
@@ -1266,6 +1370,10 @@ def _load_workflow(path: Path, *, configured_name: str) -> WorkflowDefinition:
         return WorkflowDefinition(
             name=workflow_name,
             base_workflow=None,
+            execution_population_name=_parse_execution_population_name(
+                payload,
+                label=f"workflow {workflow_name}",
+            ),
             steps=steps,
             step_outputs=step_outputs,
             step_overrides={},
@@ -1275,12 +1383,16 @@ def _load_workflow(path: Path, *, configured_name: str) -> WorkflowDefinition:
     _check_fields(
         payload,
         allowed=VARIANT_WORKFLOW_FIELDS,
-        required=VARIANT_WORKFLOW_FIELDS,
+        required=REQUIRED_VARIANT_WORKFLOW_FIELDS,
         label=f"workflow {workflow_name}",
     )
     return WorkflowDefinition(
         name=workflow_name,
         base_workflow=validate_path_token(base_workflow, label="base_workflow"),
+        execution_population_name=_parse_execution_population_name(
+            payload,
+            label=f"workflow {workflow_name}",
+        ),
         steps=(),
         step_outputs={},
         step_overrides=_parse_overrides(
@@ -1288,6 +1400,23 @@ def _load_workflow(path: Path, *, configured_name: str) -> WorkflowDefinition:
             label=f"workflow {workflow_name} step_overrides",
         ),
         source_path=path,
+    )
+
+
+def _parse_execution_population_name(
+    payload: Mapping[str, Any],
+    *,
+    label: str,
+) -> str | None:
+    if "execution_population" not in payload:
+        return None
+    return validate_path_token(
+        _required_string(
+            payload,
+            "execution_population",
+            f"{label} execution_population",
+        ),
+        label="execution_population",
     )
 
 
@@ -1412,6 +1541,11 @@ def _resolve_workflows(
             workflow = WorkflowDefinition(
                 name=workflow.name,
                 base_workflow=workflow.base_workflow,
+                execution_population_name=(
+                    workflow.execution_population_name
+                    if workflow.execution_population_name is not None
+                    else base.execution_population_name
+                ),
                 steps=base.steps,
                 step_outputs=dict(base.step_outputs),
                 step_overrides=step_overrides,
@@ -1426,6 +1560,20 @@ def _resolve_workflows(
     for name in sorted(raw_workflows):
         resolve(name)
     return resolved
+
+
+def _validate_execution_population_names(
+    workflows: Mapping[str, WorkflowDefinition],
+    *,
+    manifests: Mapping[str, Manifest],
+) -> None:
+    for workflow in workflows.values():
+        manifest_name = workflow.execution_population_name
+        if manifest_name is not None and manifest_name not in manifests:
+            raise ValidationError(
+                f"workflow {workflow.name!r} references unknown "
+                f"execution_population: {manifest_name}"
+            )
 
 
 def _validate_workflow_references(
@@ -1536,11 +1684,50 @@ def _compile_manifest_binding(
         ) from exc
     return WorkflowPlanManifestBinding(
         step_name=step.name,
-        role=binding.role,
+        manifest_usage_role=binding.role,
         manifest_name=binding.manifest_name,
+        manifest_value_schema=manifest.manifest_value_schema,
         manifest_digest=manifest.manifest_digest,
         manifest_hash=manifest.manifest_hash,
+        entity_ids=manifest.entity_ids,
         entity_count=manifest.entity_count,
+    )
+
+
+def _compile_execution_population(
+    loaded: LoadedWorkflowProject,
+    workflow: WorkflowDefinition,
+) -> WorkflowPlanExecutionPopulation | None:
+    manifest_name = workflow.execution_population_name
+    if manifest_name is None:
+        return None
+    try:
+        manifest = loaded.manifests[manifest_name]
+    except KeyError as exc:
+        raise ValidationError(
+            f"workflow {workflow.name!r} references unknown "
+            f"execution_population: {manifest_name}"
+        ) from exc
+    return WorkflowPlanExecutionPopulation(
+        manifest_name=manifest_name,
+        manifest_value_schema=manifest.manifest_value_schema,
+        manifest_digest=manifest.manifest_digest,
+        manifest_hash=manifest.manifest_hash,
+        entity_ids=manifest.entity_ids,
+        entity_count=manifest.entity_count,
+    )
+
+
+def _requires_execution_population(
+    steps: tuple[StepDefinition, ...],
+) -> bool:
+    return any(
+        step.address_scope == "entity"
+        or any(
+            step_input.dependency_role in {"fit_input", "analysis_input"}
+            for step_input in step.inputs.values()
+        )
+        for step in steps
     )
 
 

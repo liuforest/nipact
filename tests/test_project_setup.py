@@ -18,8 +18,14 @@ from nipact.examples.dynamic_functional_connectivity_demo import (
     project_template as dfc_template,
 )
 from nipact.examples.fmri_preprocessing_demo import project_template as fmri_template
+from nipact.errors import ValidationError
 from nipact.hashing import sha256_digest, sha256_file_digest, short_hash
-from nipact.manifest import manifest_body, manifest_digest
+from nipact.manifest import (
+    MANIFEST_VALUE_SCHEMA,
+    build_manifest,
+    build_manifest_value,
+    manifest_body,
+)
 from nipact.registry import REGISTRY_SCHEMA_VERSION
 
 
@@ -58,7 +64,7 @@ def _init_demo(
     )
     output = capsys.readouterr().out
     assert "PASS: init" in output
-    assert "manifest_hash=287318ee136c4518" in output
+    assert "manifest_hash=90ddcf303284f890" in output
     return project_dir, runtime_dir
 
 
@@ -157,10 +163,6 @@ def _write_generic_prepared_project(
                 "import_color_source_file"
             ),
             "source_inputs": ["source_text"],
-            "manifest_binding": {
-                "role": "source_population",
-                "manifest": "subjects",
-            },
             "outputs": {
                 "raw_text": {
                     "extension": ".json",
@@ -173,6 +175,7 @@ def _write_generic_prepared_project(
         project_dir / "workflows/main.yaml",
         {
             "workflow_name": "main",
+            "execution_population": "subjects",
             "steps": [
                 {
                     "step_name": "source_text",
@@ -303,7 +306,7 @@ def _insert_published_output(
                 "address": address,
                 "canonical_parameters": {},
                 "determinism_contract": "deterministic",
-                "identity_contract_version": 1,
+                "identity_contract_version": 2,
                 "namespace": "colors",
                 "output_contract": {
                     "output_contract_version": 1,
@@ -315,7 +318,7 @@ def _insert_published_output(
                 "role_labelled_bindings": [],
                 "step_contract": {
                     "callable_ref": "tests:manual",
-                    "runner_contract_version": "1",
+                    "runner_contract_version": "2",
                     "step_contract_id": step_name,
                     "step_contract_version": "1",
                 },
@@ -511,10 +514,13 @@ def test_init_creates_project_runtime_databases_and_validates(
         schema_version = conn.execute("PRAGMA user_version").fetchone()[0]
         manifest_rows = conn.execute(
             """
-            SELECT name, path, entity_count, manifest_digest, manifest_hash,
-                   manifest_body
-            FROM manifests
-            ORDER BY name
+            SELECT d.manifest_name, d.declared_path, v.value_schema,
+                   v.entity_count, v.manifest_digest, v.canonical_body
+            FROM manifest_declarations d
+            JOIN manifest_values v
+              ON v.value_schema = d.last_validated_manifest_value_schema
+             AND v.manifest_digest = d.last_validated_manifest_digest
+            ORDER BY d.manifest_name
             """
         ).fetchall()
         artifact_rows = conn.execute(
@@ -534,17 +540,17 @@ def test_init_creates_project_runtime_databases_and_validates(
         (
             "demo-40",
             "manifests/demo-40.yaml",
+            MANIFEST_VALUE_SCHEMA,
             40,
-            manifest_digest(fit_cohort_entity_ids()),
-            "9db06e41af119408",
+            build_manifest_value(entities=fit_cohort_entity_ids()).manifest_digest,
             manifest_body(fit_cohort_entity_ids()),
         ),
         (
             "init",
             "manifests/init.yaml",
+            MANIFEST_VALUE_SCHEMA,
             200,
-            manifest_digest(analysis_entity_ids()),
-            "287318ee136c4518",
+            build_manifest_value(entities=analysis_entity_ids()).manifest_digest,
             manifest_body(analysis_entity_ids()),
         ),
     ]
@@ -581,6 +587,58 @@ def test_init_creates_project_runtime_databases_and_validates(
     assert list((runtime_dir / "outputs").rglob("*")) == []
 
     _assert_validate_passes(project_dir, capsys)
+
+
+def test_registry_manifest_values_deduplicate_and_reject_key_collisions(
+    tmp_path: Path,
+) -> None:
+    registry_path = tmp_path / "registry.db"
+    manifest = build_manifest(description="Shared membership", entities=("a", "b"))
+    manifests = {"first": manifest, "alias": manifest}
+    manifest_paths = {
+        "first": "manifests/first.yaml",
+        "alias": "manifests/alias.yaml",
+    }
+
+    registry_module.initialize_prepared_demo_registry_db(
+        registry_path,
+        context="example",
+        runtime_root=tmp_path,
+        manifests=manifests,
+        manifest_paths=manifest_paths,
+    )
+    with sqlite3.connect(registry_path) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM manifest_values").fetchone()[0] == 1
+        assert (
+            conn.execute("SELECT COUNT(*) FROM manifest_declarations").fetchone()[0]
+            == 2
+        )
+        conn.execute(
+            """
+            UPDATE manifest_values
+            SET canonical_body = 'different'
+            WHERE value_schema = ? AND manifest_digest = ?
+            """,
+            (manifest.manifest_value_schema, manifest.manifest_digest),
+        )
+
+    with pytest.raises(ValidationError, match="digest does not match canonical body"):
+        registry_module.read_manifest(
+            registry_path,
+            context="example",
+            manifest_name="first",
+        )
+    with pytest.raises(
+        ValidationError,
+        match="manifest value does not match its schema-qualified key",
+    ):
+        registry_module.initialize_prepared_demo_registry_db(
+            registry_path,
+            context="example",
+            runtime_root=tmp_path,
+            manifests=manifests,
+            manifest_paths=manifest_paths,
+        )
 
 
 @pytest.mark.parametrize(
@@ -633,10 +691,14 @@ def test_init_creates_prepared_neuro_demo_project_and_registry(
         ).fetchone()
         manifest_rows = conn.execute(
             """
-            SELECT name, path, entity_count, source_artifact_path
-            FROM manifests
-            WHERE context = ?
-            ORDER BY name
+            SELECT d.manifest_name, d.declared_path, v.value_schema,
+                   v.entity_count
+            FROM manifest_declarations d
+            JOIN manifest_values v
+              ON v.value_schema = d.last_validated_manifest_value_schema
+             AND v.manifest_digest = d.last_validated_manifest_digest
+            WHERE d.context = ?
+            ORDER BY d.manifest_name
             """,
             (demo,),
         ).fetchall()
@@ -654,8 +716,8 @@ def test_init_creates_prepared_neuro_demo_project_and_registry(
         (
             name,
             template.manifest_paths()[name],
+            MANIFEST_VALUE_SCHEMA,
             manifest.entity_count,
-            None,
         )
         for name, manifest in sorted(template.build_manifests().items())
     ]
@@ -896,7 +958,7 @@ def test_validate_rejects_missing_upstream_request_projection(
         "address": "init",
         "canonical_parameters": {},
         "determinism_contract": "deterministic",
-        "identity_contract_version": 1,
+        "identity_contract_version": 2,
         "namespace": "colors",
         "output_contract": {
             "output_contract_version": 1,
@@ -914,7 +976,7 @@ def test_validate_rejects_missing_upstream_request_projection(
         ],
         "step_contract": {
             "callable_ref": "tests:manual",
-            "runner_contract_version": "1",
+            "runner_contract_version": "2",
             "step_contract_id": "manual",
             "step_contract_version": "1",
         },
@@ -935,14 +997,14 @@ def test_validate_rejects_missing_upstream_request_projection(
     _assert_validate_fails(project_dir, capsys, "missing upstream projection")
 
 
-def test_registry_v15_projection_observation_and_membership_constraints(
+def test_registry_v16_projection_observation_and_membership_constraints(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     _project_dir, runtime_dir = _init_demo(tmp_path, capsys)
     registry_path = runtime_dir / "database/registry.db"
     with sqlite3.connect(registry_path) as conn:
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 15
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 16
         artifact_columns = {
             row[1]: row for row in conn.execute("PRAGMA table_info(artifacts)")
         }
@@ -968,6 +1030,23 @@ def test_registry_v15_projection_observation_and_membership_constraints(
         artifact_foreign_keys = conn.execute(
             "PRAGMA foreign_key_list(artifacts)"
         ).fetchall()
+        dependency_columns = {
+            row[1]: row
+            for row in conn.execute("PRAGMA table_info(artifact_dependencies)")
+        }
+        dependency_sql = conn.execute(
+            """
+            SELECT sql
+            FROM sqlite_master
+            WHERE type = 'table' AND name = 'artifact_dependencies'
+            """
+        ).fetchone()[0]
+        manifest_value_count = conn.execute(
+            "SELECT COUNT(*) FROM manifest_values"
+        ).fetchone()[0]
+        manifest_declaration_count = conn.execute(
+            "SELECT COUNT(*) FROM manifest_declarations"
+        ).fetchone()[0]
 
     assert "request_bundle_digest" in artifact_columns
     assert "identity_contract_version" not in artifact_columns
@@ -989,11 +1068,83 @@ def test_registry_v15_projection_observation_and_membership_constraints(
     assert "request_bundle_digest IS NOT NULL" in artifact_sql
     assert "origin = 'source'" in artifact_sql
     assert "request_bundle_digest IS NULL" in artifact_sql
+    assert "manifest_value_schema" in dependency_columns
+    assert "manifest_value_schema IS NULL" in dependency_sql
+    assert "manifest_digest IS NULL" in dependency_sql
+    assert manifest_value_count == 2
+    assert manifest_declaration_count == 2
 
     with sqlite3.connect(registry_path) as conn:
+        conn.execute("PRAGMA foreign_keys = ON")
         source_artifact_id = conn.execute(
             "SELECT artifact_id FROM artifacts WHERE origin = 'source' LIMIT 1"
         ).fetchone()[0]
+        manifest_value_schema, manifest_digest = conn.execute(
+            """
+            SELECT last_validated_manifest_value_schema,
+                   last_validated_manifest_digest
+            FROM manifest_declarations
+            WHERE context = 'colors' AND manifest_name = 'init'
+            """
+        ).fetchone()
+        with pytest.raises(sqlite3.IntegrityError, match="CHECK constraint failed"):
+            conn.execute(
+                """
+                INSERT INTO artifact_dependencies (
+                    dependent_artifact_id, source_artifact_id,
+                    source_content_digest, source_file_size, source_extension,
+                    input_path, binding_name, dependency_role,
+                    manifest_value_schema, manifest_digest
+                )
+                VALUES (?, ?, ?, 0, '.json', 'data/source.json', 'invalid_pair',
+                        'source_input', ?, NULL)
+                """,
+                (
+                    source_artifact_id,
+                    source_artifact_id,
+                    "e" * 64,
+                    manifest_value_schema,
+                ),
+            )
+        with pytest.raises(sqlite3.IntegrityError, match="FOREIGN KEY constraint failed"):
+            conn.execute(
+                """
+                INSERT INTO artifact_dependencies (
+                    dependent_artifact_id, source_artifact_id,
+                    source_content_digest, source_file_size, source_extension,
+                    input_path, binding_name, dependency_role,
+                    manifest_value_schema, manifest_digest
+                )
+                VALUES (?, ?, ?, 0, '.json', 'data/source.json', 'missing_value',
+                        'source_input', ?, ?)
+                """,
+                (
+                    source_artifact_id,
+                    source_artifact_id,
+                    "e" * 64,
+                    manifest_value_schema,
+                    "f" * 64,
+                ),
+            )
+        conn.execute(
+            """
+            INSERT INTO artifact_dependencies (
+                dependent_artifact_id, source_artifact_id,
+                source_content_digest, source_file_size, source_extension,
+                input_path, binding_name, dependency_role,
+                manifest_value_schema, manifest_digest
+            )
+            VALUES (?, ?, ?, 0, '.json', 'data/source.json', 'valid_value',
+                    'source_input', ?, ?)
+            """,
+            (
+                source_artifact_id,
+                source_artifact_id,
+                "e" * 64,
+                manifest_value_schema,
+                manifest_digest,
+            ),
+        )
         with pytest.raises(sqlite3.IntegrityError, match="CHECK constraint failed"):
             conn.execute(
                 """

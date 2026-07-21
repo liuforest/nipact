@@ -62,6 +62,7 @@ function dependency(
     source_file_size: 1,
     source_extension: ".json",
     dependency_set_id: null,
+    manifest_value_schema: null,
     manifest_digest: null,
     edge_cardinality: null,
     ...overrides,
@@ -73,7 +74,7 @@ function dependency(
 // source input into the model step (distinct binding/role), a sibling workflow,
 // and a degraded missing-source dependency.
 const graph: TraceGraphResponse = {
-  schema_version: 1,
+  schema_version: 2,
   context: "colors",
   selected_artifact_id: 12,
   provenance_status: "degraded",
@@ -98,6 +99,7 @@ const graph: TraceGraphResponse = {
     // degraded: source artifact 999 is not in the closure
     dependency({ edge_id: "d6", source_artifact_id: 999, dependent_artifact_id: 10, binding_name: "raw", dependency_role: "source_input" }),
   ],
+  execution_populations: [],
   manifest_bindings: [],
   warnings: [],
 };
@@ -106,7 +108,7 @@ const graph: TraceGraphResponse = {
 // edge_id are display-only; only the structured coordinates and the source/
 // target references are load-bearing.
 const topology: ObservedTopologyResponse = {
-  schema_version: 1,
+  schema_version: 2,
   perspective: "observed",
   scope: "ancestor_closure",
   context: "colors",
@@ -138,6 +140,7 @@ const topology: ObservedTopologyResponse = {
     { kind: "produces", edge_id: "e_p_bm", source_node_id: "n_step_bm", target_node_id: "n_slot_bmf" },
     { kind: "produces", edge_id: "e_p_ap", source_node_id: "n_step_ap", target_node_id: "n_slot_apc" },
   ],
+  execution_populations: [],
   manifest_bindings: [],
   warnings: [],
 };

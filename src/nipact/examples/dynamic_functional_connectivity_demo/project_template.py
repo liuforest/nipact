@@ -94,10 +94,6 @@ def step_files() -> dict[str, dict[str, Any]]:
                 "import_timeseries_file"
             ),
             "source_inputs": ["timeseries"],
-            "manifest_binding": {
-                "role": "source_population",
-                "manifest": ANALYSIS_COHORT_NAME,
-            },
             "outputs": {
                 "raw_timeseries": {
                     "extension": ".npy",
@@ -162,6 +158,7 @@ def workflow_files() -> dict[str, dict[str, Any]]:
     return {
         BASE_WORKFLOW_NAME: {
             "workflow_name": BASE_WORKFLOW_NAME,
+            "execution_population": ANALYSIS_COHORT_NAME,
             "steps": [
                 "dfc_source",
                 "dfc_clean_timeseries",

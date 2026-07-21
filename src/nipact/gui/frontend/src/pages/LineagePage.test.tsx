@@ -31,7 +31,7 @@ vi.mock("../lineage/LineageGraphCanvas", () => ({
 }));
 
 const topology: ObservedTopologyResponse = {
-  schema_version: 1,
+  schema_version: 2,
   perspective: "observed",
   scope: "ancestor_closure",
   context: "colors",
@@ -90,12 +90,14 @@ const topology: ObservedTopologyResponse = {
       target_node_id: "n2",
     },
   ],
+  execution_populations: [],
   manifest_bindings: [
     {
       workflow_name: "base",
       step_name: "finish",
-      role: "analysis",
+      manifest_usage_role: "analysis",
       manifest_name: "colors",
+      manifest_value_schema: "entity_set_v1",
       distinct_run_count: 1,
       distinct_manifest_digest_count: 1,
       manifest_digest: "digest",
@@ -107,7 +109,7 @@ const topology: ObservedTopologyResponse = {
 };
 
 const graph: TraceGraphResponse = {
-  schema_version: 1,
+  schema_version: 2,
   context: "colors",
   selected_artifact_id: 2,
   provenance_status: "complete",
@@ -147,6 +149,7 @@ const graph: TraceGraphResponse = {
     },
   ],
   dependencies: [],
+  execution_populations: [],
   manifest_bindings: [],
   warnings: [],
 };
@@ -291,7 +294,12 @@ describe("LineagePage", () => {
     expect(
       await screen.findByRole("heading", { name: /Observed Topology/ }),
     ).toBeInTheDocument();
-    expect(screen.getByRole("heading", { name: "Manifest Bindings" })).toBeInTheDocument();
+    expect(
+      screen.getByRole("heading", { name: "Execution Populations" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("heading", { name: "Scientific Manifest Bindings" }),
+    ).toBeInTheDocument();
     expect(screen.getByText("missing_artifact × 2")).toBeInTheDocument();
     expect(
       screen.getByText(
@@ -556,8 +564,9 @@ describe("LineagePage", () => {
         run_id: index + 1,
         workflow_name: "base",
         step_name: "finish",
-        role: "analysis",
+        manifest_usage_role: "analysis",
         manifest_name: "colors",
+        manifest_value_schema: "entity_set_v1",
         manifest_digest: `digest-${index}`,
         manifest_hash: `hash-${index}`,
         entity_count: 2,
@@ -636,8 +645,9 @@ describe("LineagePage", () => {
         run_id: index + 1,
         workflow_name: "base",
         step_name: "finish",
-        role: "analysis",
+        manifest_usage_role: "analysis",
         manifest_name: "colors",
+        manifest_value_schema: "entity_set_v1",
         manifest_digest: `digest-${index}`,
         manifest_hash: `hash-${index}`,
         entity_count: 2,

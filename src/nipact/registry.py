@@ -15,20 +15,20 @@ from .artifacts import parse_output_filename
 from .errors import ValidationError
 from .hashing import is_valid_digest, sha256_digest, sha256_file_digest, short_hash
 from .identity import validate_hash_alias, validate_path_token
-from .manifest import Manifest
+from .manifest import Manifest, ManifestValue
 from .projection import (
     RegisteredSourceSnapshot,
-    RequestBundleProjectionPlanV1,
-    ResolvedRequestBundleProjectionV1,
+    RequestBundleProjectionPlanV2,
+    ResolvedRequestBundleProjectionV2,
     RequestedOutputCoordinate,
     SourceCoordinate,
-    ValidatedStoredRequestBundleProjectionV1,
+    ValidatedStoredRequestBundleProjectionV2,
     resolve_request_bundle_projection_plan,
-    validate_stored_request_bundle_projection_v1,
+    validate_stored_request_bundle_projection_v2,
 )
 
 REGISTRY_DB_PATH = "database/registry.db"
-REGISTRY_SCHEMA_VERSION = 15
+REGISTRY_SCHEMA_VERSION = 16
 PARAMETER_HASH_VERSION = 1
 
 
@@ -59,6 +59,7 @@ class ArtifactInputRow:
     source_execution_role: str | None = None
     source_is_reused: bool | None = None
     source_artifact_path: str | None = None
+    manifest_value_schema: str | None = None
     manifest_digest: str | None = None
     edge_cardinality: int | None = None
     registry_source_artifact_id: int | None = None
@@ -90,7 +91,7 @@ class RetainedJobProjectionRecipe:
     step_name: str
     address: str
     output_names: tuple[str, ...]
-    projection_plan: RequestBundleProjectionPlanV1
+    projection_plan: RequestBundleProjectionPlanV2
 
 
 @dataclass(frozen=True)
@@ -127,13 +128,19 @@ class EnvironmentObservationV1:
 
 
 @dataclass(frozen=True)
+class RunExecutionPopulationRow:
+    manifest_name: str
+    manifest_value_schema: str
+    manifest_digest: str
+
+
+@dataclass(frozen=True)
 class RunManifestBindingRow:
     step_name: str
-    role: str
+    manifest_usage_role: str
     manifest_name: str
+    manifest_value_schema: str
     manifest_digest: str
-    manifest_hash: str
-    entity_count: int
 
 
 @dataclass(frozen=True)
@@ -189,6 +196,7 @@ class RegistryDependency:
     source_output_name: str | None
     source_address: str | None
     dependency_set_id: str | None
+    manifest_value_schema: str | None
     manifest_digest: str | None
     edge_cardinality: int | None
 
@@ -198,7 +206,7 @@ class ReusableArtifactBundleRequest:
     context: str
     step_name: str
     address: str
-    resolved_projection: ResolvedRequestBundleProjectionV1
+    resolved_projection: ResolvedRequestBundleProjectionV2
     sibling_outputs: tuple[tuple[str, str], ...]
     input_records: tuple[ArtifactInputRow, ...]
 
@@ -241,8 +249,21 @@ class RegistryManifestBinding:
     context: str
     workflow_name: str
     step_name: str
-    role: str
+    manifest_usage_role: str
     manifest_name: str
+    manifest_value_schema: str
+    manifest_digest: str
+    manifest_hash: str
+    entity_count: int
+
+
+@dataclass(frozen=True)
+class RegistryExecutionPopulation:
+    run_id: int
+    context: str
+    workflow_name: str
+    manifest_name: str
+    manifest_value_schema: str
     manifest_digest: str
     manifest_hash: str
     entity_count: int
@@ -253,13 +274,17 @@ class RegistryManifest:
     context: str
     name: str
     path: str
+    manifest_value_schema: str
     entity_count: int
     first_entity_id: str
     last_entity_id: str
     manifest_digest: str
     manifest_hash: str
-    source_artifact_path: str | None
-    manifest_body: str
+    canonical_body: str
+
+    @property
+    def manifest_body(self) -> str:
+        return self.canonical_body
 
 
 @dataclass(frozen=True)
@@ -362,38 +387,12 @@ def initialize_registry_db(
             source_digest=source_digest,
             source_hash=source_hash,
         )
-        for name, manifest in manifests.items():
-            conn.execute(
-                """
-                INSERT INTO manifests (
-                    context, name, path, entity_count, first_entity_id,
-                    last_entity_id, manifest_digest, manifest_hash,
-                    source_artifact_path, manifest_body
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(context, name) DO UPDATE SET
-                    path = excluded.path,
-                    entity_count = excluded.entity_count,
-                    first_entity_id = excluded.first_entity_id,
-                    last_entity_id = excluded.last_entity_id,
-                    manifest_digest = excluded.manifest_digest,
-                    manifest_hash = excluded.manifest_hash,
-                    source_artifact_path = excluded.source_artifact_path,
-                    manifest_body = excluded.manifest_body
-                """,
-                (
-                    context,
-                    name,
-                    manifest_paths[name],
-                    manifest.entity_count,
-                    manifest.first_entity_id,
-                    manifest.last_entity_id,
-                    manifest.manifest_digest,
-                    manifest.manifest_hash,
-                    source_artifact_path,
-                    manifest.manifest_body,
-                ),
-            )
+        _insert_manifest_declarations(
+            conn,
+            context=context,
+            manifests=manifests,
+            manifest_paths=manifest_paths,
+        )
 
 
 def initialize_prepared_demo_registry_db(
@@ -416,37 +415,71 @@ def initialize_prepared_demo_registry_db(
             """,
             (context, str(runtime_root)),
         )
-        for name, manifest in manifests.items():
-            conn.execute(
-                """
-                INSERT INTO manifests (
-                    context, name, path, entity_count, first_entity_id,
-                    last_entity_id, manifest_digest, manifest_hash,
-                    source_artifact_path, manifest_body
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)
-                ON CONFLICT(context, name) DO UPDATE SET
-                    path = excluded.path,
-                    entity_count = excluded.entity_count,
-                    first_entity_id = excluded.first_entity_id,
-                    last_entity_id = excluded.last_entity_id,
-                    manifest_digest = excluded.manifest_digest,
-                    manifest_hash = excluded.manifest_hash,
-                    source_artifact_path = excluded.source_artifact_path,
-                    manifest_body = excluded.manifest_body
-                """,
-                (
-                    context,
-                    name,
-                    manifest_paths[name],
-                    manifest.entity_count,
-                    manifest.first_entity_id,
-                    manifest.last_entity_id,
-                    manifest.manifest_digest,
-                    manifest.manifest_hash,
-                    manifest.manifest_body,
-                ),
+        _insert_manifest_declarations(
+            conn,
+            context=context,
+            manifests=manifests,
+            manifest_paths=manifest_paths,
+        )
+
+
+def _insert_manifest_declarations(
+    conn: sqlite3.Connection,
+    *,
+    context: str,
+    manifests: dict[str, Manifest],
+    manifest_paths: dict[str, str],
+) -> None:
+    for name, manifest in manifests.items():
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO manifest_values (
+                value_schema, manifest_digest, canonical_body, entity_count
             )
+            VALUES (?, ?, ?, ?)
+            """,
+            (
+                manifest.manifest_value_schema,
+                manifest.manifest_digest,
+                manifest.canonical_body,
+                manifest.entity_count,
+            ),
+        )
+        stored_value = conn.execute(
+            """
+            SELECT canonical_body, entity_count
+            FROM manifest_values
+            WHERE value_schema = ? AND manifest_digest = ?
+            """,
+            (manifest.manifest_value_schema, manifest.manifest_digest),
+        ).fetchone()
+        if stored_value != (manifest.canonical_body, manifest.entity_count):
+            raise ValidationError(
+                "registry manifest value does not match its schema-qualified key"
+            )
+        conn.execute(
+            """
+            INSERT INTO manifest_declarations (
+                context, manifest_name, declared_path,
+                last_validated_manifest_value_schema,
+                last_validated_manifest_digest
+            )
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(context, manifest_name) DO UPDATE SET
+                declared_path = excluded.declared_path,
+                last_validated_manifest_value_schema =
+                    excluded.last_validated_manifest_value_schema,
+                last_validated_manifest_digest =
+                    excluded.last_validated_manifest_digest
+            """,
+            (
+                context,
+                name,
+                manifest_paths[name],
+                manifest.manifest_value_schema,
+                manifest.manifest_digest,
+            ),
+        )
 
 
 def validate_registry_db(
@@ -496,12 +529,14 @@ def validate_registry_db(
             )
             rows = conn.execute(
                 """
-                SELECT name, path, entity_count, first_entity_id, last_entity_id,
-                       manifest_digest, manifest_hash, source_artifact_path,
-                       manifest_body
-                FROM manifests
-                WHERE context = ?
-                ORDER BY name
+                SELECT d.manifest_name, d.declared_path, v.value_schema,
+                       v.manifest_digest, v.canonical_body, v.entity_count
+                FROM manifest_declarations d
+                JOIN manifest_values v
+                  ON v.value_schema = d.last_validated_manifest_value_schema
+                 AND v.manifest_digest = d.last_validated_manifest_digest
+                WHERE d.context = ?
+                ORDER BY d.manifest_name
                 """,
                 (context,),
             ).fetchall()
@@ -540,13 +575,10 @@ def validate_registry_db(
         (
             name,
             manifest_paths[name].relative_to(project_root).as_posix(),
-            manifest.entity_count,
-            manifest.first_entity_id,
-            manifest.last_entity_id,
+            manifest.manifest_value_schema,
             manifest.manifest_digest,
-            manifest.manifest_hash,
-            source_artifact_path,
-            manifest.manifest_body,
+            manifest.canonical_body,
+            manifest.entity_count,
         )
         for name, manifest in sorted(manifests.items())
     ]
@@ -658,7 +690,7 @@ def _validate_request_bundle_projection_graph(
     graph: dict[str, tuple[str, ...]] = {}
     for row in rows:
         digest = str(row[0])
-        validated = validate_stored_request_bundle_projection_v1(
+        validated = validate_stored_request_bundle_projection_v2(
             request_bundle_digest=digest,
             projection_json=str(row[1]),
         )
@@ -730,6 +762,7 @@ def record_workflow_run(
     reused_projection_seeds: Iterable[ReusedProjectionSeed],
     selected_resolution_intents: Iterable[SelectedOutputResolutionIntent],
     environment_observation: EnvironmentObservationV1,
+    execution_population: RunExecutionPopulationRow | None = None,
     manifest_bindings: Iterable[RunManifestBindingRow],
     membership_intents: Iterable[MembershipIntent],
     base_workflow_name: str | None = None,
@@ -859,11 +892,15 @@ def record_workflow_run(
             )
             _insert_run_manifest_bindings(
                 conn,
-                context=context,
-                workflow_name=workflow_name,
                 run_id=run_id,
                 rows=manifest_binding_rows,
             )
+            if execution_population is not None:
+                _insert_run_execution_population(
+                    conn,
+                    run_id=run_id,
+                    row=execution_population,
+                )
             _delete_published_output_coordinates(
                 conn,
                 rows=tuple(intent.row for intent in membership_rows),
@@ -1362,7 +1399,7 @@ def resolve_reusable_artifact_bundle(
     preferred_artifact_ids: tuple[int, ...] | None = None,
 ) -> ReusableArtifactBundleCandidate | None:
     """Resolve one coherent reusable bundle independently of workflow membership."""
-    validate_stored_request_bundle_projection_v1(
+    validate_stored_request_bundle_projection_v2(
         request_bundle_digest=request.resolved_projection.request_bundle_digest,
         projection_json=request.resolved_projection.canonical_json,
     )
@@ -1533,7 +1570,7 @@ def _dependencies_for_artifact(
                source_content_digest, source_file_size, source_extension, input_path,
                binding_name, dependency_role, source_step_name,
                source_output_name, source_address, dependency_set_id,
-               manifest_digest, edge_cardinality
+               manifest_value_schema, manifest_digest, edge_cardinality
         FROM artifact_dependencies
         WHERE dependent_artifact_id = ?
         ORDER BY binding_name, input_path, source_artifact_id
@@ -1613,6 +1650,7 @@ def _dependency_common_fields_match(
     return (
         dependency.binding_name == input_record.binding_name
         and dependency.dependency_role == input_record.dependency_role
+        and dependency.manifest_value_schema == input_record.manifest_value_schema
         and dependency.manifest_digest == input_record.manifest_digest
         and dependency.edge_cardinality == input_record.edge_cardinality
     )
@@ -1890,7 +1928,7 @@ def _list_upstream_dependencies_conn(
                    source_content_digest, source_file_size, source_extension, input_path,
                    binding_name, dependency_role, source_step_name,
                    source_output_name, source_address, dependency_set_id,
-                   manifest_digest, edge_cardinality
+                   manifest_value_schema, manifest_digest, edge_cardinality
             FROM artifact_dependencies
             WHERE dependent_artifact_id = ?
             ORDER BY binding_name, input_path, source_artifact_id
@@ -1924,26 +1962,63 @@ def _list_run_manifest_bindings_conn(
     context: str | None = None,
 ) -> list[RegistryManifestBinding]:
     """List manifest bindings for a run on an already-open read connection."""
-    where_sql = "WHERE run_id = ?"
+    where_sql = "WHERE b.run_id = ?"
     values: tuple[object, ...] = (run_id,)
     if context is not None:
-        where_sql += " AND context = ?"
+        where_sql += " AND r.context = ?"
         values = (run_id, context)
     try:
         _require_run_id(conn, run_id)
         rows = conn.execute(
             """
-            SELECT run_id, context, workflow_name, step_name, role,
-                   manifest_name, manifest_digest, manifest_hash, entity_count
-            FROM run_manifest_bindings
+            SELECT b.run_id, r.context, r.workflow_name, b.step_name,
+                   b.manifest_usage_role, b.manifest_name,
+                   b.manifest_value_schema, b.manifest_digest, v.entity_count,
+                   v.canonical_body
+            FROM run_manifest_bindings b
+            JOIN workflow_runs r ON r.run_id = b.run_id
+            JOIN manifest_values v
+              ON v.value_schema = b.manifest_value_schema
+             AND v.manifest_digest = b.manifest_digest
             {where_sql}
-            ORDER BY step_name, role, manifest_name
+            ORDER BY b.step_name, b.manifest_usage_role, b.manifest_name
             """.format(where_sql=where_sql),
             values,
         ).fetchall()
     except sqlite3.Error as exc:
         raise ValidationError(f"registry.db is malformed: {exc}") from exc
     return [_registry_manifest_binding_from_row(row) for row in rows]
+
+
+def _read_run_execution_population_conn(
+    conn: sqlite3.Connection,
+    *,
+    run_id: int,
+    context: str | None = None,
+) -> RegistryExecutionPopulation | None:
+    where_sql = "WHERE p.run_id = ?"
+    values: tuple[object, ...] = (run_id,)
+    if context is not None:
+        where_sql += " AND r.context = ?"
+        values = (run_id, context)
+    _require_run_id(conn, run_id)
+    row = conn.execute(
+        """
+        SELECT p.run_id, r.context, r.workflow_name, p.manifest_name,
+               p.manifest_value_schema, p.manifest_digest, v.entity_count,
+               v.canonical_body
+        FROM run_execution_population p
+        JOIN workflow_runs r ON r.run_id = p.run_id
+        JOIN manifest_values v
+          ON v.value_schema = p.manifest_value_schema
+         AND v.manifest_digest = p.manifest_digest
+        {where_sql}
+        """.format(where_sql=where_sql),
+        values,
+    ).fetchone()
+    if row is None:
+        return None
+    return _registry_execution_population_from_row(row)
 
 
 def list_run_manifest_bindings(
@@ -1958,6 +2033,26 @@ def list_run_manifest_bindings(
         with _connect_readonly_rows(path) as conn:
             _validate_schema_version(conn)
             return _list_run_manifest_bindings_conn(
+                conn,
+                run_id=run_id,
+                context=context,
+            )
+    except sqlite3.Error as exc:
+        raise ValidationError(f"registry.db is malformed: {exc}") from exc
+
+
+def read_run_execution_population(
+    path: Path,
+    *,
+    run_id: int,
+    context: str | None = None,
+) -> RegistryExecutionPopulation | None:
+    """Read the workflow-level execution population recorded for a run."""
+    _validate_positive_id(run_id, label="run id")
+    try:
+        with _connect_readonly_rows(path) as conn:
+            _validate_schema_version(conn)
+            return _read_run_execution_population_conn(
                 conn,
                 run_id=run_id,
                 context=context,
@@ -2003,6 +2098,19 @@ class _RegistryReadSession:
             context=context,
         )
 
+    def read_run_execution_population(
+        self,
+        *,
+        run_id: int,
+        context: str | None = None,
+    ) -> RegistryExecutionPopulation | None:
+        _validate_positive_id(run_id, label="run id")
+        return _read_run_execution_population_conn(
+            self._conn,
+            run_id=run_id,
+            context=context,
+        )
+
 
 @contextmanager
 def _open_registry_read_session(path: Path) -> Iterator[_RegistryReadSession]:
@@ -2029,12 +2137,16 @@ def list_manifests(path: Path, *, context: str) -> list[RegistryManifest]:
             _validate_schema_version(conn)
             rows = conn.execute(
                 """
-                SELECT context, name, path, entity_count, first_entity_id,
-                       last_entity_id, manifest_digest, manifest_hash,
-                       source_artifact_path, manifest_body
-                FROM manifests
-                WHERE context = ?
-                ORDER BY name
+                SELECT d.context, d.manifest_name AS name,
+                       d.declared_path AS path,
+                       v.value_schema AS manifest_value_schema,
+                       v.entity_count, v.manifest_digest, v.canonical_body
+                FROM manifest_declarations d
+                JOIN manifest_values v
+                  ON v.value_schema = d.last_validated_manifest_value_schema
+                 AND v.manifest_digest = d.last_validated_manifest_digest
+                WHERE d.context = ?
+                ORDER BY d.manifest_name
                 """,
                 (context,),
             ).fetchall()
@@ -2055,11 +2167,15 @@ def read_manifest(
             _validate_schema_version(conn)
             row = conn.execute(
                 """
-                SELECT context, name, path, entity_count, first_entity_id,
-                       last_entity_id, manifest_digest, manifest_hash,
-                       source_artifact_path, manifest_body
-                FROM manifests
-                WHERE context = ? AND name = ?
+                SELECT d.context, d.manifest_name AS name,
+                       d.declared_path AS path,
+                       v.value_schema AS manifest_value_schema,
+                       v.entity_count, v.manifest_digest, v.canonical_body
+                FROM manifest_declarations d
+                JOIN manifest_values v
+                  ON v.value_schema = d.last_validated_manifest_value_schema
+                 AND v.manifest_digest = d.last_validated_manifest_digest
+                WHERE d.context = ? AND d.manifest_name = ?
                 """,
                 (context, manifest_name),
             ).fetchone()
@@ -2081,7 +2197,11 @@ def read_registry_summary(path: Path, *, context: str) -> dict[str, int]:
             ).fetchone()
             if context_row is None:
                 raise ValidationError(f"unknown context: {context}")
-            manifest_count = _count_rows(conn, "manifests", context=context)
+            manifest_count = _count_rows(
+                conn,
+                "manifest_declarations",
+                context=context,
+            )
             artifact_count = _count_rows(conn, "artifacts", context=context)
             source_artifact_count = _count_rows(
                 conn,
@@ -2266,7 +2386,7 @@ def _insert_workflow_output_artifacts(
     artifact_rows: tuple[WorkflowOutputArtifactRow, ...],
     parameter_ids: dict[tuple[str, str], int],
     finalized_projections: dict[
-        tuple[str, str], ResolvedRequestBundleProjectionV1
+        tuple[str, str], ResolvedRequestBundleProjectionV2
     ],
     created_at: str,
 ) -> dict[tuple[str, str, str], int]:
@@ -2329,7 +2449,7 @@ def _validate_no_divergent_fresh_bundles(
     run_id: int,
     artifact_rows: tuple[WorkflowOutputArtifactRow, ...],
     finalized_projections: dict[
-        tuple[str, str], ResolvedRequestBundleProjectionV1
+        tuple[str, str], ResolvedRequestBundleProjectionV2
     ],
 ) -> None:
     fresh_rows_by_job: dict[
@@ -2413,8 +2533,8 @@ def _validated_stored_request_bundle_projection(
     request_bundle_digest: str,
     *,
     missing_ok: bool = False,
-    cache: dict[str, ValidatedStoredRequestBundleProjectionV1] | None = None,
-) -> ValidatedStoredRequestBundleProjectionV1 | None:
+    cache: dict[str, ValidatedStoredRequestBundleProjectionV2] | None = None,
+) -> ValidatedStoredRequestBundleProjectionV2 | None:
     if not is_valid_digest(request_bundle_digest):
         raise ValidationError("registry request projection digest is invalid")
     if cache is not None and request_bundle_digest in cache:
@@ -2431,7 +2551,7 @@ def _validated_stored_request_bundle_projection(
         if missing_ok:
             return None
         raise ValidationError("registry request projection is missing")
-    validated = validate_stored_request_bundle_projection_v1(
+    validated = validate_stored_request_bundle_projection_v2(
         request_bundle_digest=request_bundle_digest,
         projection_json=str(row[0]),
     )
@@ -2442,11 +2562,11 @@ def _validated_stored_request_bundle_projection(
 
 def _insert_or_validate_request_bundle_projection(
     conn: sqlite3.Connection,
-    projection: ResolvedRequestBundleProjectionV1,
+    projection: ResolvedRequestBundleProjectionV2,
     *,
-    cache: dict[str, ValidatedStoredRequestBundleProjectionV1],
+    cache: dict[str, ValidatedStoredRequestBundleProjectionV2],
 ) -> None:
-    validated = validate_stored_request_bundle_projection_v1(
+    validated = validate_stored_request_bundle_projection_v2(
         request_bundle_digest=projection.request_bundle_digest,
         projection_json=projection.canonical_json,
     )
@@ -2485,8 +2605,8 @@ def _authenticate_reused_projection_seed(
     *,
     context: str,
     seed: ReusedProjectionSeed,
-    projection_cache: dict[str, ValidatedStoredRequestBundleProjectionV1],
-) -> ResolvedRequestBundleProjectionV1:
+    projection_cache: dict[str, ValidatedStoredRequestBundleProjectionV2],
+) -> ResolvedRequestBundleProjectionV2:
     if type(seed.actual_artifact_id) is not int or seed.actual_artifact_id <= 0:
         raise ValidationError("reused projection seed artifact id is invalid")
     if not is_valid_digest(seed.request_bundle_digest):
@@ -2525,13 +2645,13 @@ def _finalize_retained_job_projections(
     artifact_rows: tuple[WorkflowOutputArtifactRow, ...],
     projection_recipes: tuple[RetainedJobProjectionRecipe, ...],
     reused_projection_seeds: tuple[ReusedProjectionSeed, ...],
-) -> dict[tuple[str, str], ResolvedRequestBundleProjectionV1]:
+) -> dict[tuple[str, str], ResolvedRequestBundleProjectionV2]:
     source_snapshots = _read_registered_source_snapshots_conn(conn, context=context)
     upstream_states: dict[
         RequestedOutputCoordinate,
-        ResolvedRequestBundleProjectionV1,
+        ResolvedRequestBundleProjectionV2,
     ] = {}
-    projection_cache: dict[str, ValidatedStoredRequestBundleProjectionV1] = {}
+    projection_cache: dict[str, ValidatedStoredRequestBundleProjectionV2] = {}
     for seed in reused_projection_seeds:
         if seed.requested_output.namespace != context:
             raise ValidationError("reused projection seed belongs to another context")
@@ -2550,7 +2670,7 @@ def _finalize_retained_job_projections(
             row.output_name
         )
 
-    finalized: dict[tuple[str, str], ResolvedRequestBundleProjectionV1] = {}
+    finalized: dict[tuple[str, str], ResolvedRequestBundleProjectionV2] = {}
     for recipe in projection_recipes:
         job_key = (recipe.step_name, recipe.address)
         if job_key in finalized:
@@ -2581,7 +2701,7 @@ def _finalize_retained_job_projections(
         )
         if not isinstance(
             projection_state,
-            ResolvedRequestBundleProjectionV1,
+            ResolvedRequestBundleProjectionV2,
         ):
             raise ValidationError("retained projection remained unresolved after source upsert")
         _insert_or_validate_request_bundle_projection(
@@ -2719,10 +2839,10 @@ def _insert_artifact_dependencies(
                     dependent_artifact_id, source_artifact_id,
                     source_content_digest, source_file_size, source_extension,
                     input_path, binding_name, dependency_role, source_step_name,
-                    source_output_name, source_address, manifest_digest,
-                    edge_cardinality
+                    source_output_name, source_address, manifest_value_schema,
+                    manifest_digest, edge_cardinality
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     dependent_artifact_id,
@@ -2736,6 +2856,7 @@ def _insert_artifact_dependencies(
                     input_record.source_step_name,
                     input_record.source_output_name,
                     input_record.source_address,
+                    input_record.manifest_value_schema,
                     input_record.manifest_digest,
                     input_record.edge_cardinality,
                 ),
@@ -2898,32 +3019,49 @@ def _source_artifact_snapshot(
 def _insert_run_manifest_bindings(
     conn: sqlite3.Connection,
     *,
-    context: str,
-    workflow_name: str,
     run_id: int,
     rows: tuple[RunManifestBindingRow, ...],
 ) -> None:
     conn.executemany(
         """
         INSERT INTO run_manifest_bindings (
-            run_id, context, workflow_name, step_name, role, manifest_name,
-            manifest_digest, manifest_hash, entity_count
+            run_id, step_name, manifest_usage_role, manifest_name,
+            manifest_value_schema, manifest_digest
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?)
         """,
         (
             (
                 run_id,
-                context,
-                workflow_name,
                 row.step_name,
-                row.role,
+                row.manifest_usage_role,
                 row.manifest_name,
+                row.manifest_value_schema,
                 row.manifest_digest,
-                row.manifest_hash,
-                row.entity_count,
             )
             for row in rows
+        ),
+    )
+
+
+def _insert_run_execution_population(
+    conn: sqlite3.Connection,
+    *,
+    run_id: int,
+    row: RunExecutionPopulationRow,
+) -> None:
+    conn.execute(
+        """
+        INSERT INTO run_execution_population (
+            run_id, manifest_name, manifest_value_schema, manifest_digest
+        )
+        VALUES (?, ?, ?, ?)
+        """,
+        (
+            run_id,
+            row.manifest_name,
+            row.manifest_value_schema,
+            row.manifest_digest,
         ),
     )
 
@@ -3382,20 +3520,29 @@ def _create_schema(conn: sqlite3.Connection) -> None:
             PRIMARY KEY (context, path)
         );
 
-        CREATE TABLE IF NOT EXISTS manifests (
+        CREATE TABLE IF NOT EXISTS manifest_values (
+            value_schema TEXT NOT NULL,
+            manifest_digest TEXT NOT NULL CHECK(
+                length(manifest_digest) = 64
+                AND manifest_digest NOT GLOB '*[^0-9a-f]*'
+            ),
+            canonical_body TEXT NOT NULL CHECK(length(canonical_body) > 0),
+            entity_count INTEGER NOT NULL CHECK(entity_count > 0),
+            PRIMARY KEY (value_schema, manifest_digest)
+        );
+
+        CREATE TABLE IF NOT EXISTS manifest_declarations (
             context TEXT NOT NULL REFERENCES contexts(context) ON DELETE CASCADE,
-            name TEXT NOT NULL,
-            path TEXT NOT NULL,
-            entity_count INTEGER NOT NULL CHECK(entity_count >= 0),
-            first_entity_id TEXT NOT NULL,
-            last_entity_id TEXT NOT NULL,
-            manifest_digest TEXT NOT NULL,
-            manifest_hash TEXT NOT NULL,
-            source_artifact_path TEXT,
-            manifest_body TEXT NOT NULL,
-            PRIMARY KEY (context, name),
-            FOREIGN KEY (context, source_artifact_path)
-                REFERENCES source_artifacts(context, path)
+            manifest_name TEXT NOT NULL,
+            declared_path TEXT NOT NULL,
+            last_validated_manifest_value_schema TEXT NOT NULL,
+            last_validated_manifest_digest TEXT NOT NULL,
+            PRIMARY KEY (context, manifest_name),
+            FOREIGN KEY (
+                last_validated_manifest_value_schema,
+                last_validated_manifest_digest
+            ) REFERENCES manifest_values(value_schema, manifest_digest)
+                ON DELETE RESTRICT
         );
 
         CREATE TABLE IF NOT EXISTS workflow_runs (
@@ -3534,27 +3681,45 @@ def _create_schema(conn: sqlite3.Connection) -> None:
             source_output_name TEXT,
             source_address TEXT,
             dependency_set_id TEXT,
+            manifest_value_schema TEXT,
             manifest_digest TEXT,
             edge_cardinality INTEGER CHECK(
                 edge_cardinality IS NULL OR edge_cardinality >= 0
             ),
+            CHECK (
+                (manifest_value_schema IS NULL) = (manifest_digest IS NULL)
+            ),
+            FOREIGN KEY (manifest_value_schema, manifest_digest)
+                REFERENCES manifest_values(value_schema, manifest_digest)
+                ON DELETE RESTRICT,
             PRIMARY KEY (
                 dependent_artifact_id, source_artifact_id, input_path, binding_name
             )
         );
 
+        CREATE TABLE IF NOT EXISTS run_execution_population (
+            run_id INTEGER PRIMARY KEY
+                REFERENCES workflow_runs(run_id) ON DELETE CASCADE,
+            manifest_name TEXT NOT NULL,
+            manifest_value_schema TEXT NOT NULL,
+            manifest_digest TEXT NOT NULL,
+            FOREIGN KEY (manifest_value_schema, manifest_digest)
+                REFERENCES manifest_values(value_schema, manifest_digest)
+                ON DELETE RESTRICT
+        );
+
         CREATE TABLE IF NOT EXISTS run_manifest_bindings (
             run_id INTEGER NOT NULL
                 REFERENCES workflow_runs(run_id) ON DELETE CASCADE,
-            context TEXT NOT NULL REFERENCES contexts(context) ON DELETE CASCADE,
-            workflow_name TEXT NOT NULL,
             step_name TEXT NOT NULL,
-            role TEXT NOT NULL,
+            manifest_usage_role TEXT NOT NULL,
             manifest_name TEXT NOT NULL,
+            manifest_value_schema TEXT NOT NULL,
             manifest_digest TEXT NOT NULL,
-            manifest_hash TEXT NOT NULL,
-            entity_count INTEGER NOT NULL CHECK(entity_count >= 0),
-            PRIMARY KEY (run_id, step_name, role, manifest_name)
+            PRIMARY KEY (run_id, step_name, manifest_usage_role),
+            FOREIGN KEY (manifest_value_schema, manifest_digest)
+                REFERENCES manifest_values(value_schema, manifest_digest)
+                ON DELETE RESTRICT
         );
 
         CREATE TABLE IF NOT EXISTS published_outputs (
@@ -3878,6 +4043,7 @@ def _registry_dependency_from_row(row: sqlite3.Row) -> RegistryDependency:
         source_output_name=row["source_output_name"],
         source_address=row["source_address"],
         dependency_set_id=row["dependency_set_id"],
+        manifest_value_schema=row["manifest_value_schema"],
         manifest_digest=row["manifest_digest"],
         edge_cardinality=_optional_int(row["edge_cardinality"]),
     )
@@ -3886,32 +4052,63 @@ def _registry_dependency_from_row(row: sqlite3.Row) -> RegistryDependency:
 def _registry_manifest_binding_from_row(
     row: sqlite3.Row,
 ) -> RegistryManifestBinding:
+    value = _manifest_value_from_registry_row(row)
     return RegistryManifestBinding(
         run_id=int(row["run_id"]),
         context=str(row["context"]),
         workflow_name=str(row["workflow_name"]),
         step_name=str(row["step_name"]),
-        role=str(row["role"]),
+        manifest_usage_role=str(row["manifest_usage_role"]),
         manifest_name=str(row["manifest_name"]),
-        manifest_digest=str(row["manifest_digest"]),
-        manifest_hash=str(row["manifest_hash"]),
-        entity_count=int(row["entity_count"]),
+        manifest_value_schema=value.value_schema,
+        manifest_digest=value.manifest_digest,
+        manifest_hash=value.manifest_hash,
+        entity_count=value.entity_count,
+    )
+
+
+def _registry_execution_population_from_row(
+    row: sqlite3.Row,
+) -> RegistryExecutionPopulation:
+    value = _manifest_value_from_registry_row(row)
+    return RegistryExecutionPopulation(
+        run_id=int(row["run_id"]),
+        context=str(row["context"]),
+        workflow_name=str(row["workflow_name"]),
+        manifest_name=str(row["manifest_name"]),
+        manifest_value_schema=value.value_schema,
+        manifest_digest=value.manifest_digest,
+        manifest_hash=value.manifest_hash,
+        entity_count=value.entity_count,
     )
 
 
 def _registry_manifest_from_row(row: sqlite3.Row) -> RegistryManifest:
+    value = _manifest_value_from_registry_row(row)
     return RegistryManifest(
         context=str(row["context"]),
         name=str(row["name"]),
         path=str(row["path"]),
-        entity_count=int(row["entity_count"]),
-        first_entity_id=str(row["first_entity_id"]),
-        last_entity_id=str(row["last_entity_id"]),
-        manifest_digest=str(row["manifest_digest"]),
-        manifest_hash=str(row["manifest_hash"]),
-        source_artifact_path=row["source_artifact_path"],
-        manifest_body=str(row["manifest_body"]),
+        manifest_value_schema=value.value_schema,
+        entity_count=value.entity_count,
+        first_entity_id=value.entity_ids[0],
+        last_entity_id=value.entity_ids[-1],
+        manifest_digest=value.manifest_digest,
+        manifest_hash=value.manifest_hash,
+        canonical_body=value.canonical_body,
     )
+
+
+def _manifest_value_from_registry_row(row: sqlite3.Row) -> ManifestValue:
+    value = ManifestValue(
+        value_schema=str(row["manifest_value_schema"]),
+        manifest_digest=str(row["manifest_digest"]),
+        canonical_body=str(row["canonical_body"]),
+    )
+    entity_count = int(row["entity_count"])
+    if entity_count != value.entity_count:
+        raise ValidationError("registry manifest value entity count is inconsistent")
+    return value
 
 
 def _count_rows(
@@ -3921,7 +4118,7 @@ def _count_rows(
     context: str,
     origin: str | None = None,
 ) -> int:
-    if table not in {"manifests", "artifacts", "workflow_runs"}:
+    if table not in {"manifest_declarations", "artifacts", "workflow_runs"}:
         raise ValidationError("unsupported registry summary table")
     where_sql = "context = ?"
     values: list[object] = [context]

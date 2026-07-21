@@ -69,7 +69,7 @@ def _manifest_binding(
     *,
     workflow_name: str = "wf",
     step_name: str = "fit",
-    role: str = "source_population",
+    manifest_usage_role: str = "fit_cohort",
     manifest_name: str = "cohort",
     manifest_digest: str = "d1",
     manifest_hash: str = "h1",
@@ -79,8 +79,29 @@ def _manifest_binding(
         "run_id": run_id,
         "workflow_name": workflow_name,
         "step_name": step_name,
-        "role": role,
+        "manifest_usage_role": manifest_usage_role,
         "manifest_name": manifest_name,
+        "manifest_value_schema": "entity_set_v1",
+        "manifest_digest": manifest_digest,
+        "manifest_hash": manifest_hash,
+        "entity_count": entity_count,
+    }
+
+
+def _execution_population(
+    run_id: int,
+    *,
+    workflow_name: str = "wf",
+    manifest_name: str = "population",
+    manifest_digest: str = "d1",
+    manifest_hash: str = "h1",
+    entity_count: int = 100,
+) -> dict:
+    return {
+        "run_id": run_id,
+        "workflow_name": workflow_name,
+        "manifest_name": manifest_name,
+        "manifest_value_schema": "entity_set_v1",
         "manifest_digest": manifest_digest,
         "manifest_hash": manifest_hash,
         "entity_count": entity_count,
@@ -92,6 +113,7 @@ def _trace(
     artifacts: list[dict],
     dependencies: list[dict],
     selected_artifact_id: int,
+    execution_populations: list[dict] | None = None,
     manifest_bindings: list[dict] | None = None,
     warnings: list[dict] | None = None,
     provenance_status: str | None = None,
@@ -99,13 +121,14 @@ def _trace(
 ) -> dict:
     warnings = warnings or []
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "context": context,
         "selected_artifact_id": selected_artifact_id,
         "provenance_status": provenance_status
         or ("degraded" if warnings else "complete"),
         "artifacts": artifacts,
         "dependencies": dependencies,
+        "execution_populations": execution_populations or [],
         "manifest_bindings": manifest_bindings or [],
         "warnings": warnings,
     }
@@ -392,6 +415,43 @@ def test_missing_source_edge_omitted_but_counted_and_warned():
 # --- manifest grouping -------------------------------------------------------
 
 
+def test_execution_populations_are_grouped_separately() -> None:
+    trace = _trace(
+        artifacts=[
+            _artifact(
+                100,
+                "workflow_output",
+                workflow_name="wf",
+                step_name="fit",
+                output_name="model",
+                address="cohort",
+            ),
+        ],
+        dependencies=[],
+        selected_artifact_id=100,
+        execution_populations=[
+            _execution_population(1),
+            _execution_population(2),
+        ],
+    )
+
+    topology = build_observed_topology(trace)
+
+    assert topology["manifest_bindings"] == []
+    assert topology["execution_populations"] == [
+        {
+            "workflow_name": "wf",
+            "manifest_name": "population",
+            "manifest_value_schema": "entity_set_v1",
+            "distinct_run_count": 2,
+            "distinct_manifest_digest_count": 1,
+            "manifest_digest": "d1",
+            "manifest_hash": "h1",
+            "entity_count": 100,
+        }
+    ]
+
+
 def test_manifest_bindings_grouped_with_disagreement_nulled():
     trace = _trace(
         artifacts=[
@@ -415,11 +475,16 @@ def test_manifest_bindings_grouped_with_disagreement_nulled():
 
     assert len(topology["manifest_bindings"]) == 1
     summary = topology["manifest_bindings"][0]
-    assert (summary["workflow_name"], summary["step_name"], summary["role"]) == (
+    assert (
+        summary["workflow_name"],
+        summary["step_name"],
+        summary["manifest_usage_role"],
+    ) == (
         "wf",
         "fit",
-        "source_population",
+        "fit_cohort",
     )
+    assert summary["manifest_value_schema"] == "entity_set_v1"
     assert summary["distinct_run_count"] == 2
     assert summary["distinct_manifest_digest_count"] == 2
     assert summary["manifest_digest"] is None  # disagree -> null
@@ -575,5 +640,6 @@ def test_real_trace_projects_and_validates(
     assert response.summary.registry_dependency_count == len(graph["dependencies"])
     assert response.summary.node_count == len(response.nodes)
     assert response.summary.edge_count == len(response.edges)
+    assert len(response.execution_populations) == 1
     # the colors closure has at least one source feeding the modeling step
     assert any(node.kind == "source_input" for node in response.nodes)

@@ -3,6 +3,7 @@ import { Link } from "react-router-dom";
 import type {
   TraceArtifact,
   TraceDependency,
+  TraceExecutionPopulation,
   TraceGraphResponse,
   TraceManifestBinding,
 } from "../api/types";
@@ -127,15 +128,34 @@ export function LineageGraphExplorer({ graph }: { graph: TraceGraphResponse }) {
       </section>
       <WarningList warnings={graph.warnings} />
       <section className="panel">
-        <h2>Manifest Bindings</h2>
+        <h2>Execution Populations</h2>
+        <DataTable<TraceExecutionPopulation>
+          rows={graph.execution_populations}
+          getRowKey={(row) => `${row.run_id}:${row.workflow_name}:${row.manifest_name}`}
+          columns={[
+            { key: "workflow", label: "workflow", render: (row) => row.workflow_name },
+            { key: "manifest", label: "manifest", render: (row) => row.manifest_name },
+            { key: "schema", label: "schema", render: (row) => row.manifest_value_schema },
+            {
+              key: "digest",
+              label: "digest",
+              render: (row) => <IdentifierValue value={row.manifest_digest} compact />,
+            },
+            { key: "entities", label: "entities", render: (row) => row.entity_count },
+          ]}
+        />
+      </section>
+      <section className="panel">
+        <h2>Scientific Manifest Bindings</h2>
         <DataTable<TraceManifestBinding>
           rows={graph.manifest_bindings}
-          getRowKey={(row) => `${row.run_id}:${row.workflow_name}:${row.step_name}:${row.role}:${row.manifest_name}`}
+          getRowKey={(row) => `${row.run_id}:${row.workflow_name}:${row.step_name}:${row.manifest_usage_role}:${row.manifest_name}`}
           columns={[
             { key: "workflow", label: "workflow", render: (row) => row.workflow_name },
             { key: "step", label: "step", render: (row) => row.step_name },
-            { key: "role", label: "role", render: (row) => row.role },
+            { key: "role", label: "role", render: (row) => row.manifest_usage_role },
             { key: "manifest", label: "manifest", render: (row) => row.manifest_name },
+            { key: "schema", label: "schema", render: (row) => row.manifest_value_schema },
             {
               key: "digest",
               label: "digest",

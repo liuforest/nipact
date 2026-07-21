@@ -6,6 +6,7 @@ import json
 import pytest
 
 from nipact.errors import ValidationError
+from nipact.manifest import MANIFEST_VALUE_SCHEMA
 from nipact.projection import (
     IDENTITY_CONTRACT_VERSION,
     OUTPUT_CONTRACT_VERSION,
@@ -16,9 +17,9 @@ from nipact.projection import (
     ProjectionBindingPlan,
     RegisteredSourceBinding,
     RegisteredSourceSnapshot,
-    RequestBundleProjectionV1,
-    RequestBundleProjectionPlanV1,
-    ResolvedRequestBundleProjectionV1,
+    RequestBundleProjectionV2,
+    RequestBundleProjectionPlanV2,
+    ResolvedRequestBundleProjectionV2,
     RequestedOutputCoordinate,
     SiblingOutput,
     SourceBindingPlan,
@@ -29,7 +30,7 @@ from nipact.projection import (
     UpstreamRequestedOutputBindingPlan,
     canonicalize_request_bundle_projection,
     resolve_request_bundle_projection_plan,
-    validate_stored_request_bundle_projection_v1,
+    validate_stored_request_bundle_projection_v2,
 )
 
 
@@ -54,8 +55,8 @@ def _projection(
     canonical_parameters: object | None = None,
     role_labelled_bindings: tuple[object, ...] | None = None,
     sibling_outputs: tuple[SiblingOutput, ...] | None = None,
-) -> RequestBundleProjectionV1:
-    return RequestBundleProjectionV1(
+) -> RequestBundleProjectionV2:
+    return RequestBundleProjectionV2(
         identity_contract_version=IDENTITY_CONTRACT_VERSION,
         namespace="clms",
         step_contract=StepContract(
@@ -109,12 +110,12 @@ def _upstream_binding(
 
 
 def _resolved(
-    projection: RequestBundleProjectionV1,
-) -> ResolvedRequestBundleProjectionV1:
+    projection: RequestBundleProjectionV2,
+) -> ResolvedRequestBundleProjectionV2:
     return canonicalize_request_bundle_projection(projection)
 
 
-def _canonical_json(projection: RequestBundleProjectionV1) -> str:
+def _canonical_json(projection: RequestBundleProjectionV2) -> str:
     return _resolved(projection).canonical_json
 
 
@@ -122,8 +123,8 @@ def _projection_plan(
     *binding_plans: ProjectionBindingPlan,
     address: str = "aac_027_m00",
     parameters: object | None = None,
-) -> RequestBundleProjectionPlanV1:
-    return RequestBundleProjectionPlanV1(
+) -> RequestBundleProjectionPlanV2:
+    return RequestBundleProjectionPlanV2(
         identity_contract_version=IDENTITY_CONTRACT_VERSION,
         namespace="clms",
         step_contract=StepContract(
@@ -159,7 +160,7 @@ def test_canonical_projection_matches_golden_json() -> None:
     assert resolved.canonical_json == (
         '{"address":"aac_027_m00","canonical_parameters":{"enabled":true,'
         '"label":"café","threshold":0.5},"determinism_contract":"deterministic",'
-        '"identity_contract_version":1,"namespace":"clms","output_contract":'
+        '"identity_contract_version":2,"namespace":"clms","output_contract":'
         '{"output_contract_version":1,"sibling_outputs":[{"declared_extension":'
         '".nii.gz","output_name":"segmentation"}]},"result_affecting_settings":{},'
         '"role_labelled_bindings":[{"declared_extension":".nii.gz",'
@@ -167,12 +168,18 @@ def test_canonical_projection_matches_golden_json() -> None:
         'aaaaaaaaaaaaaaaa","registered_file_size":123,"role":"t1w",'
         '"source_coordinate":{"namespace":"clms","path":'
         '"data/aac_027_m00/t1w.nii.gz"}}],"step_contract":{"callable_ref":'
-        '"clms.steps:t1_synthseg","runner_contract_version":"1",'
+        '"clms.steps:t1_synthseg","runner_contract_version":"2",'
         '"step_contract_id":"t1_synthseg","step_contract_version":"1"}}'
     )
-    assert resolved.request_bundle_digest == hashlib.sha256(
-        resolved.canonical_json.encode("utf-8")
-    ).hexdigest()
+    assert (
+        resolved.request_bundle_digest
+        == "584f0e97713ebeda36b774f8e4a39651f498f01d9ec8dfefdbcd8db3039c0bc4"
+    )
+
+
+def test_projection_contract_versions_are_v2() -> None:
+    assert IDENTITY_CONTRACT_VERSION == 2
+    assert RUNNER_CONTRACT_VERSION == "2"
 
 
 def test_canonical_projection_is_invariant_to_object_and_declared_set_order() -> None:
@@ -185,6 +192,7 @@ def test_canonical_projection_is_invariant_to_object_and_declared_set_order() ->
             CollectionBinding(
                 role="images",
                 collection_semantics="coordinate_set_v1",
+                manifest_value_schema=MANIFEST_VALUE_SCHEMA,
                 manifest_digest="b" * 64,
                 members=(second_member, first_member),
             ),
@@ -200,6 +208,7 @@ def test_canonical_projection_is_invariant_to_object_and_declared_set_order() ->
             CollectionBinding(
                 role="images",
                 collection_semantics="coordinate_set_v1",
+                manifest_value_schema=MANIFEST_VALUE_SCHEMA,
                 manifest_digest="b" * 64,
                 members=(first_member, second_member),
             ),
@@ -260,6 +269,7 @@ def test_canonical_projection_serializes_collection_without_manifest() -> None:
     )
 
     assert '"manifest_digest":null' in serialized
+    assert '"manifest_value_schema":null' in serialized
     payload = json.loads(serialized)
     members = payload["role_labelled_bindings"][0]["members"]
     assert [member["upstream_request_bundle_digest"] for member in members] == sorted(
@@ -268,6 +278,42 @@ def test_canonical_projection_serializes_collection_without_manifest() -> None:
             second.upstream_request_bundle_digest,
         ]
     )
+
+
+@pytest.mark.parametrize(
+    ("manifest_value_schema", "manifest_digest"),
+    [
+        (MANIFEST_VALUE_SCHEMA, None),
+        (None, "b" * 64),
+    ],
+)
+def test_collection_manifest_reference_requires_null_parity(
+    manifest_value_schema: str | None,
+    manifest_digest: str | None,
+) -> None:
+    binding = CollectionBinding(
+        role="images",
+        collection_semantics="coordinate_set_v1",
+        manifest_value_schema=manifest_value_schema,
+        manifest_digest=manifest_digest,
+        members=(_upstream_binding(role="images", address="subject-a"),),
+    )
+
+    with pytest.raises(ValidationError, match="must both be null or both be present"):
+        _canonical_json(_projection(role_labelled_bindings=(binding,)))
+
+
+def test_collection_manifest_reference_rejects_unknown_schema() -> None:
+    binding = CollectionBinding(
+        role="images",
+        collection_semantics="coordinate_set_v1",
+        manifest_value_schema="entity_set_v2",
+        manifest_digest="b" * 64,
+        members=(_upstream_binding(role="images", address="subject-a"),),
+    )
+
+    with pytest.raises(ValidationError, match="must be 'entity_set_v1'"):
+        _canonical_json(_projection(role_labelled_bindings=(binding,)))
 
 
 def test_binding_role_is_identity_bearing() -> None:
@@ -366,6 +412,7 @@ def test_projection_rejects_invalid_full_digests(
         binding = CollectionBinding(
             role="images",
             collection_semantics="coordinate_set_v1",
+            manifest_value_schema=MANIFEST_VALUE_SCHEMA,
             manifest_digest=digest,
             members=(_upstream_binding(role="images", address="subject-a"),),
         )
@@ -374,12 +421,13 @@ def test_projection_rejects_invalid_full_digests(
         _canonical_json(_projection(role_labelled_bindings=(binding,)))
 
 
-def _identity_matrix_projection(change: str) -> RequestBundleProjectionV1:
+def _identity_matrix_projection(change: str) -> RequestBundleProjectionV2:
     first_binding = _source_binding(role="image", path="data/image.nii.gz")
     member = _upstream_binding(role="mask", address="subject-a")
     second_binding = CollectionBinding(
         role="mask",
         collection_semantics="coordinate_set_v1",
+        manifest_value_schema=MANIFEST_VALUE_SCHEMA,
         manifest_digest="c" * 64,
         members=(member,),
     )
@@ -411,7 +459,7 @@ def _identity_matrix_projection(change: str) -> RequestBundleProjectionV1:
     if change == "runner_contract_version":
         return replace(
             base,
-            step_contract=replace(base.step_contract, runner_contract_version="2"),
+            step_contract=replace(base.step_contract, runner_contract_version="3"),
         )
     if change == "address":
         return replace(base, address="other")
@@ -539,7 +587,7 @@ def test_projection_identity_inclusion_and_exclusion_matrix(
 
 
 def test_projection_contract_excludes_operational_and_retrospective_facts() -> None:
-    field_names = {field.name for field in fields(RequestBundleProjectionV1)}
+    field_names = {field.name for field in fields(RequestBundleProjectionV2)}
 
     assert field_names.isdisjoint(
         {
@@ -564,7 +612,7 @@ def test_projection_rejects_unknown_contract_versions(
 ) -> None:
     projection = _projection()
     if contract == "identity":
-        projection = replace(projection, identity_contract_version=2)
+        projection = replace(projection, identity_contract_version=1)
     else:
         projection = replace(
             projection,
@@ -573,7 +621,11 @@ def test_projection_rejects_unknown_contract_versions(
                 output_contract_version=2,
             ),
         )
-    with pytest.raises(ValidationError, match="contract_version must be 1"):
+    expected_version = 2 if contract == "identity" else 1
+    with pytest.raises(
+        ValidationError,
+        match=rf"contract_version must be {expected_version}",
+    ):
         _canonical_json(projection)
 
 
@@ -633,7 +685,7 @@ def test_projection_plan_resolves_registered_source_snapshot() -> None:
         upstream_states={},
     )
 
-    assert isinstance(state, ResolvedRequestBundleProjectionV1)
+    assert isinstance(state, ResolvedRequestBundleProjectionV2)
     payload = json.loads(state.canonical_json)
     assert payload["output_contract"]["sibling_outputs"] == [
         {"declared_extension": ".nii.gz", "output_name": "segmentation"},
@@ -712,6 +764,9 @@ def test_projection_plan_resolves_collection_members(
             CollectionBindingPlan(
                 role="images",
                 collection_semantics="coordinate_set_v1",
+                manifest_value_schema=(
+                    MANIFEST_VALUE_SCHEMA if manifest_digest is not None else None
+                ),
                 manifest_digest=manifest_digest,
                 members=(second_coordinate, first_coordinate),
             )
@@ -723,7 +778,7 @@ def test_projection_plan_resolves_collection_members(
         },
     )
 
-    assert isinstance(state, ResolvedRequestBundleProjectionV1)
+    assert isinstance(state, ResolvedRequestBundleProjectionV2)
     members = json.loads(state.canonical_json)["role_labelled_bindings"][0][
         "members"
     ]
@@ -752,7 +807,7 @@ def test_projection_plan_rejects_unavailable_upstream_coordinate() -> None:
 
 
 def test_projection_plan_is_not_a_canonical_projection() -> None:
-    with pytest.raises(ValidationError, match="RequestBundleProjectionV1"):
+    with pytest.raises(ValidationError, match="RequestBundleProjectionV2"):
         canonicalize_request_bundle_projection(
             _projection_plan()  # type: ignore[arg-type]
         )
@@ -842,7 +897,7 @@ def test_stored_projection_validator_round_trips_and_reports_direct_upstreams() 
         )
     )
 
-    validated = validate_stored_request_bundle_projection_v1(
+    validated = validate_stored_request_bundle_projection_v2(
         request_bundle_digest=resolved.request_bundle_digest,
         projection_json=resolved.canonical_json,
     )
@@ -867,7 +922,7 @@ def test_stored_projection_validator_rejects_malformed_shapes(
     error: str,
 ) -> None:
     with pytest.raises(ValidationError, match=error):
-        validate_stored_request_bundle_projection_v1(
+        validate_stored_request_bundle_projection_v2(
             request_bundle_digest=digest,
             projection_json=projection_json,
         )
@@ -878,12 +933,31 @@ def test_stored_projection_validator_rejects_noncanonical_or_mismatched_payload(
     noncanonical = json.dumps(json.loads(resolved.canonical_json), indent=2)
 
     with pytest.raises(ValidationError, match="not canonical"):
-        validate_stored_request_bundle_projection_v1(
+        validate_stored_request_bundle_projection_v2(
             request_bundle_digest=resolved.request_bundle_digest,
             projection_json=noncanonical,
         )
     with pytest.raises(ValidationError, match="does not match"):
-        validate_stored_request_bundle_projection_v1(
+        validate_stored_request_bundle_projection_v2(
             request_bundle_digest="f" * 64,
             projection_json=resolved.canonical_json,
+        )
+
+
+def test_stored_projection_validator_rejects_v1_payload() -> None:
+    payload = json.loads(_resolved(_projection()).canonical_json)
+    payload["identity_contract_version"] = 1
+    projection_json = json.dumps(
+        payload,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+
+    with pytest.raises(ValidationError, match="identity_contract_version must be 2"):
+        validate_stored_request_bundle_projection_v2(
+            request_bundle_digest=hashlib.sha256(
+                projection_json.encode("utf-8")
+            ).hexdigest(),
+            projection_json=projection_json,
         )

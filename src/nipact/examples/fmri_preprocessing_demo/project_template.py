@@ -104,10 +104,6 @@ def step_files() -> dict[str, dict[str, Any]]:
                 "import_fmri_sources_file"
             ),
             "source_inputs": ["bold", "t1"],
-            "manifest_binding": {
-                "role": "source_population",
-                "manifest": ANALYSIS_COHORT_NAME,
-            },
             "outputs": {
                 "raw_bold": {
                     "extension": ".npy",
@@ -169,6 +165,7 @@ def workflow_files() -> dict[str, dict[str, Any]]:
     return {
         BASE_WORKFLOW_NAME: {
             "workflow_name": BASE_WORKFLOW_NAME,
+            "execution_population": ANALYSIS_COHORT_NAME,
             "steps": [
                 "fmri_source",
                 {

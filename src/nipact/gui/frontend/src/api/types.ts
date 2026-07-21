@@ -39,13 +39,13 @@ export interface ManifestSummary {
   entity_count: number;
   first_entity_id: string;
   last_entity_id: string;
+  manifest_value_schema: string;
   manifest_digest: string;
   manifest_hash: string;
-  source_artifact_path: string | null;
 }
 
 export interface ManifestDetail extends ManifestSummary {
-  manifest_body: string;
+  canonical_body: string;
 }
 
 export interface ManifestsResponse {
@@ -172,6 +172,7 @@ export interface TraceDependency {
   source_file_size: number;
   source_extension: string;
   dependency_set_id: string | null;
+  manifest_value_schema: string | null;
   manifest_digest: string | null;
   edge_cardinality: number | null;
 }
@@ -180,8 +181,19 @@ export interface TraceManifestBinding {
   run_id: number;
   workflow_name: string;
   step_name: string;
-  role: string;
+  manifest_usage_role: string;
   manifest_name: string;
+  manifest_value_schema: string;
+  manifest_digest: string;
+  manifest_hash: string;
+  entity_count: number;
+}
+
+export interface TraceExecutionPopulation {
+  run_id: number;
+  workflow_name: string;
+  manifest_name: string;
+  manifest_value_schema: string;
   manifest_digest: string;
   manifest_hash: string;
   entity_count: number;
@@ -201,6 +213,7 @@ export interface TraceGraphResponse {
   provenance_status: string;
   artifacts: TraceArtifact[];
   dependencies: TraceDependency[];
+  execution_populations: TraceExecutionPopulation[];
   manifest_bindings: TraceManifestBinding[];
   warnings: TraceWarning[];
 }
@@ -275,8 +288,20 @@ export type TopologyEdge = TopologyConsumesEdge | TopologyProducesEdge;
 export interface TopologyManifestBindingSummary {
   workflow_name: string;
   step_name: string;
-  role: string;
+  manifest_usage_role: string;
   manifest_name: string;
+  manifest_value_schema: string;
+  distinct_run_count: number;
+  distinct_manifest_digest_count: number;
+  manifest_digest: string | null;
+  manifest_hash: string | null;
+  entity_count: number | null;
+}
+
+export interface TopologyExecutionPopulationSummary {
+  workflow_name: string;
+  manifest_name: string;
+  manifest_value_schema: string;
   distinct_run_count: number;
   distinct_manifest_digest_count: number;
   manifest_digest: string | null;
@@ -307,6 +332,7 @@ export interface ObservedTopologyResponse {
   summary: TopologySummary;
   nodes: TopologyNode[];
   edges: TopologyEdge[];
+  execution_populations: TopologyExecutionPopulationSummary[];
   manifest_bindings: TopologyManifestBindingSummary[];
   warnings: TopologyWarningSummary[];
 }
