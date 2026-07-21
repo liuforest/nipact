@@ -85,6 +85,7 @@ def step_files() -> dict[str, dict[str, Any]]:
     return {
         "dfc_source": {
             "step_name": "dfc_source",
+            "step_contract_version": "1",
             "pattern_kind": "pattern_a",
             "execution_role": "source_import",
             "address_scope": "entity",
@@ -106,6 +107,7 @@ def step_files() -> dict[str, dict[str, Any]]:
         },
         "dfc_clean_timeseries": {
             "step_name": "dfc_clean_timeseries",
+            "step_contract_version": "1",
             "pattern_kind": "pattern_a",
             "execution_role": "transform",
             "address_scope": "entity",
@@ -128,6 +130,7 @@ def step_files() -> dict[str, dict[str, Any]]:
         },
         "dfc_group_summary": {
             "step_name": SELECTED_STEP_NAME,
+            "step_contract_version": "1",
             "pattern_kind": "analysis",
             "execution_role": "analysis",
             "address_scope": "cohort",

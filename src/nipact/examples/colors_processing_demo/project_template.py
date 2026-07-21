@@ -145,6 +145,7 @@ def step_files() -> dict[str, dict[str, Any]]:
     return {
         "color_source": {
             "step_name": "color_source",
+            "step_contract_version": "1",
             "pattern_kind": "pattern_a",
             "execution_role": "source_import",
             "address_scope": "entity",
@@ -169,6 +170,7 @@ def step_files() -> dict[str, dict[str, Any]]:
         },
         "color_features": {
             "step_name": "color_features",
+            "step_contract_version": "1",
             "pattern_kind": "pattern_a",
             "execution_role": "transform",
             "address_scope": "entity",
@@ -188,6 +190,7 @@ def step_files() -> dict[str, dict[str, Any]]:
         },
         "color_local_transform": {
             "step_name": "color_local_transform",
+            "step_contract_version": "1",
             "pattern_kind": "pattern_a",
             "execution_role": "transform",
             "address_scope": "entity",
@@ -212,6 +215,7 @@ def step_files() -> dict[str, dict[str, Any]]:
         },
         "color_candidate_select": {
             "step_name": "color_candidate_select",
+            "step_contract_version": "1",
             "pattern_kind": "pattern_a",
             "execution_role": "transform",
             "address_scope": "entity",
@@ -235,6 +239,7 @@ def step_files() -> dict[str, dict[str, Any]]:
         },
         "color_cohort_fit": {
             "step_name": "color_cohort_fit",
+            "step_contract_version": "1",
             "pattern_kind": "pattern_b",
             "execution_role": "b_fit",
             "address_scope": "cohort",
@@ -258,6 +263,7 @@ def step_files() -> dict[str, dict[str, Any]]:
         },
         "color_cohort_apply": {
             "step_name": "color_cohort_apply",
+            "step_contract_version": "1",
             "pattern_kind": "pattern_b",
             "execution_role": "b_apply",
             "address_scope": "entity",
@@ -282,6 +288,7 @@ def step_files() -> dict[str, dict[str, Any]]:
         },
         "color_sector_label": {
             "step_name": "color_sector_label",
+            "step_contract_version": "1",
             "pattern_kind": "pattern_a",
             "execution_role": "transform",
             "address_scope": "entity",
@@ -305,6 +312,7 @@ def step_files() -> dict[str, dict[str, Any]]:
         },
         "color_sector_analysis": {
             "step_name": ANALYSIS_STEP_NAME,
+            "step_contract_version": "1",
             "pattern_kind": "analysis",
             "execution_role": "analysis",
             "address_scope": "cohort",

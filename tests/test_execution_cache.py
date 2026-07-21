@@ -218,6 +218,7 @@ def step_apply_file(*, inputs, outputs, params, address):
         project_dir / "steps/a_source.yaml",
         {
             "step_name": "a_source",
+            "step_contract_version": "1",
             "pattern_kind": "pattern_a",
             "execution_role": "source_import",
             "address_scope": "entity",
@@ -239,6 +240,7 @@ def step_apply_file(*, inputs, outputs, params, address):
         project_dir / "steps/b_transform.yaml",
         {
             "step_name": "b_transform",
+            "step_contract_version": "1",
             "pattern_kind": "pattern_a",
             "execution_role": "transform",
             "address_scope": "entity",
@@ -264,6 +266,7 @@ def step_apply_file(*, inputs, outputs, params, address):
         project_dir / "steps/c_transform.yaml",
         {
             "step_name": "c_transform",
+            "step_contract_version": "1",
             "pattern_kind": "pattern_a",
             "execution_role": "transform",
             "address_scope": "entity",
@@ -286,6 +289,7 @@ def step_apply_file(*, inputs, outputs, params, address):
         project_dir / "steps/d_transform.yaml",
         {
             "step_name": "d_transform",
+            "step_contract_version": "1",
             "pattern_kind": "pattern_a",
             "execution_role": "transform",
             "address_scope": "entity",
@@ -308,6 +312,7 @@ def step_apply_file(*, inputs, outputs, params, address):
         project_dir / "steps/fit_transform.yaml",
         {
             "step_name": "fit_transform",
+            "step_contract_version": "1",
             "pattern_kind": "pattern_a",
             "execution_role": "b_fit",
             "address_scope": "cohort",
@@ -337,6 +342,7 @@ def step_apply_file(*, inputs, outputs, params, address):
         project_dir / "steps/apply_transform.yaml",
         {
             "step_name": "apply_transform",
+            "step_contract_version": "1",
             "pattern_kind": "pattern_b",
             "execution_role": "b_apply",
             "address_scope": "entity",
@@ -366,6 +372,7 @@ def step_apply_file(*, inputs, outputs, params, address):
         project_dir / "steps/multi_transform.yaml",
         {
             "step_name": "multi_transform",
+            "step_contract_version": "1",
             "pattern_kind": "pattern_a",
             "execution_role": "transform",
             "address_scope": "entity",
@@ -392,6 +399,7 @@ def step_apply_file(*, inputs, outputs, params, address):
         project_dir / "steps/use_multi.yaml",
         {
             "step_name": "use_multi",
+            "step_contract_version": "1",
             "pattern_kind": "pattern_a",
             "execution_role": "transform",
             "address_scope": "entity",
@@ -857,6 +865,16 @@ def test_projection_planning_uses_prospective_upstream_request_identity(
         fresh_b_plan.selected_reused_output_refs[0]
         .reuse_request.resolved_projection
     )
+    a_plan = build_run_plan(
+        project_dir=project_dir,
+        context="cache",
+        workflow_name="main",
+        step_name="a_source",
+    )
+    a_projection = (
+        a_plan.selected_reused_output_refs[0]
+        .reuse_request.resolved_projection
+    )
 
     c_plan = build_run_plan(
         project_dir=project_dir,
@@ -933,25 +951,45 @@ def test_projection_planning_uses_prospective_upstream_request_identity(
     )
     assert after_edit_c.projection_state.canonical_json == before_edit
 
-    source_step_path = project_dir / "steps/a_source.yaml"
-    source_step = yaml.safe_load(source_step_path.read_text(encoding="utf-8"))
-    source_step["step_contract_version"] = "2"
-    _write_yaml(source_step_path, source_step)
+    transform_step_path = project_dir / "steps/b_transform.yaml"
+    transform_step = yaml.safe_load(transform_step_path.read_text(encoding="utf-8"))
+    transform_step["step_contract_version"] = "2"
+    _write_yaml(transform_step_path, transform_step)
     changed_request_plan = build_run_plan(
         project_dir=project_dir,
         context="cache",
         workflow_name="main",
-        step_name="b_transform",
+        step_name="c_transform",
+    )
+    unchanged_a_plan = build_run_plan(
+        project_dir=project_dir,
+        context="cache",
+        workflow_name="main",
+        step_name="a_source",
+    )
+    unchanged_a_projection = (
+        unchanged_a_plan.selected_reused_output_refs[0]
+        .reuse_request.resolved_projection
     )
     changed_b = _workflow_input_job(
         changed_request_plan,
         step_name="b_transform",
     )
+    changed_c = _workflow_input_job(
+        changed_request_plan,
+        step_name="c_transform",
+    )
     assert isinstance(
         changed_b.projection_state,
         ResolvedRequestBundleProjectionV1,
     )
+    assert isinstance(
+        changed_c.projection_state,
+        ResolvedRequestBundleProjectionV1,
+    )
+    assert unchanged_a_projection == a_projection
     assert changed_b.projection_state != fresh_b_projection
+    assert changed_c.projection_state != c_job.projection_state
 
 
 def test_projection_planning_covers_collection_cohort_and_sibling_outputs(
@@ -1061,6 +1099,7 @@ def test_dependency_free_workflow_output_remains_reusable_as_an_input(
         project_dir / "steps/constant_value.yaml",
         {
             "step_name": "constant_value",
+            "step_contract_version": "1",
             "pattern_kind": "pattern_a",
             "execution_role": "transform",
             "address_scope": "entity",
@@ -1081,6 +1120,7 @@ def test_dependency_free_workflow_output_remains_reusable_as_an_input(
         project_dir / "steps/use_constant.yaml",
         {
             "step_name": "use_constant",
+            "step_contract_version": "1",
             "pattern_kind": "pattern_a",
             "execution_role": "transform",
             "address_scope": "entity",

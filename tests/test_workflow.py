@@ -139,6 +139,20 @@ def test_step_contract_version_is_loaded_and_compiled(tmp_path: Path) -> None:
     assert plan.steps[1].step_contract_version == "1"
 
 
+def test_loader_rejects_missing_step_contract_version(tmp_path: Path) -> None:
+    project_dir, _runtime_dir = _init_demo(tmp_path)
+    step_path = project_dir / "steps/color_source.yaml"
+    payload = _read_yaml(step_path)
+    del payload["step_contract_version"]
+    _write_yaml(step_path, payload)
+
+    with pytest.raises(
+        ValidationError,
+        match="missing required field.*step_contract_version",
+    ):
+        _load(project_dir)
+
+
 @pytest.mark.parametrize("value", [1, True, ""])
 def test_loader_rejects_invalid_step_contract_version(
     tmp_path: Path,
