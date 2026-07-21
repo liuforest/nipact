@@ -261,8 +261,7 @@ def test_registry_manifest_helpers_and_summary(
 
     assert {row.name for row in manifests} >= {"init"}
     assert manifest.name == "init"
-    assert manifest.manifest_body.startswith("color_000")
-    assert manifest.canonical_body == manifest.manifest_body
+    assert manifest.canonical_body.startswith("color_000")
     assert manifest.manifest_value_schema == "entity_set_v1"
     assert manifest.first_entity_id == "color_000"
     assert manifest.last_entity_id == "color_199"

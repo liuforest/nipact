@@ -24,7 +24,6 @@ from nipact.manifest import (
     MANIFEST_VALUE_SCHEMA,
     build_manifest,
     build_manifest_value,
-    manifest_body,
 )
 from nipact.registry import REGISTRY_SCHEMA_VERSION
 
@@ -543,7 +542,7 @@ def test_init_creates_project_runtime_databases_and_validates(
             MANIFEST_VALUE_SCHEMA,
             40,
             build_manifest_value(entities=fit_cohort_entity_ids()).manifest_digest,
-            manifest_body(fit_cohort_entity_ids()),
+            build_manifest_value(entities=fit_cohort_entity_ids()).canonical_body,
         ),
         (
             "init",
@@ -551,7 +550,7 @@ def test_init_creates_project_runtime_databases_and_validates(
             MANIFEST_VALUE_SCHEMA,
             200,
             build_manifest_value(entities=analysis_entity_ids()).manifest_digest,
-            manifest_body(analysis_entity_ids()),
+            build_manifest_value(entities=analysis_entity_ids()).canonical_body,
         ),
     ]
     source_digest = sha256_file_digest(runtime_dir / "data/color_source.json")

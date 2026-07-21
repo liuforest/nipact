@@ -21,7 +21,7 @@ from .model import (
     DEFAULT_SEED,
     DEFAULT_VALUE,
     GREEN_THETA,
-    build_source_population,
+    build_color_grid,
 )
 
 SUPPORTED_DEMO = "colors"
@@ -44,7 +44,7 @@ MANIFEST_DESCRIPTIONS = {
 
 def source_payload() -> dict[str, Any]:
     records = []
-    for point in build_source_population():
+    for point in build_color_grid():
         payload = point.to_payload()
         payload["rgb"] = list(point.rgb)
         records.append(payload)

@@ -282,10 +282,6 @@ class RegistryManifest:
     manifest_hash: str
     canonical_body: str
 
-    @property
-    def manifest_body(self) -> str:
-        return self.canonical_body
-
 
 @dataclass(frozen=True)
 class ArtifactGroupCount:

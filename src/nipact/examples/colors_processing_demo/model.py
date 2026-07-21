@@ -7,7 +7,7 @@ import colorsys
 import math
 from typing import Sequence
 
-from ...manifest import manifest_digest
+from ...manifest import build_manifest_value
 
 TAU = 2 * math.pi
 DEFAULT_SEED = 20260519
@@ -187,7 +187,7 @@ def color_point(
     return make_point(entity_id(index), index, theta=theta, radius=radius, value=value)
 
 
-def build_source_population(
+def build_color_grid(
     *,
     angular_bins: int = DEFAULT_ANGULAR_BINS,
     radius_bins: int = DEFAULT_RADIUS_BINS,
@@ -337,7 +337,9 @@ def fit_cohort(points: Sequence[ColorPoint]) -> CohortFit:
         cohort_x_centroid=x_centroid,
         cohort_y_centroid=y_centroid,
         cohort_entity_count=len(points),
-        cohort_manifest_digest=manifest_digest(point.entity_id for point in points),
+        cohort_manifest_digest=build_manifest_value(
+            entities=(point.entity_id for point in points)
+        ).manifest_digest,
     )
 
 
@@ -388,7 +390,9 @@ def analyze_sectors(
     other_count = entity_count - red_count - green_count - blue_count
     return SectorCounts(
         analysis_manifest_name=analysis_manifest_name,
-        analysis_manifest_digest=manifest_digest(point.entity_id for point in points),
+        analysis_manifest_digest=build_manifest_value(
+            entities=(point.entity_id for point in points)
+        ).manifest_digest,
         entity_count=entity_count,
         red_arc_count=red_count,
         green_arc_count=green_count,
