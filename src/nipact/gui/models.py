@@ -94,6 +94,9 @@ class Artifact(Dto):
     run_label: str | None
     datatype: str | None
     suffix: str | None
+    source_scope: str | None
+    source_name: str | None
+    source_entity_id: str | None
     workflow_artifact_ref: str | None
     callable_ref: str | None
     software_ref: str | None
@@ -152,6 +155,9 @@ class TraceArtifact(Dto):
     run_label: str | None
     datatype: str | None
     suffix: str | None
+    source_scope: str | None
+    source_name: str | None
+    source_entity_id: str | None
     source_metadata: dict[str, Any] | None
     workflow_artifact_ref: str | None
     callable_ref: str | None
@@ -169,6 +175,10 @@ class TraceDependency(Dto):
     source_content_digest: str
     source_file_size: int
     source_extension: str
+    source_scope: str | None = None
+    source_name: str | None = None
+    source_entity_id: str | None = None
+    source_occurrence_path: str | None = None
     dependency_set_id: str | None
     manifest_value_schema: str | None
     manifest_digest: str | None

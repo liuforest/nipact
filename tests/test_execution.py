@@ -25,7 +25,7 @@ from nipact.execution import (
 )
 from nipact.hashing import is_valid_digest, sha256_digest, sha256_file_digest, short_hash
 from nipact.manifest import build_manifest_value, load_manifest
-from nipact.projection import ResolvedRequestBundleProjectionV2
+from nipact.projection import ResolvedRequestBundleProjectionV3
 from nipact.registry import EnvironmentObservationV1
 from nipact.runtime import run_job
 from nipact.trace import build_trace_graph_for_workflow_coordinate
@@ -620,8 +620,8 @@ def test_build_run_plan_with_address_selects_one_entity(
     assert run_plan.selected_fresh_output_refs[0].address == "sub_001"
     assert run_plan.selected_reused_output_refs == ()
     assert len(run_plan.selected_fresh_jobs) == 1
-    # Plan construction stays population-wide; selection narrows targets, not jobs.
-    assert {job.address for job in run_plan.jobs} == {"sub_001", "sub_002"}
+    # Structural expansion is restricted to the selected semantic closure.
+    assert {job.address for job in run_plan.jobs} == {"sub_001"}
     assert {spec.address for spec in run_plan.published_outputs} == {"sub_001"}
     payload = _run_plan_payload(run_plan)
     assert payload["requested_address"] == "sub_001"
@@ -955,7 +955,9 @@ def test_multi_output_run_registers_sibling_outputs_and_exact_dependency(
         step_name="qc_echo",
     )
 
-    assert execute_run_plan(run_plan, cores=1).published_count == len(run_plan.published_outputs)
+    assert execute_run_plan(run_plan, cores=1).published_count == len(
+        run_plan.published_outputs
+    )
 
     registry_path = runtime_dir / "database/registry.db"
     with sqlite3.connect(registry_path) as conn:
@@ -1040,7 +1042,14 @@ def test_multi_output_run_registers_sibling_outputs_and_exact_dependency(
     for projections in source_projection_by_address.values():
         projection = json.loads(next(iter(projections)))
         source_binding = projection["role_labelled_bindings"][0]
-        source_path = source_binding["source_coordinate"]["path"]
+        coordinate = source_binding["source_coordinate"]
+        source_path = f"data/source/{coordinate['entity_id']}.txt"
+        assert coordinate == {
+            "context": "multi",
+            "scope": "entity",
+            "source_name": "source_text",
+            "entity_id": coordinate["entity_id"],
+        }
         assert (
             source_binding["registered_content_digest"],
             source_binding["registered_file_size"],
@@ -1084,7 +1093,7 @@ def test_multi_output_run_registers_sibling_outputs_and_exact_dependency(
     for reused_output in equivalent_plan.reused_outputs:
         assert isinstance(
             reused_output.projection_state,
-            ResolvedRequestBundleProjectionV2,
+            ResolvedRequestBundleProjectionV3,
         )
         assert reused_output.projection_state.canonical_json in (
             source_projection_by_address[reused_output.address]
@@ -1169,6 +1178,9 @@ def test_execute_run_plan_publishes_selected_outputs_without_real_snakemake(
     assert outcome.selected_generated_count == 1
     assert outcome.selected_reused_count == 0
     assert events == [
+        "sources_new:1",
+        "sources_changed:0",
+        "sources_unchanged:0",
         "building_workspace",
         "starting_snakemake",
         "snakemake_complete",
@@ -1318,6 +1330,9 @@ def test_execute_run_plan_removes_published_files_when_registration_fails(
     with sqlite3.connect(runtime_dir / "database/registry.db") as conn:
         assert conn.execute("SELECT COUNT(*) FROM published_outputs").fetchone()[0] == 0
         assert conn.execute("SELECT COUNT(*) FROM workflow_runs").fetchone()[0] == 0
+        assert conn.execute(
+            "SELECT COUNT(*) FROM artifacts WHERE origin = 'source'"
+        ).fetchone()[0] == 1
 
 
 def test_selected_resolution_mismatch_rolls_back_run_recording(
@@ -1411,9 +1426,13 @@ def test_tiny_non_colors_run_registers_used_sources_and_trace(
         step_name="uppercase_text",
     )
 
-    def run_jobs_through_runtime(*_args: object, **_kwargs: object) -> int:
-        run_plan_path = run_plan.run_workspace / "run_plan.json"
-        for job in run_plan.jobs:
+    def run_jobs_through_runtime(
+        executable_plan: object,
+        *_args: object,
+        **_kwargs: object,
+    ) -> int:
+        run_plan_path = executable_plan.run_workspace / "run_plan.json"
+        for job in executable_plan.jobs:
             run_job(run_plan_path=run_plan_path, job_id=job.job_id)
         return 0
 
@@ -1487,7 +1506,10 @@ def test_tiny_non_colors_run_registers_used_sources_and_trace(
     first_digest = source_rows[0][1]
     (runtime_dir / "data/source/sub_001.txt").write_text("changed\n", encoding="utf-8")
 
-    assert execute_run_plan(run_plan, cores=1).published_count == len(run_plan.published_outputs)
+    outcome = execute_run_plan(run_plan, cores=1)
+    assert outcome.published_count == 2
+    assert outcome.selected_generated_count == 1
+    assert outcome.selected_reused_count == 1
 
     changed_digest = sha256_file_digest(runtime_dir / "data/source/sub_001.txt")
     with sqlite3.connect(registry_path) as conn:
@@ -1600,6 +1622,9 @@ def test_failed_snakemake_run_does_not_update_registry(
             "manifest_bindings": conn.execute(
                 "SELECT COUNT(*) FROM run_manifest_bindings"
             ).fetchone()[0],
+            "source_artifacts": conn.execute(
+                "SELECT COUNT(*) FROM artifacts WHERE origin = 'source'"
+            ).fetchone()[0],
         }
     assert counts == {
         "published_outputs": 0,
@@ -1607,6 +1632,7 @@ def test_failed_snakemake_run_does_not_update_registry(
         "workflow_artifacts": 0,
         "dependencies": 0,
         "manifest_bindings": 0,
+        "source_artifacts": 1,
     }
 
 
@@ -1704,10 +1730,13 @@ def test_projection_finalization_failure_rolls_back_current_run(
     project_dir, runtime_dir = _write_tiny_non_colors_project(tmp_path, monkeypatch)
     active_plan: dict[str, object] = {}
 
-    def run_active_plan(*_args: object, **_kwargs: object) -> int:
-        run_plan = active_plan["value"]
-        run_plan_path = run_plan.run_workspace / "run_plan.json"
-        for job in run_plan.jobs:
+    def run_active_plan(
+        executable_plan: object,
+        *_args: object,
+        **_kwargs: object,
+    ) -> int:
+        run_plan_path = executable_plan.run_workspace / "run_plan.json"
+        for job in executable_plan.jobs:
             run_job(run_plan_path=run_plan_path, job_id=job.job_id)
         return 0
 
@@ -1741,6 +1770,9 @@ def test_projection_finalization_failure_rolls_back_current_run(
         )
 
     active_plan["value"] = rerun_plan
+    (runtime_dir / "data/source/sub_001.txt").write_text(
+        "changed\n", encoding="utf-8"
+    )
     monkeypatch.setattr(
         "nipact.execution._retained_projection_recipes",
         lambda *_args, **_kwargs: (),

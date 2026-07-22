@@ -26,6 +26,11 @@ from nipact.manifest import (
     build_manifest_value,
 )
 from nipact.registry import REGISTRY_SCHEMA_VERSION
+from nipact.source_authority import (
+    LogicalSourceCoordinate,
+    SourceDeclaration,
+    observe_source_authority,
+)
 
 
 def _run_main_from(cwd: Path, argv: list[str]) -> int:
@@ -305,7 +310,7 @@ def _insert_published_output(
                 "address": address,
                 "canonical_parameters": {},
                 "determinism_contract": "deterministic",
-                "identity_contract_version": 2,
+                "identity_contract_version": 3,
                 "namespace": "colors",
                 "output_contract": {
                     "output_contract_version": 1,
@@ -553,35 +558,7 @@ def test_init_creates_project_runtime_databases_and_validates(
             build_manifest_value(entities=analysis_entity_ids()).canonical_body,
         ),
     ]
-    source_digest = sha256_file_digest(runtime_dir / "data/color_source.json")
-    source_identity_digest = sha256_digest(
-        json.dumps(
-            source_payload,
-            sort_keys=True,
-            separators=(",", ":"),
-            ensure_ascii=False,
-        ).encode("utf-8")
-    )
-    assert artifact_rows == [
-        (
-            "source",
-            "colors",
-            "data/color_source.json",
-            source_digest,
-            short_hash(source_digest),
-            (runtime_dir / "data/color_source.json").stat().st_size,
-            ".json",
-            json.dumps(
-                {
-                    "entity_count": DEFAULT_ENTITY_COUNT,
-                    "source_digest": source_identity_digest,
-                    "source_hash": short_hash(source_identity_digest),
-                },
-                sort_keys=True,
-                separators=(",", ":"),
-            ),
-        )
-    ]
+    assert artifact_rows == []
     assert published_rows == []
     assert list((runtime_dir / "outputs").rglob("*")) == []
 
@@ -701,10 +678,6 @@ def test_init_creates_prepared_neuro_demo_project_and_registry(
             """,
             (demo,),
         ).fetchall()
-        source_artifact_rows = conn.execute(
-            "SELECT COUNT(*) FROM source_artifacts WHERE context = ?",
-            (demo,),
-        ).fetchone()[0]
         artifact_rows = conn.execute(
             "SELECT COUNT(*) FROM artifacts WHERE context = ?",
             (demo,),
@@ -720,7 +693,6 @@ def test_init_creates_prepared_neuro_demo_project_and_registry(
         )
         for name, manifest in sorted(template.build_manifests().items())
     ]
-    assert source_artifact_rows == 0
     assert artifact_rows == 0
     assert len(template.source_file_paths()) == source_file_count
 
@@ -883,18 +855,18 @@ def test_validate_fails_for_malformed_database(
     assert "registry.db is malformed" in capsys.readouterr().err
 
 
-def test_validate_fails_for_stale_registry_source_row(
+def test_validate_accepts_source_before_first_authority_reconciliation(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     project_dir, runtime_dir = _init_demo(tmp_path, capsys)
-    with sqlite3.connect(runtime_dir / "database/registry.db") as conn:
-        conn.execute(
-            "UPDATE source_artifacts SET source_hash = ? WHERE context = ?",
-            ("bad-source-hash", "colors"),
+    assert (
+        main(
+            ["validate", "--project-dir", str(project_dir), "--context", "colors"]
         )
-
-    _assert_validate_fails(project_dir, capsys, "registry.db source artifact row")
+        == 0
+    )
+    assert "PASS: validate" in capsys.readouterr().out
 
 
 def test_validate_accepts_registered_published_output(
@@ -957,7 +929,7 @@ def test_validate_rejects_missing_upstream_request_projection(
         "address": "init",
         "canonical_parameters": {},
         "determinism_contract": "deterministic",
-        "identity_contract_version": 2,
+            "identity_contract_version": 3,
         "namespace": "colors",
         "output_contract": {
             "output_contract_version": 1,
@@ -996,14 +968,32 @@ def test_validate_rejects_missing_upstream_request_projection(
     _assert_validate_fails(project_dir, capsys, "missing upstream projection")
 
 
-def test_registry_v16_projection_observation_and_membership_constraints(
+def test_registry_v17_projection_observation_and_membership_constraints(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     _project_dir, runtime_dir = _init_demo(tmp_path, capsys)
     registry_path = runtime_dir / "database/registry.db"
+    observation = observe_source_authority(
+        runtime_root=runtime_dir,
+        declaration=SourceDeclaration(
+            coordinate=LogicalSourceCoordinate(
+                "colors", "global", "colors_source", None
+            ),
+            declared_path="data/color_source.json",
+            declared_extension=".json",
+        ),
+        registered=None,
+    )
+    registry_module.reconcile_manifest_and_source_authorities(
+        registry_path,
+        context="colors",
+        manifests={},
+        manifest_paths={},
+        observations=(observation,),
+    )
     with sqlite3.connect(registry_path) as conn:
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 16
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 17
         artifact_columns = {
             row[1]: row for row in conn.execute("PRAGMA table_info(artifacts)")
         }

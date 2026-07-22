@@ -1,4 +1,4 @@
-"""Inactive logical-source authority and stable-observation primitives."""
+"""Logical-source authority and stable-observation primitives."""
 
 from __future__ import annotations
 
@@ -217,7 +217,10 @@ def observe_source_authority(
         runtime_root=runtime_root,
         declared_path=declaration.declared_path,
     )
-    current_guard = _guard_for_path(source_path)
+    current_guard = read_source_occurrence_guard(
+        runtime_root=runtime_root,
+        declaration=declaration,
+    )
 
     if registered is not None and current_guard == registered.guard:
         status = (
@@ -268,6 +271,24 @@ def observe_source_authority(
         file_size=before.st_size,
         guard=before,
         status=status,
+    )
+
+
+def read_source_occurrence_guard(
+    *,
+    runtime_root: Path,
+    declaration: SourceDeclaration,
+) -> SourceOccurrenceGuard:
+    """Read current source metadata without hashing file content."""
+    if not isinstance(runtime_root, Path):
+        raise ValidationError("runtime_root must be a Path")
+    if not isinstance(declaration, SourceDeclaration):
+        raise ValidationError("declaration must be a SourceDeclaration")
+    return _guard_for_path(
+        _resolved_source_path(
+            runtime_root=runtime_root,
+            declared_path=declaration.declared_path,
+        )
     )
 
 

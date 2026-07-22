@@ -409,7 +409,11 @@ def _run_workflow_command(args: argparse.Namespace) -> int | None:
 
         def status_callback(event: str) -> None:
             nonlocal active_spinner
-            if event == "building_workspace":
+            if event.startswith("sources_"):
+                status, separator, count = event.removeprefix("sources_").partition(":")
+                if separator and status in {"new", "changed", "unchanged"}:
+                    feedback.line(f"Sources {status}: {count}")
+            elif event == "building_workspace":
                 feedback.line("Preparing run workspace...")
             elif event == "starting_snakemake":
                 feedback.line("Starting Snakemake...")
@@ -424,7 +428,7 @@ def _run_workflow_command(args: argparse.Namespace) -> int | None:
                     active_spinner = None
                 feedback.line("Snakemake complete.")
             elif event == "validating_selected_reuse":
-                feedback.line("Resolving selected reused outputs...")
+                feedback.line("Validating selected reused outputs...")
             elif event == "publishing_outputs":
                 feedback.line("Publishing outputs...")
             elif event == "registry_updated":

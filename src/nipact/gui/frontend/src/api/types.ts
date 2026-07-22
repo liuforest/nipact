@@ -81,6 +81,9 @@ export interface Artifact {
   run_label: string | null;
   datatype: string | null;
   suffix: string | null;
+  source_scope?: string | null;
+  source_name?: string | null;
+  source_entity_id?: string | null;
   workflow_artifact_ref: string | null;
   callable_ref: string | null;
   software_ref: string | null;
@@ -154,6 +157,9 @@ export interface TraceArtifact {
   run_label: string | null;
   datatype: string | null;
   suffix: string | null;
+  source_scope?: string | null;
+  source_name?: string | null;
+  source_entity_id?: string | null;
   source_metadata: Record<string, unknown> | null;
   workflow_artifact_ref: string | null;
   callable_ref: string | null;
@@ -171,6 +177,10 @@ export interface TraceDependency {
   source_content_digest: string;
   source_file_size: number;
   source_extension: string;
+  source_scope?: string | null;
+  source_name?: string | null;
+  source_entity_id?: string | null;
+  source_occurrence_path?: string | null;
   dependency_set_id: string | null;
   manifest_value_schema: string | null;
   manifest_digest: string | null;

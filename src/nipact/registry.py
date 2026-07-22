@@ -18,17 +18,23 @@ from .identity import validate_hash_alias, validate_path_token
 from .manifest import Manifest, ManifestValue
 from .projection import (
     RegisteredSourceSnapshot,
-    RequestBundleProjectionPlanV2,
-    ResolvedRequestBundleProjectionV2,
+    RequestBundleProjectionPlanV3,
+    ResolvedRequestBundleProjectionV3,
     RequestedOutputCoordinate,
-    SourceCoordinate,
-    ValidatedStoredRequestBundleProjectionV2,
+    ValidatedStoredRequestBundleProjectionV3,
     resolve_request_bundle_projection_plan,
-    validate_stored_request_bundle_projection_v2,
+    validate_stored_request_bundle_projection_v3,
+)
+from .source_authority import (
+    LogicalSourceCoordinate,
+    ObservedSourceAuthority,
+    SourceDeclaration,
+    SourceOccurrenceGuard,
+    registered_source_authority_from_facts,
 )
 
 REGISTRY_DB_PATH = "database/registry.db"
-REGISTRY_SCHEMA_VERSION = 16
+REGISTRY_SCHEMA_VERSION = 17
 PARAMETER_HASH_VERSION = 1
 
 
@@ -59,6 +65,11 @@ class ArtifactInputRow:
     source_execution_role: str | None = None
     source_is_reused: bool | None = None
     source_artifact_path: str | None = None
+    source_scope: str | None = None
+    source_name: str | None = None
+    source_entity_id: str | None = None
+    source_content_digest: str | None = None
+    source_file_size: int | None = None
     manifest_value_schema: str | None = None
     manifest_digest: str | None = None
     edge_cardinality: int | None = None
@@ -91,7 +102,7 @@ class RetainedJobProjectionRecipe:
     step_name: str
     address: str
     output_names: tuple[str, ...]
-    projection_plan: RequestBundleProjectionPlanV2
+    projection_plan: RequestBundleProjectionPlanV3
 
 
 @dataclass(frozen=True)
@@ -180,6 +191,9 @@ class RegistryArtifact:
     software_ref: str | None
     created_at: str
     request_bundle_digest: str | None = None
+    source_scope: str | None = None
+    source_name: str | None = None
+    source_entity_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -199,6 +213,16 @@ class RegistryDependency:
     manifest_value_schema: str | None
     manifest_digest: str | None
     edge_cardinality: int | None
+    source_scope: str | None = None
+    source_name: str | None = None
+    source_entity_id: str | None = None
+    source_occurrence_path: str | None = None
+
+
+@dataclass(frozen=True)
+class RegisteredSourceAuthority:
+    artifact_id: int
+    authority: ObservedSourceAuthority
 
 
 @dataclass(frozen=True)
@@ -206,7 +230,7 @@ class ReusableArtifactBundleRequest:
     context: str
     step_name: str
     address: str
-    resolved_projection: ResolvedRequestBundleProjectionV2
+    resolved_projection: ResolvedRequestBundleProjectionV3
     sibling_outputs: tuple[tuple[str, str], ...]
     input_records: tuple[ArtifactInputRow, ...]
 
@@ -327,7 +351,10 @@ _ARTIFACT_SELECT_COLUMNS = """
     a.source_metadata_json,
     a.callable_ref,
     a.software_ref,
-    a.created_at
+    a.created_at,
+    a.source_scope,
+    a.source_name,
+    a.source_entity_id
 """
 
 
@@ -336,10 +363,6 @@ def initialize_registry_db(
     *,
     context: str,
     runtime_root: Path,
-    source_artifact_path: str,
-    source_entity_count: int,
-    source_digest: str,
-    source_hash: str,
     manifests: dict[str, Manifest],
     manifest_paths: dict[str, str],
 ) -> None:
@@ -354,34 +377,6 @@ def initialize_registry_db(
                 runtime_path = excluded.runtime_path
             """,
             (context, str(runtime_root)),
-        )
-        conn.execute(
-            """
-            INSERT INTO source_artifacts (
-                context, path, entity_count, source_digest, source_hash
-            )
-            VALUES (?, ?, ?, ?, ?)
-            ON CONFLICT(context, path) DO UPDATE SET
-                entity_count = excluded.entity_count,
-                source_digest = excluded.source_digest,
-                source_hash = excluded.source_hash
-            """,
-            (
-                context,
-                source_artifact_path,
-                source_entity_count,
-                source_digest,
-                source_hash,
-            ),
-        )
-        _upsert_source_artifact(
-            conn,
-            context=context,
-            runtime_root=runtime_root,
-            source_artifact_path=source_artifact_path,
-            source_entity_count=source_entity_count,
-            source_digest=source_digest,
-            source_hash=source_hash,
         )
         _insert_manifest_declarations(
             conn,
@@ -449,7 +444,10 @@ def _insert_manifest_declarations(
             """,
             (manifest.manifest_value_schema, manifest.manifest_digest),
         ).fetchone()
-        if stored_value != (manifest.canonical_body, manifest.entity_count):
+        if stored_value is None or tuple(stored_value) != (
+            manifest.canonical_body,
+            manifest.entity_count,
+        ):
             raise ValidationError(
                 "registry manifest value does not match its schema-qualified key"
             )
@@ -485,10 +483,6 @@ def validate_registry_db(
     runtime_root: Path,
     manifest_paths: dict[str, Path],
     context: str,
-    source_artifact_path: str,
-    source_entity_count: int,
-    source_digest: str,
-    source_hash: str,
     manifests: dict[str, Manifest],
     loaded_workflow_project: Any,
 ) -> dict[str, int]:
@@ -504,25 +498,6 @@ def validate_registry_db(
                 raise ValidationError("registry.db missing context row")
             if context_row != (str(runtime_root),):
                 raise ValidationError("registry.db context row is out of date")
-            source_row = conn.execute(
-                """
-                SELECT entity_count, source_digest, source_hash
-                FROM source_artifacts
-                WHERE context = ? AND path = ?
-                """,
-                (context, source_artifact_path),
-            ).fetchone()
-            if source_row != (source_entity_count, source_digest, source_hash):
-                raise ValidationError("registry.db source artifact row is out of date")
-            _validate_source_artifact_row(
-                conn,
-                context=context,
-                runtime_root=runtime_root,
-                source_artifact_path=source_artifact_path,
-                source_entity_count=source_entity_count,
-                source_digest=source_digest,
-                source_hash=source_hash,
-            )
             rows = conn.execute(
                 """
                 SELECT d.manifest_name, d.declared_path, v.value_schema,
@@ -686,7 +661,7 @@ def _validate_request_bundle_projection_graph(
     graph: dict[str, tuple[str, ...]] = {}
     for row in rows:
         digest = str(row[0])
-        validated = validate_stored_request_bundle_projection_v2(
+        validated = validate_stored_request_bundle_projection_v3(
             request_bundle_digest=digest,
             projection_json=str(row[1]),
         )
@@ -832,13 +807,6 @@ def record_workflow_run(
                 environment_observation_json=_environment_observation_json(
                     environment_observation
                 ),
-                created_at=now,
-            )
-            _upsert_source_artifacts_for_inputs(
-                conn,
-                context=context,
-                runtime_root=runtime_root,
-                artifact_rows=artifact_rows,
                 created_at=now,
             )
             finalized_projections = _finalize_retained_job_projections(
@@ -1078,58 +1046,290 @@ def read_artifact_by_id_for_context(
     return _registry_artifact_from_row(row)
 
 
+def read_registered_source_authorities(
+    path: Path,
+    *,
+    coordinates: Iterable[LogicalSourceCoordinate] | None = None,
+) -> dict[LogicalSourceCoordinate, RegisteredSourceAuthority]:
+    """Read current logical-source authority without touching source files."""
+    selected = None if coordinates is None else frozenset(coordinates)
+    try:
+        with _connect_readonly_rows(path) as conn:
+            _validate_schema_version(conn)
+            return _read_registered_source_authorities_conn(
+                conn,
+                coordinates=selected,
+            )
+    except sqlite3.Error as exc:
+        raise ValidationError(f"registry.db is malformed: {exc}") from exc
+
+
 def read_registered_source_snapshots(
     path: Path,
     *,
     context: str,
-) -> dict[SourceCoordinate, RegisteredSourceSnapshot]:
-    """Read authoritative source identity facts without touching source files."""
-    try:
-        with _connect_readonly_rows(path) as conn:
-            _validate_schema_version(conn)
-            return _read_registered_source_snapshots_conn(conn, context=context)
-    except sqlite3.Error as exc:
-        raise ValidationError(f"registry.db is malformed: {exc}") from exc
+) -> dict[LogicalSourceCoordinate, RegisteredSourceSnapshot]:
+    """Read current source identity snapshots for one context."""
+    authorities = read_registered_source_authorities(path)
+    return {
+        coordinate: RegisteredSourceSnapshot(
+            content_digest=record.authority.content_digest,
+            file_size=record.authority.file_size,
+            declared_extension=record.authority.declaration.declared_extension,
+        )
+        for coordinate, record in authorities.items()
+        if coordinate.context == context
+    }
 
 
 def _read_registered_source_snapshots_conn(
     conn: sqlite3.Connection,
     *,
     context: str,
-) -> dict[SourceCoordinate, RegisteredSourceSnapshot]:
+) -> dict[LogicalSourceCoordinate, RegisteredSourceSnapshot]:
     rows = conn.execute(
         """
-        SELECT path, content_digest, file_size, extension
+        SELECT source_scope, source_name, source_entity_id,
+               content_digest, file_size, extension
         FROM artifacts
-        WHERE context = ? AND origin = 'source'
-        ORDER BY path
+        WHERE origin = 'source' AND context = ?
+        ORDER BY source_scope, source_name, source_entity_id
         """,
         (context,),
     ).fetchall()
-    snapshots: dict[SourceCoordinate, RegisteredSourceSnapshot] = {}
-    for row in rows:
-        source_path = _validate_registry_artifact_path(
-            str(row[0]),
-            origin="source",
+    snapshots: dict[LogicalSourceCoordinate, RegisteredSourceSnapshot] = {}
+    for scope, source_name, entity_id, digest, size, extension in rows:
+        coordinate = LogicalSourceCoordinate(
+            context=context,
+            scope=str(scope),
+            source_name=str(source_name),
+            entity_id=entity_id,
         )
-        content_digest = row[1]
-        file_size = row[2]
-        extension = row[3]
-        if not is_valid_digest(content_digest):
-            raise ValidationError("registry source artifact digest is malformed")
-        if type(file_size) is not int or file_size < 0:
-            raise ValidationError("registry source artifact size is malformed")
-        if type(extension) is not str or not extension:
-            raise ValidationError("registry source artifact extension is malformed")
-        coordinate = SourceCoordinate(namespace=context, path=source_path)
         if coordinate in snapshots:
             raise ValidationError("registry source artifact coordinate is duplicated")
         snapshots[coordinate] = RegisteredSourceSnapshot(
-            content_digest=content_digest,
-            file_size=file_size,
-            declared_extension=extension,
+            content_digest=str(digest),
+            file_size=int(size),
+            declared_extension=str(extension),
         )
     return snapshots
+
+
+def reconcile_manifest_and_source_authorities(
+    path: Path,
+    *,
+    context: str,
+    manifests: dict[str, Manifest],
+    manifest_paths: dict[str, str],
+    observations: Iterable[ObservedSourceAuthority],
+) -> dict[LogicalSourceCoordinate, RegisteredSourceAuthority]:
+    """Atomically reconcile frozen relevant manifests and prepared sources."""
+    context = validate_path_token(context, label="context")
+    if set(manifests) != set(manifest_paths):
+        raise ValidationError("reconciled manifest names and paths do not match")
+    if any(not isinstance(manifest, Manifest) for manifest in manifests.values()):
+        raise ValidationError("reconciled manifest is malformed")
+    observed = tuple(observations)
+    if any(
+        not isinstance(observation, ObservedSourceAuthority)
+        for observation in observed
+    ):
+        raise ValidationError("source authority observation is malformed")
+    by_coordinate = {
+        observation.declaration.coordinate: observation
+        for observation in observed
+    }
+    if len(by_coordinate) != len(observed):
+        raise ValidationError("source authority observation coordinate is duplicated")
+    if any(coordinate.context != context for coordinate in by_coordinate):
+        raise ValidationError("source authority observation context does not match")
+    now = _utc_now()
+    try:
+        with _connect(path) as conn:
+            conn.row_factory = sqlite3.Row
+            _validate_schema_version(conn)
+            if conn.execute(
+                "SELECT 1 FROM contexts WHERE context = ?",
+                (context,),
+            ).fetchone() is None:
+                raise ValidationError(f"registry.db missing context: {context}")
+            _insert_manifest_declarations(
+                conn,
+                context=context,
+                manifests=manifests,
+                manifest_paths=manifest_paths,
+            )
+            _reconcile_source_authorities_conn(
+                conn,
+                observations=by_coordinate,
+                now=now,
+            )
+            return _read_registered_source_authorities_conn(
+                conn,
+                coordinates=frozenset(by_coordinate),
+            )
+    except sqlite3.Error as exc:
+        raise ValidationError(f"registry.db is malformed: {exc}") from exc
+
+
+def _reconcile_source_authorities_conn(
+    conn: sqlite3.Connection,
+    *,
+    observations: dict[LogicalSourceCoordinate, ObservedSourceAuthority],
+    now: str,
+) -> None:
+    for coordinate, observation in sorted(
+        observations.items(),
+        key=lambda item: _logical_source_coordinate_sort_key(item[0]),
+    ):
+        existing = _select_source_authority_row(conn, coordinate)
+        if (
+            existing is not None
+            and str(existing["path"]) != observation.declaration.declared_path
+        ):
+            raise ValidationError(
+                "source relocation is unsupported for an already registered coordinate"
+            )
+        values = (
+            observation.declaration.declared_path,
+            observation.content_digest,
+            short_hash(observation.content_digest),
+            observation.file_size,
+            observation.declaration.declared_extension,
+            observation.guard.st_dev,
+            observation.guard.st_ino,
+            observation.guard.st_size,
+            observation.guard.st_mtime_ns,
+            observation.guard.st_ctime_ns,
+            now,
+        )
+        if existing is None:
+            conn.execute(
+                """
+                INSERT INTO artifacts (
+                    origin, context, path, content_digest, output_hash,
+                    file_size, extension, source_scope, source_name,
+                    source_entity_id, source_st_dev, source_st_ino,
+                    source_st_size, source_st_mtime_ns, source_st_ctime_ns,
+                    created_at
+                )
+                VALUES (
+                    'source', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                )
+                """,
+                (
+                    coordinate.context,
+                    *values[:5],
+                    coordinate.scope,
+                    coordinate.source_name,
+                    coordinate.entity_id,
+                    *values[5:],
+                ),
+            )
+        else:
+            conn.execute(
+                """
+                UPDATE artifacts
+                SET path = ?, content_digest = ?, output_hash = ?,
+                    file_size = ?, extension = ?, source_st_dev = ?,
+                    source_st_ino = ?, source_st_size = ?,
+                    source_st_mtime_ns = ?, source_st_ctime_ns = ?,
+                    created_at = ?
+                WHERE artifact_id = ?
+                """,
+                (*values, int(existing["artifact_id"])),
+            )
+
+
+def _read_registered_source_authorities_conn(
+    conn: sqlite3.Connection,
+    *,
+    coordinates: frozenset[LogicalSourceCoordinate] | None,
+) -> dict[LogicalSourceCoordinate, RegisteredSourceAuthority]:
+    rows = conn.execute(
+        """
+        SELECT artifact_id, context, path, content_digest, file_size, extension,
+               source_scope, source_name, source_entity_id, source_st_dev,
+               source_st_ino, source_st_size, source_st_mtime_ns,
+               source_st_ctime_ns
+        FROM artifacts
+        WHERE origin = 'source'
+        ORDER BY context, source_scope, source_name, source_entity_id
+        """,
+    ).fetchall()
+    authorities: dict[LogicalSourceCoordinate, RegisteredSourceAuthority] = {}
+    for row in rows:
+        coordinate = LogicalSourceCoordinate(
+            context=str(row["context"]),
+            scope=str(row["source_scope"]),
+            source_name=str(row["source_name"]),
+            entity_id=row["source_entity_id"],
+        )
+        if coordinates is not None and coordinate not in coordinates:
+            continue
+        source_path = _validate_registry_artifact_path(
+            str(row["path"]),
+            origin="source",
+        )
+        if coordinate in authorities:
+            raise ValidationError("registry source artifact coordinate is duplicated")
+        authority = registered_source_authority_from_facts(
+            coordinate=coordinate,
+            declared_path=source_path,
+            declared_extension=str(row["extension"]),
+            content_digest=str(row["content_digest"]),
+            file_size=int(row["file_size"]),
+            guard=SourceOccurrenceGuard(
+                st_dev=int(row["source_st_dev"]),
+                st_ino=int(row["source_st_ino"]),
+                st_size=int(row["source_st_size"]),
+                st_mtime_ns=int(row["source_st_mtime_ns"]),
+                st_ctime_ns=int(row["source_st_ctime_ns"]),
+            ),
+        )
+        authorities[coordinate] = RegisteredSourceAuthority(
+            artifact_id=int(row["artifact_id"]),
+            authority=authority,
+        )
+    if coordinates is not None and not set(authorities).issubset(coordinates):
+        raise ValidationError("registry returned an unrequested source coordinate")
+    return authorities
+
+
+def _select_source_authority_row(
+    conn: sqlite3.Connection,
+    coordinate: LogicalSourceCoordinate,
+) -> sqlite3.Row | None:
+    if coordinate.scope == "global":
+        return conn.execute(
+            """
+            SELECT artifact_id, path
+            FROM artifacts
+            WHERE origin = 'source' AND context = ? AND source_scope = 'global'
+              AND source_name = ?
+            """,
+            (coordinate.context, coordinate.source_name),
+        ).fetchone()
+    return conn.execute(
+        """
+        SELECT artifact_id, path
+        FROM artifacts
+        WHERE origin = 'source' AND context = ? AND source_scope = 'entity'
+          AND source_name = ? AND source_entity_id = ?
+        """,
+        (coordinate.context, coordinate.source_name, coordinate.entity_id),
+    ).fetchone()
+
+
+def _logical_source_coordinate_sort_key(
+    coordinate: LogicalSourceCoordinate,
+) -> tuple[str, str, str, str]:
+    return (
+        coordinate.context,
+        coordinate.scope,
+        coordinate.source_name,
+        coordinate.entity_id or "",
+    )
 
 
 def read_artifact_by_path(
@@ -1395,7 +1595,7 @@ def resolve_reusable_artifact_bundle(
     preferred_artifact_ids: tuple[int, ...] | None = None,
 ) -> ReusableArtifactBundleCandidate | None:
     """Resolve one coherent reusable bundle independently of workflow membership."""
-    validate_stored_request_bundle_projection_v2(
+    validate_stored_request_bundle_projection_v3(
         request_bundle_digest=request.resolved_projection.request_bundle_digest,
         projection_json=request.resolved_projection.canonical_json,
     )
@@ -1565,7 +1765,8 @@ def _dependencies_for_artifact(
         SELECT dependent_artifact_id, source_artifact_id,
                source_content_digest, source_file_size, source_extension, input_path,
                binding_name, dependency_role, source_step_name,
-               source_output_name, source_address, dependency_set_id,
+               source_output_name, source_address, source_scope, source_name,
+               source_entity_id, source_occurrence_path, dependency_set_id,
                manifest_value_schema, manifest_digest, edge_cardinality
         FROM artifact_dependencies
         WHERE dependent_artifact_id = ?
@@ -1661,14 +1862,36 @@ def _source_dependency_matches_current_input(
 ) -> bool:
     if source.origin != "source" or source.context != context:
         return False
-    if input_record.source_artifact_path is None:
-        raise ValidationError("source dependency is missing source artifact path")
-    if source.path != input_record.source_artifact_path:
+    if (
+        input_record.source_artifact_path is None
+        or input_record.source_scope is None
+        or input_record.source_name is None
+        or input_record.source_extension is None
+        or input_record.source_content_digest is None
+        or input_record.source_file_size is None
+    ):
+        raise ValidationError("source dependency is missing prepared source authority")
+    if (
+        source.path != input_record.source_artifact_path
+        or source.source_scope != input_record.source_scope
+        or source.source_name != input_record.source_name
+        or source.source_entity_id != input_record.source_entity_id
+        or dependency.source_scope != input_record.source_scope
+        or dependency.source_name != input_record.source_name
+        or dependency.source_entity_id != input_record.source_entity_id
+        or dependency.source_occurrence_path != input_record.source_artifact_path
+    ):
         return False
     return (
-        dependency.source_content_digest == source.content_digest
-        and dependency.source_file_size == source.file_size
-        and dependency.source_extension == source.extension
+        dependency.source_content_digest
+        == source.content_digest
+        == input_record.source_content_digest
+        and dependency.source_file_size
+        == source.file_size
+        == input_record.source_file_size
+        and dependency.source_extension
+        == source.extension
+        == input_record.source_extension
     )
 
 
@@ -1923,7 +2146,8 @@ def _list_upstream_dependencies_conn(
             SELECT dependent_artifact_id, source_artifact_id,
                    source_content_digest, source_file_size, source_extension, input_path,
                    binding_name, dependency_role, source_step_name,
-                   source_output_name, source_address, dependency_set_id,
+                   source_output_name, source_address, source_scope, source_name,
+                   source_entity_id, source_occurrence_path, dependency_set_id,
                    manifest_value_schema, manifest_digest, edge_cardinality
             FROM artifact_dependencies
             WHERE dependent_artifact_id = ?
@@ -2382,7 +2606,7 @@ def _insert_workflow_output_artifacts(
     artifact_rows: tuple[WorkflowOutputArtifactRow, ...],
     parameter_ids: dict[tuple[str, str], int],
     finalized_projections: dict[
-        tuple[str, str], ResolvedRequestBundleProjectionV2
+        tuple[str, str], ResolvedRequestBundleProjectionV3
     ],
     created_at: str,
 ) -> dict[tuple[str, str, str], int]:
@@ -2445,7 +2669,7 @@ def _validate_no_divergent_fresh_bundles(
     run_id: int,
     artifact_rows: tuple[WorkflowOutputArtifactRow, ...],
     finalized_projections: dict[
-        tuple[str, str], ResolvedRequestBundleProjectionV2
+        tuple[str, str], ResolvedRequestBundleProjectionV3
     ],
 ) -> None:
     fresh_rows_by_job: dict[
@@ -2529,8 +2753,8 @@ def _validated_stored_request_bundle_projection(
     request_bundle_digest: str,
     *,
     missing_ok: bool = False,
-    cache: dict[str, ValidatedStoredRequestBundleProjectionV2] | None = None,
-) -> ValidatedStoredRequestBundleProjectionV2 | None:
+    cache: dict[str, ValidatedStoredRequestBundleProjectionV3] | None = None,
+) -> ValidatedStoredRequestBundleProjectionV3 | None:
     if not is_valid_digest(request_bundle_digest):
         raise ValidationError("registry request projection digest is invalid")
     if cache is not None and request_bundle_digest in cache:
@@ -2547,7 +2771,7 @@ def _validated_stored_request_bundle_projection(
         if missing_ok:
             return None
         raise ValidationError("registry request projection is missing")
-    validated = validate_stored_request_bundle_projection_v2(
+    validated = validate_stored_request_bundle_projection_v3(
         request_bundle_digest=request_bundle_digest,
         projection_json=str(row[0]),
     )
@@ -2558,11 +2782,11 @@ def _validated_stored_request_bundle_projection(
 
 def _insert_or_validate_request_bundle_projection(
     conn: sqlite3.Connection,
-    projection: ResolvedRequestBundleProjectionV2,
+    projection: ResolvedRequestBundleProjectionV3,
     *,
-    cache: dict[str, ValidatedStoredRequestBundleProjectionV2],
+    cache: dict[str, ValidatedStoredRequestBundleProjectionV3],
 ) -> None:
-    validated = validate_stored_request_bundle_projection_v2(
+    validated = validate_stored_request_bundle_projection_v3(
         request_bundle_digest=projection.request_bundle_digest,
         projection_json=projection.canonical_json,
     )
@@ -2601,8 +2825,8 @@ def _authenticate_reused_projection_seed(
     *,
     context: str,
     seed: ReusedProjectionSeed,
-    projection_cache: dict[str, ValidatedStoredRequestBundleProjectionV2],
-) -> ResolvedRequestBundleProjectionV2:
+    projection_cache: dict[str, ValidatedStoredRequestBundleProjectionV3],
+) -> ResolvedRequestBundleProjectionV3:
     if type(seed.actual_artifact_id) is not int or seed.actual_artifact_id <= 0:
         raise ValidationError("reused projection seed artifact id is invalid")
     if not is_valid_digest(seed.request_bundle_digest):
@@ -2641,13 +2865,13 @@ def _finalize_retained_job_projections(
     artifact_rows: tuple[WorkflowOutputArtifactRow, ...],
     projection_recipes: tuple[RetainedJobProjectionRecipe, ...],
     reused_projection_seeds: tuple[ReusedProjectionSeed, ...],
-) -> dict[tuple[str, str], ResolvedRequestBundleProjectionV2]:
+) -> dict[tuple[str, str], ResolvedRequestBundleProjectionV3]:
     source_snapshots = _read_registered_source_snapshots_conn(conn, context=context)
     upstream_states: dict[
         RequestedOutputCoordinate,
-        ResolvedRequestBundleProjectionV2,
+        ResolvedRequestBundleProjectionV3,
     ] = {}
-    projection_cache: dict[str, ValidatedStoredRequestBundleProjectionV2] = {}
+    projection_cache: dict[str, ValidatedStoredRequestBundleProjectionV3] = {}
     for seed in reused_projection_seeds:
         if seed.requested_output.namespace != context:
             raise ValidationError("reused projection seed belongs to another context")
@@ -2666,7 +2890,7 @@ def _finalize_retained_job_projections(
             row.output_name
         )
 
-    finalized: dict[tuple[str, str], ResolvedRequestBundleProjectionV2] = {}
+    finalized: dict[tuple[str, str], ResolvedRequestBundleProjectionV3] = {}
     for recipe in projection_recipes:
         job_key = (recipe.step_name, recipe.address)
         if job_key in finalized:
@@ -2697,7 +2921,7 @@ def _finalize_retained_job_projections(
         )
         if not isinstance(
             projection_state,
-            ResolvedRequestBundleProjectionV2,
+            ResolvedRequestBundleProjectionV3,
         ):
             raise ValidationError("retained projection remained unresolved after source upsert")
         _insert_or_validate_request_bundle_projection(
@@ -2739,70 +2963,6 @@ def _reused_projection_identities(
     return identities
 
 
-def _upsert_source_artifacts_for_inputs(
-    conn: sqlite3.Connection,
-    *,
-    context: str,
-    runtime_root: Path,
-    artifact_rows: tuple[WorkflowOutputArtifactRow, ...],
-    created_at: str,
-) -> None:
-    source_paths: set[str] = set()
-    for row in artifact_rows:
-        for input_record in row.input_records:
-            if input_record.origin != "source":
-                continue
-            if input_record.source_artifact_path is None:
-                raise ValidationError("source dependency is missing source artifact path")
-            source_paths.add(input_record.source_artifact_path)
-
-    for source_artifact_path in sorted(source_paths):
-        _upsert_generic_source_artifact(
-            conn,
-            context=context,
-            runtime_root=runtime_root,
-            source_artifact_path=source_artifact_path,
-            created_at=created_at,
-        )
-
-
-def _upsert_generic_source_artifact(
-    conn: sqlite3.Connection,
-    *,
-    context: str,
-    runtime_root: Path,
-    source_artifact_path: str,
-    created_at: str,
-) -> None:
-    source_path = _source_file_path(runtime_root, source_artifact_path)
-    content_digest = sha256_file_digest(source_path)
-    conn.execute(
-        """
-        INSERT INTO artifacts (
-            origin, context, path, content_digest, output_hash, file_size,
-            extension, created_at
-        )
-        VALUES ('source', ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(context, path) WHERE origin = 'source'
-        DO UPDATE SET
-            content_digest = excluded.content_digest,
-            output_hash = excluded.output_hash,
-            file_size = excluded.file_size,
-            extension = excluded.extension,
-            created_at = excluded.created_at
-        """,
-        (
-            context,
-            source_artifact_path,
-            content_digest,
-            short_hash(content_digest),
-            source_path.stat().st_size,
-            _path_extension(source_artifact_path),
-            created_at,
-        ),
-    )
-
-
 def _insert_artifact_dependencies(
     conn: sqlite3.Connection,
     *,
@@ -2826,19 +2986,33 @@ def _insert_artifact_dependencies(
                 input_record=input_record,
                 artifact_ids=artifact_ids,
             )
-            source_content_digest, source_file_size, source_extension = (
-                _source_artifact_snapshot(conn, source_artifact_id)
-            )
+            if input_record.origin == "source":
+                if (
+                    input_record.source_content_digest is None
+                    or input_record.source_file_size is None
+                    or input_record.source_extension is None
+                ):
+                    raise ValidationError(
+                        "source dependency is missing its prepared snapshot"
+                    )
+                source_content_digest = input_record.source_content_digest
+                source_file_size = input_record.source_file_size
+                source_extension = input_record.source_extension
+            else:
+                source_content_digest, source_file_size, source_extension = (
+                    _source_artifact_snapshot(conn, source_artifact_id)
+                )
             conn.execute(
                 """
                 INSERT INTO artifact_dependencies (
                     dependent_artifact_id, source_artifact_id,
                     source_content_digest, source_file_size, source_extension,
                     input_path, binding_name, dependency_role, source_step_name,
-                    source_output_name, source_address, manifest_value_schema,
-                    manifest_digest, edge_cardinality
+                    source_output_name, source_address, source_scope, source_name,
+                    source_entity_id, source_occurrence_path,
+                    manifest_value_schema, manifest_digest, edge_cardinality
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     dependent_artifact_id,
@@ -2852,6 +3026,10 @@ def _insert_artifact_dependencies(
                     input_record.source_step_name,
                     input_record.source_output_name,
                     input_record.source_address,
+                    input_record.source_scope,
+                    input_record.source_name,
+                    input_record.source_entity_id,
+                    input_record.source_artifact_path,
                     input_record.manifest_value_schema,
                     input_record.manifest_digest,
                     input_record.edge_cardinality,
@@ -2872,18 +3050,51 @@ def _dependency_source_artifact_id(
     artifact_ids: dict[tuple[str, str, str], int],
 ) -> int:
     if input_record.origin == "source":
-        if input_record.source_artifact_path is None:
-            raise ValidationError("source dependency is missing source artifact path")
-        row = conn.execute(
-            """
-            SELECT artifact_id
-            FROM artifacts
-            WHERE context = ? AND origin = 'source' AND path = ?
-            """,
-            (context, input_record.source_artifact_path),
-        ).fetchone()
+        if (
+            input_record.source_scope is None
+            or input_record.source_name is None
+            or input_record.source_artifact_path is None
+        ):
+            raise ValidationError("source dependency is missing its logical coordinate")
+        if input_record.source_scope == "global":
+            if input_record.source_entity_id is not None:
+                raise ValidationError("global source dependency has an entity id")
+            row = conn.execute(
+                """
+                SELECT artifact_id, path, content_digest, file_size, extension
+                FROM artifacts
+                WHERE context = ? AND origin = 'source'
+                  AND source_scope = 'global' AND source_name = ?
+                """,
+                (context, input_record.source_name),
+            ).fetchone()
+        elif input_record.source_scope == "entity":
+            if input_record.source_entity_id is None:
+                raise ValidationError("entity source dependency is missing entity id")
+            row = conn.execute(
+                """
+                SELECT artifact_id, path, content_digest, file_size, extension
+                FROM artifacts
+                WHERE context = ? AND origin = 'source'
+                  AND source_scope = 'entity' AND source_name = ?
+                  AND source_entity_id = ?
+                """,
+                (context, input_record.source_name, input_record.source_entity_id),
+            ).fetchone()
+        else:
+            raise ValidationError("source dependency scope is invalid")
         if row is None:
             raise ValidationError("registry.db missing source artifact dependency")
+        expected = (
+            input_record.source_artifact_path,
+            input_record.source_content_digest,
+            input_record.source_file_size,
+            input_record.source_extension,
+        )
+        if tuple(row[1:]) != expected:
+            raise ValidationError(
+                "source dependency snapshot does not match current authority"
+            )
         return int(row[0])
     if input_record.origin == "workflow_output":
         if (
@@ -3507,15 +3718,6 @@ def _create_schema(conn: sqlite3.Connection) -> None:
             runtime_path TEXT NOT NULL
         );
 
-        CREATE TABLE IF NOT EXISTS source_artifacts (
-            context TEXT NOT NULL REFERENCES contexts(context) ON DELETE CASCADE,
-            path TEXT NOT NULL,
-            entity_count INTEGER NOT NULL CHECK(entity_count >= 0),
-            source_digest TEXT NOT NULL,
-            source_hash TEXT NOT NULL,
-            PRIMARY KEY (context, path)
-        );
-
         CREATE TABLE IF NOT EXISTS manifest_values (
             value_schema TEXT NOT NULL,
             manifest_digest TEXT NOT NULL CHECK(
@@ -3614,6 +3816,20 @@ def _create_schema(conn: sqlite3.Connection) -> None:
             source_metadata_json TEXT,
             callable_ref TEXT,
             software_ref TEXT,
+            source_scope TEXT CHECK(
+                source_scope IS NULL OR source_scope IN ('global', 'entity')
+            ),
+            source_name TEXT,
+            source_entity_id TEXT,
+            source_st_dev INTEGER CHECK(source_st_dev IS NULL OR source_st_dev >= 0),
+            source_st_ino INTEGER CHECK(source_st_ino IS NULL OR source_st_ino >= 0),
+            source_st_size INTEGER CHECK(source_st_size IS NULL OR source_st_size >= 0),
+            source_st_mtime_ns INTEGER CHECK(
+                source_st_mtime_ns IS NULL OR source_st_mtime_ns >= 0
+            ),
+            source_st_ctime_ns INTEGER CHECK(
+                source_st_ctime_ns IS NULL OR source_st_ctime_ns >= 0
+            ),
             request_bundle_digest TEXT
                 REFERENCES request_bundle_projections(request_bundle_digest)
                 ON DELETE RESTRICT,
@@ -3641,13 +3857,41 @@ def _create_schema(conn: sqlite3.Connection) -> None:
                     AND is_published = 0
                     AND published_path IS NULL
                     AND staging_path IS NULL
+                    AND source_scope IS NOT NULL
+                    AND source_name IS NOT NULL
+                    AND (
+                        (source_scope = 'global' AND source_entity_id IS NULL)
+                        OR
+                        (source_scope = 'entity' AND source_entity_id IS NOT NULL)
+                    )
+                    AND source_st_dev IS NOT NULL
+                    AND source_st_ino IS NOT NULL
+                    AND source_st_size IS NOT NULL
+                    AND source_st_mtime_ns IS NOT NULL
+                    AND source_st_ctime_ns IS NOT NULL
+                )
+            ),
+            CHECK (
+                origin = 'source'
+                OR (
+                    source_scope IS NULL
+                    AND source_name IS NULL
+                    AND source_entity_id IS NULL
+                    AND source_st_dev IS NULL
+                    AND source_st_ino IS NULL
+                    AND source_st_size IS NULL
+                    AND source_st_mtime_ns IS NULL
+                    AND source_st_ctime_ns IS NULL
                 )
             )
         );
 
-        CREATE UNIQUE INDEX IF NOT EXISTS artifacts_source_path_uq
-            ON artifacts(context, path)
-            WHERE origin = 'source';
+        CREATE UNIQUE INDEX IF NOT EXISTS artifacts_source_global_coordinate_uq
+            ON artifacts(context, source_name)
+            WHERE origin = 'source' AND source_scope = 'global';
+        CREATE UNIQUE INDEX IF NOT EXISTS artifacts_source_entity_coordinate_uq
+            ON artifacts(context, source_name, source_entity_id)
+            WHERE origin = 'source' AND source_scope = 'entity';
         CREATE UNIQUE INDEX IF NOT EXISTS artifacts_workflow_output_uq
             ON artifacts(run_id, step_name, output_name, address)
             WHERE origin = 'workflow_output';
@@ -3676,6 +3920,12 @@ def _create_schema(conn: sqlite3.Connection) -> None:
             source_step_name TEXT,
             source_output_name TEXT,
             source_address TEXT,
+            source_scope TEXT CHECK(
+                source_scope IS NULL OR source_scope IN ('global', 'entity')
+            ),
+            source_name TEXT,
+            source_entity_id TEXT,
+            source_occurrence_path TEXT,
             dependency_set_id TEXT,
             manifest_value_schema TEXT,
             manifest_digest TEXT,
@@ -3684,6 +3934,28 @@ def _create_schema(conn: sqlite3.Connection) -> None:
             ),
             CHECK (
                 (manifest_value_schema IS NULL) = (manifest_digest IS NULL)
+            ),
+            CHECK (
+                (
+                    source_scope IS NULL
+                    AND source_name IS NULL
+                    AND source_entity_id IS NULL
+                    AND source_occurrence_path IS NULL
+                )
+                OR
+                (
+                    source_scope = 'global'
+                    AND source_name IS NOT NULL
+                    AND source_entity_id IS NULL
+                    AND source_occurrence_path IS NOT NULL
+                )
+                OR
+                (
+                    source_scope = 'entity'
+                    AND source_name IS NOT NULL
+                    AND source_entity_id IS NOT NULL
+                    AND source_occurrence_path IS NOT NULL
+                )
             ),
             FOREIGN KEY (manifest_value_schema, manifest_digest)
                 REFERENCES manifest_values(value_schema, manifest_digest)
@@ -3738,95 +4010,6 @@ def _create_schema(conn: sqlite3.Connection) -> None:
         PRAGMA user_version = {REGISTRY_SCHEMA_VERSION};
         """
     )
-
-
-def _upsert_source_artifact(
-    conn: sqlite3.Connection,
-    *,
-    context: str,
-    runtime_root: Path,
-    source_artifact_path: str,
-    source_entity_count: int,
-    source_digest: str,
-    source_hash: str,
-) -> None:
-    source_path = _source_file_path(runtime_root, source_artifact_path)
-    content_digest = sha256_file_digest(source_path)
-    metadata = _compact_json(
-        {
-            "entity_count": source_entity_count,
-            "source_digest": source_digest,
-            "source_hash": source_hash,
-        }
-    )
-    conn.execute(
-        """
-        INSERT INTO artifacts (
-            origin, context, path, content_digest, output_hash, file_size,
-            extension, source_metadata_json, created_at
-        )
-        VALUES ('source', ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(context, path) WHERE origin = 'source'
-        DO UPDATE SET
-            content_digest = excluded.content_digest,
-            output_hash = excluded.output_hash,
-            file_size = excluded.file_size,
-            extension = excluded.extension,
-            source_metadata_json = excluded.source_metadata_json,
-            created_at = excluded.created_at
-        """,
-        (
-            context,
-            source_artifact_path,
-            content_digest,
-            short_hash(content_digest),
-            source_path.stat().st_size,
-            _path_extension(source_artifact_path),
-            metadata,
-            _utc_now(),
-        ),
-    )
-
-
-def _validate_source_artifact_row(
-    conn: sqlite3.Connection,
-    *,
-    context: str,
-    runtime_root: Path,
-    source_artifact_path: str,
-    source_entity_count: int,
-    source_digest: str,
-    source_hash: str,
-) -> None:
-    source_path = _source_file_path(runtime_root, source_artifact_path)
-    content_digest = sha256_file_digest(source_path)
-    expected_metadata = _compact_json(
-        {
-            "entity_count": source_entity_count,
-            "source_digest": source_digest,
-            "source_hash": source_hash,
-        }
-    )
-    row = conn.execute(
-        """
-        SELECT origin, path, content_digest, output_hash, file_size, extension,
-               source_metadata_json
-        FROM artifacts
-        WHERE context = ? AND origin = 'source' AND path = ?
-        """,
-        (context, source_artifact_path),
-    ).fetchone()
-    expected_row = (
-        "source",
-        source_artifact_path,
-        content_digest,
-        short_hash(content_digest),
-        source_path.stat().st_size,
-        _path_extension(source_artifact_path),
-        expected_metadata,
-    )
-    if row != expected_row:
-        raise ValidationError("registry.db source artifact row is out of date")
 
 
 def _source_file_path(runtime_root: Path, source_artifact_path: str) -> Path:
@@ -3929,6 +4112,9 @@ def _registry_artifact_from_row(row: sqlite3.Row) -> RegistryArtifact:
         callable_ref=row["callable_ref"],
         software_ref=row["software_ref"],
         created_at=str(row["created_at"]),
+        source_scope=row["source_scope"],
+        source_name=row["source_name"],
+        source_entity_id=row["source_entity_id"],
     )
 
 
@@ -4038,6 +4224,10 @@ def _registry_dependency_from_row(row: sqlite3.Row) -> RegistryDependency:
         source_step_name=row["source_step_name"],
         source_output_name=row["source_output_name"],
         source_address=row["source_address"],
+        source_scope=row["source_scope"],
+        source_name=row["source_name"],
+        source_entity_id=row["source_entity_id"],
+        source_occurrence_path=row["source_occurrence_path"],
         dependency_set_id=row["dependency_set_id"],
         manifest_value_schema=row["manifest_value_schema"],
         manifest_digest=row["manifest_digest"],

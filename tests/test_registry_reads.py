@@ -2,6 +2,7 @@ import json
 import os
 import sqlite3
 from contextlib import contextmanager
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -11,7 +12,8 @@ import nipact.registry as registry
 from nipact.cli import main
 from nipact.errors import ValidationError
 from nipact.execution import build_run_plan, execute_run_plan
-from nipact.projection import RegisteredSourceSnapshot, SourceCoordinate
+from nipact.manifest import build_manifest
+from nipact.projection import RegisteredSourceSnapshot
 from nipact.registry import (
     EnvironmentObservationV1,
     MembershipIntent,
@@ -33,12 +35,18 @@ from nipact.registry import (
     read_manifest,
     read_published_outputs,
     read_registered_source_snapshots,
+    reconcile_manifest_and_source_authorities,
     read_registry_summary,
     read_run_execution_population,
     record_workflow_run,
     resolve_registered_artifact_path,
 )
 from nipact.project_setup import ProjectSetupError, validate_project
+from nipact.source_authority import (
+    LogicalSourceCoordinate,
+    SourceDeclaration,
+    observe_source_authority,
+)
 
 
 def _run_main_from(cwd: Path, argv: list[str]) -> int:
@@ -77,6 +85,29 @@ def _init_demo(
     return project_dir, runtime_dir
 
 
+def _reconcile_colors_source(runtime_dir: Path) -> None:
+    declaration = SourceDeclaration(
+        coordinate=LogicalSourceCoordinate(
+            "colors", "global", "colors_source", None
+        ),
+        declared_path="data/color_source.json",
+        declared_extension=".json",
+    )
+    reconcile_manifest_and_source_authorities(
+        runtime_dir / REGISTRY_DB_PATH,
+        context="colors",
+        manifests={},
+        manifest_paths={},
+        observations=(
+            observe_source_authority(
+                runtime_root=runtime_dir,
+                declaration=declaration,
+                registered=None,
+            ),
+        ),
+    )
+
+
 def _write_all_staged_outputs(run_plan: object) -> None:
     selected_keys = {
         (job.step_name, job.output_name, job.address)
@@ -96,6 +127,98 @@ def _write_all_staged_outputs(run_plan: object) -> None:
             json.dumps(payload, indent=2, sort_keys=True) + "\n",
             encoding="utf-8",
         )
+
+
+def test_manifest_and_source_authority_reconciliation_rolls_back_together(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _project_dir, runtime_dir = _init_demo(tmp_path, capsys)
+    registry_path = runtime_dir / REGISTRY_DB_PATH
+    coordinate = LogicalSourceCoordinate(
+        "colors", "global", "colors_source", None
+    )
+    declaration = SourceDeclaration(
+        coordinate=coordinate,
+        declared_path="data/color_source.json",
+        declared_extension=".json",
+    )
+    observation = observe_source_authority(
+        runtime_root=runtime_dir,
+        declaration=declaration,
+        registered=None,
+    )
+    reconcile_manifest_and_source_authorities(
+        registry_path,
+        context="colors",
+        manifests={},
+        manifest_paths={},
+        observations=(observation,),
+    )
+    with sqlite3.connect(registry_path) as conn:
+        manifest_name, declared_path, old_schema, old_digest = conn.execute(
+            """
+            SELECT manifest_name, declared_path,
+                   last_validated_manifest_value_schema,
+                   last_validated_manifest_digest
+            FROM manifest_declarations
+            WHERE context = 'colors'
+            ORDER BY manifest_name
+            LIMIT 1
+            """
+        ).fetchone()
+
+    changed_manifest = build_manifest(
+        description="Rollback probe",
+        entities=("rollback_entity",),
+    )
+    relocated = replace(
+        observation,
+        declaration=SourceDeclaration(
+            coordinate=coordinate,
+            declared_path="data/relocated.json",
+            declared_extension=".json",
+        ),
+    )
+    with pytest.raises(ValidationError, match="source relocation is unsupported"):
+        reconcile_manifest_and_source_authorities(
+            registry_path,
+            context="colors",
+            manifests={manifest_name: changed_manifest},
+            manifest_paths={manifest_name: declared_path},
+            observations=(relocated,),
+        )
+
+    with sqlite3.connect(registry_path) as conn:
+        current_reference = conn.execute(
+            """
+            SELECT last_validated_manifest_value_schema,
+                   last_validated_manifest_digest
+            FROM manifest_declarations
+            WHERE context = 'colors' AND manifest_name = ?
+            """,
+            (manifest_name,),
+        ).fetchone()
+        changed_value_count = conn.execute(
+            """
+            SELECT COUNT(*) FROM manifest_values
+            WHERE value_schema = ? AND manifest_digest = ?
+            """,
+            (
+                changed_manifest.manifest_value_schema,
+                changed_manifest.manifest_digest,
+            ),
+        ).fetchone()[0]
+        source_path = conn.execute(
+            """
+            SELECT path FROM artifacts
+            WHERE origin = 'source' AND context = 'colors'
+              AND source_scope = 'global' AND source_name = 'colors_source'
+            """
+        ).fetchone()[0]
+    assert current_reference == (old_schema, old_digest)
+    assert changed_value_count == 0
+    assert source_path == "data/color_source.json"
 
 
 def _successful_sector_run(
@@ -120,12 +243,14 @@ def _successful_sector_run(
     return project_dir, runtime_dir, run_plan
 
 
-def test_registry_reads_initialized_source_artifact(
+def test_registry_reads_reconciled_source_artifact(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     _project_dir, runtime_dir = _init_demo(tmp_path, capsys)
     registry_path = runtime_dir / REGISTRY_DB_PATH
+    assert list_artifacts(registry_path, context="colors", origin="source") == []
+    _reconcile_colors_source(runtime_dir)
 
     source_artifacts = list_artifacts(registry_path, context="colors", origin="source")
 
@@ -135,8 +260,10 @@ def test_registry_reads_initialized_source_artifact(
     assert source.path == "data/color_source.json"
     assert source.run_id is None
     assert source.request_bundle_digest is None
-    assert source.source_metadata is not None
-    assert source.source_metadata["entity_count"] == 200
+    assert source.source_metadata is None
+    assert source.source_scope == "global"
+    assert source.source_name == "colors_source"
+    assert source.source_entity_id is None
     assert read_artifact_by_id(registry_path, source.artifact_id) == source
     assert (
         read_artifact_by_path(
@@ -175,6 +302,7 @@ def test_registry_reads_source_snapshots_without_reading_live_bytes(
     _project_dir, runtime_dir = _init_demo(tmp_path, capsys)
     registry_path = runtime_dir / REGISTRY_DB_PATH
     source_path = runtime_dir / "data/color_source.json"
+    _reconcile_colors_source(runtime_dir)
     artifact = read_artifact_by_path(
         registry_path,
         context="colors",
@@ -193,7 +321,7 @@ def test_registry_reads_source_snapshots_without_reading_live_bytes(
     )
 
     assert snapshots == {
-        SourceCoordinate("colors", "data/color_source.json"):
+        LogicalSourceCoordinate("colors", "global", "colors_source", None):
             RegisteredSourceSnapshot(
                 content_digest=artifact.content_digest,
                 file_size=artifact.file_size,
@@ -218,9 +346,12 @@ def test_connection_local_source_snapshot_sees_uncommitted_upsert(
             """
             INSERT INTO artifacts (
                 origin, context, path, content_digest, output_hash, file_size,
-                extension, created_at
+                extension, source_scope, source_name, source_st_dev,
+                source_st_ino, source_st_size, source_st_mtime_ns,
+                source_st_ctime_ns, created_at
             )
-            VALUES ('source', ?, ?, ?, ?, ?, ?, ?)
+            VALUES ('source', ?, ?, ?, ?, ?, ?, 'global', 'uncommitted',
+                    1, 2, 17, 3, 4, ?)
             """,
             (
                 "colors",
@@ -239,7 +370,9 @@ def test_connection_local_source_snapshot_sees_uncommitted_upsert(
         )
         conn.rollback()
 
-    assert snapshots[SourceCoordinate("colors", "data/uncommitted.json")] == (
+    assert snapshots[
+        LogicalSourceCoordinate("colors", "global", "uncommitted", None)
+    ] == (
         RegisteredSourceSnapshot(
             content_digest="d" * 64,
             file_size=17,
@@ -254,6 +387,7 @@ def test_registry_manifest_helpers_and_summary(
 ) -> None:
     _project_dir, runtime_dir = _init_demo(tmp_path, capsys)
     registry_path = runtime_dir / REGISTRY_DB_PATH
+    _reconcile_colors_source(runtime_dir)
 
     manifests = list_manifests(registry_path, context="colors")
     manifest = read_manifest(registry_path, context="colors", manifest_name="init")
@@ -1063,9 +1197,12 @@ def test_registry_context_safe_artifact_lookup_hides_foreign_contexts(
             """
             INSERT INTO artifacts (
                 origin, context, path, content_digest, output_hash, file_size,
-                extension, created_at
+                extension, source_scope, source_name, source_st_dev,
+                source_st_ino, source_st_size, source_st_mtime_ns,
+                source_st_ctime_ns, created_at
             )
-            VALUES ('source', ?, ?, ?, ?, ?, ?, ?)
+            VALUES ('source', ?, ?, ?, ?, ?, ?, 'global', 'foreign_source',
+                    1, 2, 1, 3, 4, ?)
             """,
             (
                 "other",

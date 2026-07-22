@@ -526,7 +526,7 @@ def test_workflow_run_help_documents_dry_run_forecast(
     ) in help_text
 
 
-def test_workflow_run_targeted_summary_keeps_population_job_count(
+def test_workflow_run_targeted_summary_reports_selected_closure_job_count(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
     monkeypatch: pytest.MonkeyPatch,
@@ -573,14 +573,10 @@ def test_workflow_run_targeted_summary_keeps_population_job_count(
     assert targeted_summary["address"] == "color_007"
     assert int(full_summary["selected_outputs"]) == 200
     assert int(targeted_summary["selected_outputs"]) == 1
-    # planned_jobs keeps its compiled-fresh-job meaning: the plan stays
-    # population-wide under --address, and only planned_reachable_fresh_jobs
-    # and reuse hydration are closure-scoped (exercised in
-    # test_execution_cache.py).
+    # Structural planning and the forecast are selected-closure scoped.
     assert int(full_summary["planned_jobs"]) > 1
-    assert targeted_summary["planned_jobs"] == full_summary["planned_jobs"]
+    assert targeted_summary["planned_jobs"] == "3"
     assert full_summary["planned_reachable_fresh_jobs"] == full_summary["planned_jobs"]
-    # The targeted forecast is the single entity's three-step chain.
     assert targeted_summary["planned_reachable_fresh_jobs"] == "3"
     assert targeted_summary["planned_reused_registered_artifacts"] == "0"
     assert targeted_summary["planned_reused_inputs"] == "0"

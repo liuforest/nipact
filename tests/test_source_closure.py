@@ -119,6 +119,7 @@ def _loaded(
             entity_bindings={} if entity_bindings is None else entity_bindings,
         ),
         manifests={},
+        manifest_paths={},
         steps={},
         workflows={},
     )

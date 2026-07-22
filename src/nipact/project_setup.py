@@ -130,10 +130,6 @@ def _init_colors_project(
         runtime_root / registry.REGISTRY_DB_PATH,
         context=context,
         runtime_root=runtime_root,
-        source_artifact_path=colors_template.SOURCE_ARTIFACT_PATH,
-        source_entity_count=colors_template.SOURCE_ENTITY_COUNT,
-        source_digest=source_digest,
-        source_hash=source_hash,
         manifests=manifests,
         manifest_paths=colors_template.manifest_paths(),
     )
@@ -286,10 +282,6 @@ def _validate_colors_project(
             runtime_root=runtime_root,
             manifest_paths=manifest_paths,
             context=context,
-            source_artifact_path=colors_template.SOURCE_ARTIFACT_PATH,
-            source_entity_count=colors_template.SOURCE_ENTITY_COUNT,
-            source_digest=source_digest,
-            source_hash=source_hash,
             manifests=manifests,
             loaded_workflow_project=loaded_workflow_project,
         )

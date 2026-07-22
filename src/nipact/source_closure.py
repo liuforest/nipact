@@ -1,4 +1,4 @@
-"""Inactive structural source-closure traversal for selected workflow work."""
+"""Structural source-closure traversal for selected workflow work."""
 
 from __future__ import annotations
 
@@ -68,7 +68,7 @@ def selected_source_declarations(
 
         if step.execution_role == "source_import":
             for source_name in step.source_inputs:
-                declaration = _source_declaration(
+                declaration = source_declaration_for_binding(
                     context=loaded.context,
                     source_index=loaded.source_index,
                     source_name=source_name,
@@ -107,6 +107,49 @@ def selected_source_declarations(
             key=_source_declaration_sort_key,
         )
     )
+
+
+def selected_job_coordinates(
+    *,
+    plan: WorkflowPlan,
+    requested_address: str | None = None,
+) -> tuple[tuple[str, str], ...]:
+    """Return the selected semantic job closure in deterministic order."""
+    if not isinstance(plan, WorkflowPlan):
+        raise ValidationError("workflow plan must be a WorkflowPlan")
+    steps_by_name = {step.step_name: step for step in plan.steps}
+    if len(steps_by_name) != len(plan.steps):
+        raise ValidationError("workflow plan contains duplicate steps")
+    selected_step = _required_step(steps_by_name, plan.selected_step_name)
+    pending = [
+        (selected_step.step_name, address)
+        for address in _selected_addresses(
+            plan,
+            selected_step,
+            requested_address=requested_address,
+        )
+    ]
+    visited: set[tuple[str, str]] = set()
+    while pending:
+        step_name, address = pending.pop()
+        coordinate = (step_name, address)
+        if coordinate in visited:
+            continue
+        visited.add(coordinate)
+        step = _required_step(steps_by_name, step_name)
+        for step_input in step.inputs.values():
+            source_step = _required_step(steps_by_name, step_input.source_step_name)
+            pending.extend(
+                (source_step.step_name, source_address)
+                for source_address in _source_addresses(
+                    consumer_step=step,
+                    source_step=source_step,
+                    dependency_role=step_input.dependency_role,
+                    consumer_address=address,
+                )
+            )
+    step_order = {step.step_name: index for index, step in enumerate(plan.steps)}
+    return tuple(sorted(visited, key=lambda item: (step_order[item[0]], item[1])))
 
 
 def _selected_addresses(
@@ -168,7 +211,7 @@ def _source_addresses(
     )
 
 
-def _source_declaration(
+def source_declaration_for_binding(
     *,
     context: str,
     source_index: SourceIndex,

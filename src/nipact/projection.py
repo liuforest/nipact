@@ -6,14 +6,14 @@ import json
 import math
 from collections.abc import Mapping
 from dataclasses import dataclass
-from pathlib import PurePosixPath
 from typing import Any, TypeAlias
 
 from .errors import ValidationError
 from .hashing import is_valid_digest, sha256_digest
 from .manifest import MANIFEST_VALUE_SCHEMA
+from .source_authority import LogicalSourceCoordinate
 
-IDENTITY_CONTRACT_VERSION = 2
+IDENTITY_CONTRACT_VERSION = 3
 OUTPUT_CONTRACT_VERSION = 1
 RUNNER_CONTRACT_VERSION = "2"
 
@@ -30,12 +30,6 @@ class StepContract:
 
 
 @dataclass(frozen=True)
-class SourceCoordinate:
-    namespace: str
-    path: str
-
-
-@dataclass(frozen=True)
 class RegisteredSourceSnapshot:
     content_digest: str
     file_size: int
@@ -45,7 +39,7 @@ class RegisteredSourceSnapshot:
 @dataclass(frozen=True)
 class RegisteredSourceBinding:
     role: str
-    source_coordinate: SourceCoordinate
+    source_coordinate: LogicalSourceCoordinate
     registered_content_digest: str
     registered_file_size: int
     declared_extension: str
@@ -85,7 +79,7 @@ class OutputContract:
 
 
 @dataclass(frozen=True)
-class RequestBundleProjectionV2:
+class RequestBundleProjectionV3:
     identity_contract_version: int
     namespace: str
     step_contract: StepContract
@@ -98,15 +92,15 @@ class RequestBundleProjectionV2:
 
 
 @dataclass(frozen=True)
-class ResolvedRequestBundleProjectionV2:
+class ResolvedRequestBundleProjectionV3:
     identity_contract_version: int
     canonical_json: str
     request_bundle_digest: str
 
 
 @dataclass(frozen=True)
-class ValidatedStoredRequestBundleProjectionV2:
-    resolved_projection: ResolvedRequestBundleProjectionV2
+class ValidatedStoredRequestBundleProjectionV3:
+    resolved_projection: ResolvedRequestBundleProjectionV3
     direct_upstream_request_bundle_digests: tuple[str, ...]
 
 
@@ -121,7 +115,7 @@ class RequestedOutputCoordinate:
 @dataclass(frozen=True)
 class SourceBindingPlan:
     role: str
-    source_coordinate: SourceCoordinate
+    source_coordinate: LogicalSourceCoordinate
 
 
 @dataclass(frozen=True)
@@ -147,7 +141,7 @@ ProjectionBindingPlan: TypeAlias = (
 
 
 @dataclass(frozen=True)
-class RequestBundleProjectionPlanV2:
+class RequestBundleProjectionPlanV3:
     """Planning recipe for a projection whose source snapshots may be absent."""
 
     identity_contract_version: int
@@ -163,29 +157,29 @@ class RequestBundleProjectionPlanV2:
 
 @dataclass(frozen=True)
 class UnresolvedRequestBundleProjection:
-    missing_source_coordinates: tuple[SourceCoordinate, ...]
+    missing_source_coordinates: tuple[LogicalSourceCoordinate, ...]
 
 
 RequestBundleProjectionState: TypeAlias = (
-    ResolvedRequestBundleProjectionV2 | UnresolvedRequestBundleProjection
+    ResolvedRequestBundleProjectionV3 | UnresolvedRequestBundleProjection
 )
 
 
 def resolve_request_bundle_projection_plan(
-    plan: RequestBundleProjectionPlanV2,
+    plan: RequestBundleProjectionPlanV3,
     *,
-    source_snapshots: Mapping[SourceCoordinate, RegisteredSourceSnapshot],
+    source_snapshots: Mapping[LogicalSourceCoordinate, RegisteredSourceSnapshot],
     upstream_states: Mapping[
         RequestedOutputCoordinate,
         RequestBundleProjectionState,
     ],
 ) -> RequestBundleProjectionState:
     """Resolve one planning recipe without reading the registry or filesystem."""
-    if not isinstance(plan, RequestBundleProjectionPlanV2):
-        raise ValidationError("plan must be a RequestBundleProjectionPlanV2")
+    if not isinstance(plan, RequestBundleProjectionPlanV3):
+        raise ValidationError("plan must be a RequestBundleProjectionPlanV3")
 
     resolved_bindings: list[ProjectionBinding] = []
-    missing_sources: set[SourceCoordinate] = set()
+    missing_sources: set[LogicalSourceCoordinate] = set()
     for binding_plan in plan.role_labelled_binding_plans:
         if isinstance(binding_plan, SourceBindingPlan):
             snapshot = source_snapshots.get(binding_plan.source_coordinate)
@@ -262,7 +256,7 @@ def resolve_request_bundle_projection_plan(
             )
         )
 
-    projection = RequestBundleProjectionV2(
+    projection = RequestBundleProjectionV3(
         identity_contract_version=plan.identity_contract_version,
         namespace=plan.namespace,
         step_contract=plan.step_contract,
@@ -299,31 +293,38 @@ def _required_upstream_state(
         ) from exc
 
 
-def _source_coordinate_sort_key(coordinate: SourceCoordinate) -> tuple[str, str]:
-    return coordinate.namespace, coordinate.path
+def _source_coordinate_sort_key(
+    coordinate: LogicalSourceCoordinate,
+) -> tuple[str, str, str, str]:
+    return (
+        coordinate.context,
+        coordinate.scope,
+        coordinate.source_name,
+        coordinate.entity_id or "",
+    )
 
 
 def canonicalize_request_bundle_projection(
-    projection: RequestBundleProjectionV2,
-) -> ResolvedRequestBundleProjectionV2:
-    """Validate, serialize, and identify one V2 request projection."""
-    if not isinstance(projection, RequestBundleProjectionV2):
-        raise ValidationError("projection must be a RequestBundleProjectionV2")
+    projection: RequestBundleProjectionV3,
+) -> ResolvedRequestBundleProjectionV3:
+    """Validate, serialize, and identify one V3 request projection."""
+    if not isinstance(projection, RequestBundleProjectionV3):
+        raise ValidationError("projection must be a RequestBundleProjectionV3")
     payload = _projection_payload(projection, path="projection")
     canonical_json = _dump_json(payload)
-    return ResolvedRequestBundleProjectionV2(
+    return ResolvedRequestBundleProjectionV3(
         identity_contract_version=projection.identity_contract_version,
         canonical_json=canonical_json,
         request_bundle_digest=sha256_digest(canonical_json.encode("utf-8")),
     )
 
 
-def validate_stored_request_bundle_projection_v2(
+def validate_stored_request_bundle_projection_v3(
     *,
     request_bundle_digest: str,
     projection_json: str,
-) -> ValidatedStoredRequestBundleProjectionV2:
-    """Validate one stored V2 payload against its canonical bytes and digest."""
+) -> ValidatedStoredRequestBundleProjectionV3:
+    """Validate one stored V3 payload against its canonical bytes and digest."""
     digest = _require_digest(
         request_bundle_digest,
         path="request_bundle_digest",
@@ -347,7 +348,7 @@ def validate_stored_request_bundle_projection_v2(
             for upstream_digest in _binding_upstream_digests(binding)
         }
     )
-    return ValidatedStoredRequestBundleProjectionV2(
+    return ValidatedStoredRequestBundleProjectionV3(
         resolved_projection=resolved,
         direct_upstream_request_bundle_digests=tuple(upstream_digests),
     )
@@ -364,7 +365,7 @@ def _unique_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     return payload
 
 
-def _projection_from_payload(payload: Any, *, path: str) -> RequestBundleProjectionV2:
+def _projection_from_payload(payload: Any, *, path: str) -> RequestBundleProjectionV3:
     obj = _require_object_shape(
         payload,
         path=path,
@@ -387,7 +388,7 @@ def _projection_from_payload(payload: Any, *, path: str) -> RequestBundleProject
     settings = obj["result_affecting_settings"]
     if type(settings) is not dict:
         raise ValidationError(f"{path}.result_affecting_settings must be an object")
-    return RequestBundleProjectionV2(
+    return RequestBundleProjectionV3(
         identity_contract_version=_require_int(
             obj["identity_contract_version"],
             path=f"{path}.identity_contract_version",
@@ -470,17 +471,28 @@ def _registered_source_from_payload(
     coordinate = _require_object_shape(
         obj["source_coordinate"],
         path=f"{path}.source_coordinate",
-        keys={"namespace", "path"},
+        keys={"context", "scope", "source_name", "entity_id"},
     )
+    entity_id_value = coordinate["entity_id"]
+    if entity_id_value is not None:
+        entity_id_value = _require_string(
+            entity_id_value,
+            path=f"{path}.source_coordinate.entity_id",
+        )
     return RegisteredSourceBinding(
         role=_require_string(obj["role"], path=f"{path}.role"),
-        source_coordinate=SourceCoordinate(
-            namespace=_require_string(
-                coordinate["namespace"], path=f"{path}.source_coordinate.namespace"
+        source_coordinate=LogicalSourceCoordinate(
+            context=_require_string(
+                coordinate["context"], path=f"{path}.source_coordinate.context"
             ),
-            path=_require_registered_source_path(
-                coordinate["path"], path=f"{path}.source_coordinate.path"
+            scope=_require_string(
+                coordinate["scope"], path=f"{path}.source_coordinate.scope"
             ),
+            source_name=_require_string(
+                coordinate["source_name"],
+                path=f"{path}.source_coordinate.source_name",
+            ),
+            entity_id=entity_id_value,
         ),
         registered_content_digest=_require_digest(
             obj["registered_content_digest"],
@@ -616,7 +628,7 @@ def _require_list(value: Any, *, path: str) -> list[Any]:
 
 
 def _projection_payload(
-    projection: RequestBundleProjectionV2,
+    projection: RequestBundleProjectionV3,
     *,
     path: str,
 ) -> dict[str, Any]:
@@ -714,26 +726,26 @@ def _registered_source_payload(
     *,
     path: str,
 ) -> dict[str, Any]:
-    if not isinstance(binding.source_coordinate, SourceCoordinate):
-        raise ValidationError(f"{path}.source_coordinate must be a SourceCoordinate")
+    if not isinstance(binding.source_coordinate, LogicalSourceCoordinate):
+        raise ValidationError(
+            f"{path}.source_coordinate must be a LogicalSourceCoordinate"
+        )
     file_size = _require_int(
         binding.registered_file_size,
         path=f"{path}.registered_file_size",
     )
     if file_size < 0:
         raise ValidationError(f"{path}.registered_file_size must be non-negative")
-    source_path = _require_registered_source_path(
-        binding.source_coordinate.path,
-        path=f"{path}.source_coordinate.path",
-    )
     return {
         "role": _require_string(binding.role, path=f"{path}.role"),
         "source_coordinate": {
-            "namespace": _require_string(
-                binding.source_coordinate.namespace,
-                path=f"{path}.source_coordinate.namespace",
+            "context": _require_string(
+                binding.source_coordinate.context,
+                path=f"{path}.source_coordinate.context",
             ),
-            "path": source_path,
+            "scope": binding.source_coordinate.scope,
+            "source_name": binding.source_coordinate.source_name,
+            "entity_id": binding.source_coordinate.entity_id,
         },
         "registered_content_digest": _require_digest(
             binding.registered_content_digest,
@@ -935,22 +947,6 @@ def _require_int(value: Any, *, path: str) -> int:
     if type(value) is not int:
         raise ValidationError(f"{path} must be an integer")
     return value
-
-
-def _require_registered_source_path(value: Any, *, path: str) -> str:
-    source_path = _require_string(value, path=path)
-    if "\\" in source_path:
-        raise ValidationError(f"{path} must be a normalized POSIX path under data/")
-    parsed = PurePosixPath(source_path)
-    if (
-        parsed.is_absolute()
-        or len(parsed.parts) < 2
-        or parsed.parts[0] != "data"
-        or any(part in {".", ".."} for part in parsed.parts)
-        or parsed.as_posix() != source_path
-    ):
-        raise ValidationError(f"{path} must be a normalized POSIX path under data/")
-    return source_path
 
 
 def _require_tuple(value: Any, *, path: str) -> tuple[Any, ...]:
