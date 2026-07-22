@@ -12,6 +12,8 @@ import nipact.registry as registry_module
 import nipact.execution as execution_module
 from nipact.cli import main
 from nipact.artifacts import output_filename, parse_output_filename
+from nipact.examples.colors_processing_demo.model import build_color_grid
+from nipact.examples.colors_processing_demo.runtime import color_sector_analysis_file
 from nipact.errors import ValidationError
 from nipact.execution import (
     _run_plan_payload,
@@ -22,7 +24,7 @@ from nipact.execution import (
     execute_run_plan,
 )
 from nipact.hashing import is_valid_digest, sha256_digest, sha256_file_digest, short_hash
-from nipact.manifest import load_manifest
+from nipact.manifest import build_manifest_value, load_manifest
 from nipact.projection import ResolvedRequestBundleProjectionV2
 from nipact.registry import EnvironmentObservationV1
 from nipact.runtime import run_job
@@ -1089,6 +1091,35 @@ def test_multi_output_run_registers_sibling_outputs_and_exact_dependency(
         )
 
 
+def test_color_sector_analysis_payload_uses_manifest_value_not_job_address(
+    tmp_path: Path,
+) -> None:
+    points = build_color_grid(angular_bins=2, radius_bins=1)
+    input_paths = []
+    for point in points:
+        input_path = tmp_path / f"{point.entity_id}.json"
+        input_path.write_text(
+            json.dumps({"point": point.to_payload()}),
+            encoding="utf-8",
+        )
+        input_paths.append(input_path)
+    output_path = tmp_path / "sector-counts.json"
+
+    color_sector_analysis_file(
+        inputs={"sector_label": tuple(input_paths)},
+        outputs={"sector_counts": output_path},
+        params={},
+        address="cohort",
+    )
+
+    payload = json.loads(output_path.read_text(encoding="utf-8"))
+    assert "analysis_manifest_name" not in payload
+    assert payload["analysis_manifest_digest"] == build_manifest_value(
+        entities=(point.entity_id for point in points)
+    ).manifest_digest
+    assert payload["entity_count"] == len(points)
+
+
 def test_execute_run_plan_publishes_selected_outputs_without_real_snakemake(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
@@ -1106,7 +1137,6 @@ def test_execute_run_plan_publishes_selected_outputs_without_real_snakemake(
         _write_all_staged_outputs(
             run_plan,
             selected_payload={
-                "analysis_manifest_name": "init",
                 "analysis_manifest_digest": "0" * 64,
                 "entity_count": 200,
                 "red_arc_count": 8,

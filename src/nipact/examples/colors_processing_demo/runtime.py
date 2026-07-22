@@ -153,7 +153,6 @@ def color_sector_analysis_file(
         output,
         analyze_sectors(
             points,
-            analysis_manifest_name=address,
             **params,
         ).to_payload(),
     )
