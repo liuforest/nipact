@@ -101,6 +101,11 @@ from .workflow import (
 RunStatusCallback = Callable[[str], None]
 
 
+# Private rollout boundary for representation-transparent consumers. Unknown
+# callables retain copied delivery until they have been audited explicitly.
+_DIRECT_REUSED_INPUT_CALLABLE_REFS: frozenset[str] = frozenset()
+
+
 @dataclass(frozen=True)
 class PublishedOutputSpec:
     job_id: str
@@ -1447,11 +1452,15 @@ def _prepare_reused_inputs(
     run_plan: ExecutableRunPlan,
 ) -> _PreparedReusedInputs:
     candidates = _exact_reused_candidates(run_plan)
+    consumers_by_artifact = _reused_input_consumers(run_plan)
     verified_occurrences: dict[tuple[Path, str, int], Path] = {}
     _verify_selected_reused_outputs(
         run_plan, candidates=candidates, verified_occurrences=verified_occurrences
     )
-    prepared: list[_PreparedReusedInput] = []
+    occurrence_groups: dict[
+        tuple[Path, str, int],
+        list[tuple[ReusedRunJobOutputRef, ReusableArtifactCandidate, Path]],
+    ] = {}
     for output_ref in run_plan.reused_outputs:
         candidate = candidates[output_ref.source_artifact_id]
         source_path = _verify_reused_canonical_occurrence(
@@ -1459,21 +1468,89 @@ def _prepare_reused_inputs(
             candidate,
             verified_occurrences=verified_occurrences,
         )
-        output_ref.staging_path.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(source_path, output_ref.staging_path)
-        if output_ref.staging_path.stat().st_size != candidate.file_size:
-            raise ValidationError("hydrated artifact file size mismatch")
-        if sha256_file_digest(output_ref.staging_path) != candidate.content_digest:
-            raise ValidationError("hydrated artifact digest mismatch")
-        prepared.append(
-            _PreparedReusedInput(
-                output_ref=output_ref,
-                candidate=candidate,
-                bound_occurrence_path=source_path,
-                supplied_path=output_ref.staging_path,
-            )
+        occurrence_key = (
+            source_path.resolve(),
+            candidate.content_digest,
+            candidate.file_size,
         )
-    return _PreparedReusedInputs(candidates=candidates, inputs=tuple(prepared))
+        occurrence_groups.setdefault(occurrence_key, []).append(
+            (output_ref, candidate, source_path)
+        )
+
+    supplied_by_artifact: dict[int, Path] = {}
+    for group in occurrence_groups.values():
+        consumer_refs = {
+            callable_ref
+            for output_ref, _candidate, _source_path in group
+            for callable_ref in consumers_by_artifact[output_ref.source_artifact_id]
+        }
+        direct = all(
+            callable_ref in _DIRECT_REUSED_INPUT_CALLABLE_REFS
+            for callable_ref in consumer_refs
+        )
+        if direct:
+            supplied_path = group[0][2]
+        else:
+            copy_ref, copy_candidate, source_path = min(
+                group,
+                key=lambda item: item[0].staging_path_relative,
+            )
+            supplied_path = copy_ref.staging_path
+            supplied_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source_path, supplied_path)
+            if supplied_path.stat().st_size != copy_candidate.file_size:
+                raise ValidationError("hydrated artifact file size mismatch")
+            if sha256_file_digest(supplied_path) != copy_candidate.content_digest:
+                raise ValidationError("hydrated artifact digest mismatch")
+        for output_ref, _candidate, _source_path in group:
+            supplied_by_artifact[output_ref.source_artifact_id] = supplied_path
+
+    prepared = tuple(
+        _PreparedReusedInput(
+            output_ref=output_ref,
+            candidate=candidates[output_ref.source_artifact_id],
+            bound_occurrence_path=(
+                run_plan.runtime_root
+                / candidates[output_ref.source_artifact_id].path
+            ),
+            supplied_path=supplied_by_artifact[output_ref.source_artifact_id],
+        )
+        for output_ref in run_plan.reused_outputs
+    )
+    return _PreparedReusedInputs(candidates=candidates, inputs=prepared)
+
+
+def _reused_input_consumers(
+    run_plan: ExecutableRunPlan,
+) -> dict[int, frozenset[str]]:
+    """Return the reachable fresh callable refs consuming each reused artifact."""
+    consumers: dict[int, set[str]] = {
+        output_ref.source_artifact_id: set()
+        for output_ref in run_plan.reused_outputs
+    }
+    if len(consumers) != len(run_plan.reused_outputs):
+        raise ValidationError("reused run inputs contain duplicate artifact IDs")
+
+    reachable_job_ids = _reachable_job_ids(run_plan)
+    for job in run_plan.jobs:
+        if job.job_id not in reachable_job_ids:
+            continue
+        for record in job.input_records:
+            artifact_id = record.registry_source_artifact_id
+            if record.origin != "workflow_output" or artifact_id not in consumers:
+                continue
+            consumers[artifact_id].add(job.callable_ref)
+
+    missing = [artifact_id for artifact_id, refs in consumers.items() if not refs]
+    if missing:
+        raise ValidationError(
+            "reused run input has no reachable fresh consumer: "
+            + ", ".join(str(artifact_id) for artifact_id in sorted(missing))
+        )
+    return {
+        artifact_id: frozenset(callable_refs)
+        for artifact_id, callable_refs in consumers.items()
+    }
 
 
 def _verify_selected_reused_outputs(
