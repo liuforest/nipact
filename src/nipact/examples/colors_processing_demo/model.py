@@ -96,7 +96,6 @@ class CohortFit:
 
 @dataclass(frozen=True)
 class SectorCounts:
-    analysis_manifest_name: str
     analysis_manifest_digest: str
     entity_count: int
     red_arc_count: int
@@ -375,7 +374,6 @@ def sector_label(
 def analyze_sectors(
     points: Sequence[ColorPoint],
     *,
-    analysis_manifest_name: str = "init",
     arc_half_width: float = DEFAULT_ARC_HALF_WIDTH,
     min_radius: float = DEFAULT_MIN_ANALYSIS_RADIUS,
 ) -> SectorCounts:
@@ -389,7 +387,6 @@ def analyze_sectors(
     blue_count = labels.count(BLUE_SECTOR)
     other_count = entity_count - red_count - green_count - blue_count
     return SectorCounts(
-        analysis_manifest_name=analysis_manifest_name,
         analysis_manifest_digest=build_manifest_value(
             entities=(point.entity_id for point in points)
         ).manifest_digest,
