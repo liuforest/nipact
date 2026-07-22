@@ -4645,9 +4645,8 @@ def test_targeted_rerun_replaces_only_selected_coordinates_and_keeps_history(
     )
 
     # A changed step parameter is identity-bearing and changes the output
-    # bytes, so the targeted rerun publishes a new sub_001 artifact. (A source
-    # data change would not do this: plan-time reuse never hashes content, so
-    # the upstream import would be reused with its registered old bytes.)
+    # bytes, so the targeted rerun publishes a new sub_001 artifact. Source
+    # changes are handled separately by final under-lock reconciliation.
     step_path = project_dir / "steps/b_transform.yaml"
     step_payload = yaml.safe_load(step_path.read_text(encoding="utf-8"))
     step_payload["params"]["version"] = "v2"
@@ -6049,6 +6048,123 @@ def test_failed_targeted_rerun_preserves_prior_published_coordinate(
     assert sha256_file_digest(runtime_dir / row_before[1]) == digest_before
     with sqlite3.connect(runtime_dir / "database/registry.db") as conn:
         assert conn.execute("SELECT COUNT(*) FROM workflow_runs").fetchone()[0] == 1
+
+
+@pytest.mark.parametrize("failure_mode", ["snakemake", "recording"])
+def test_changed_authority_survives_later_scientific_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_mode: str,
+) -> None:
+    project_dir, runtime_dir, _log_path = _write_cache_project(
+        tmp_path,
+        monkeypatch,
+    )
+    initial_plan = build_run_plan(
+        project_dir=project_dir,
+        context="cache",
+        workflow_name="main",
+        step_name="b_transform",
+        address="sub_001",
+    )
+    assert execute_run_plan(initial_plan, cores=1).all_selected_resolved
+
+    def scientific_counts() -> dict[str, int]:
+        with sqlite3.connect(runtime_dir / "database/registry.db") as conn:
+            return {
+                "runs": conn.execute("SELECT COUNT(*) FROM workflow_runs").fetchone()[0],
+                "outputs": conn.execute(
+                    "SELECT COUNT(*) FROM artifacts WHERE origin = 'workflow_output'"
+                ).fetchone()[0],
+                "dependencies": conn.execute(
+                    "SELECT COUNT(*) FROM artifact_dependencies"
+                ).fetchone()[0],
+                "memberships": conn.execute(
+                    "SELECT COUNT(*) FROM published_outputs"
+                ).fetchone()[0],
+                "population_bindings": conn.execute(
+                    "SELECT COUNT(*) FROM run_execution_population"
+                ).fetchone()[0],
+                "manifest_bindings": conn.execute(
+                    "SELECT COUNT(*) FROM run_manifest_bindings"
+                ).fetchone()[0],
+            }
+
+    scientific_counts_before = scientific_counts()
+
+    _add_cache_entity(project_dir, runtime_dir, address="sub_002", seed="beta")
+    expanded_manifest = load_manifest(project_dir / "manifests/subjects.yaml")
+    source_path = runtime_dir / "data/source/sub_002.txt"
+    failed_plan = build_run_plan(
+        project_dir=project_dir,
+        context="cache",
+        workflow_name="main",
+        step_name="b_transform",
+        address="sub_002",
+    )
+
+    if failure_mode == "snakemake":
+        monkeypatch.setattr(
+            "nipact.execution._run_snakemake",
+            lambda *_args, **_kwargs: 1,
+        )
+        expected_error = "Snakemake failed with exit code 1"
+    else:
+
+        def fail_registration(*_args: object, **_kwargs: object) -> int:
+            raise ValidationError("registry write failed")
+
+        monkeypatch.setattr(
+            "nipact.execution.record_workflow_run",
+            fail_registration,
+        )
+        expected_error = "registry write failed"
+
+    with pytest.raises(ValidationError, match=expected_error):
+        execute_run_plan(failed_plan, cores=1)
+
+    with sqlite3.connect(runtime_dir / "database/registry.db") as conn:
+        declaration = conn.execute(
+            """
+            SELECT last_validated_manifest_value_schema,
+                   last_validated_manifest_digest
+            FROM manifest_declarations
+            WHERE context = 'cache' AND manifest_name = 'subjects'
+            """
+        ).fetchone()
+        stored_value = conn.execute(
+            """
+            SELECT canonical_body, entity_count
+            FROM manifest_values
+            WHERE value_schema = ? AND manifest_digest = ?
+            """,
+            (
+                expanded_manifest.manifest_value_schema,
+                expanded_manifest.manifest_digest,
+            ),
+        ).fetchone()
+        source_authority = conn.execute(
+            """
+            SELECT content_digest, file_size
+            FROM artifacts
+            WHERE context = 'cache'
+              AND origin = 'source'
+              AND source_scope = 'entity'
+              AND source_name = 'seed'
+              AND source_entity_id = 'sub_002'
+            """
+        ).fetchone()
+
+    assert declaration == (
+        expanded_manifest.manifest_value_schema,
+        expanded_manifest.manifest_digest,
+    )
+    assert stored_value == (expanded_manifest.canonical_body, 2)
+    assert source_authority == (
+        sha256_file_digest(source_path),
+        source_path.stat().st_size,
+    )
+    assert scientific_counts() == scientific_counts_before
 
 
 def test_targeted_dry_run_writes_no_outputs_and_no_registry_rows(
