@@ -1527,6 +1527,194 @@ def test_cross_target_run_plan_reuses_upstream_from_registry(
         ).fetchone() == ("staging/b_transform/b_out/sub_001.json",)
 
 
+def test_allowlisted_consumer_uses_direct_canonical_reused_input(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project_dir, runtime_dir, _log_path = _write_cache_project(tmp_path, monkeypatch)
+    b_plan = build_run_plan(
+        project_dir=project_dir,
+        context="cache",
+        workflow_name="main",
+        step_name="b_transform",
+    )
+    assert execute_run_plan(b_plan, cores=1).all_selected_resolved
+    c_plan = build_run_plan(
+        project_dir=project_dir,
+        context="cache",
+        workflow_name="main",
+        step_name="c_transform",
+    )
+    reused_b = c_plan.reused_outputs[0]
+    supplied_path = os.path.relpath(
+        reused_b.source_path,
+        c_plan.run_workspace,
+    ).replace(os.sep, "/")
+    monkeypatch.setattr(
+        execution_module,
+        "_DIRECT_REUSED_INPUT_CALLABLE_REFS",
+        frozenset({"cache_runtime:step_c_file"}),
+    )
+    monkeypatch.setattr(
+        "nipact.execution.shutil.copy2",
+        lambda *_args, **_kwargs: pytest.fail("direct delivery copied reused bytes"),
+    )
+
+    assert execute_run_plan(c_plan, cores=1).all_selected_resolved
+
+    payload = json.loads(
+        (c_plan.run_workspace / "run_plan.json").read_text(encoding="utf-8")
+    )
+    c_job = _workflow_input_job(c_plan, step_name="c_transform")
+    assert payload["prepared_reused_inputs"] == [
+        {
+            "artifact_id": reused_b.source_artifact_id,
+            "bound_occurrence_path": reused_b.source_path_relative,
+            "supplied_path": supplied_path,
+        }
+    ]
+    assert payload["jobs"][c_job.job_id]["inputs"]["b_input"] == [supplied_path]
+    assert json.dumps(supplied_path) in (
+        c_plan.run_workspace / "Snakefile"
+    ).read_text(encoding="utf-8")
+    assert not reused_b.staging_path.exists()
+
+    c_artifact_id = _selected_artifact_id(
+        runtime_dir,
+        step_name="c_transform",
+        output_name="c_out",
+        address="sub_001",
+    )
+    with sqlite3.connect(runtime_dir / "database/registry.db") as conn:
+        assert conn.execute(
+            """
+            SELECT source_artifact_id, input_path
+            FROM artifact_dependencies
+            WHERE dependent_artifact_id = ?
+            """,
+            (c_artifact_id,),
+        ).fetchone() == (reused_b.source_artifact_id, supplied_path)
+
+
+def test_direct_delivery_requires_exact_callable_reference(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project_dir, _runtime_dir, _log_path = _write_cache_project(tmp_path, monkeypatch)
+    b_plan = build_run_plan(
+        project_dir=project_dir,
+        context="cache",
+        workflow_name="main",
+        step_name="b_transform",
+    )
+    assert execute_run_plan(b_plan, cores=1).all_selected_resolved
+    c_plan = build_run_plan(
+        project_dir=project_dir,
+        context="cache",
+        workflow_name="main",
+        step_name="c_transform",
+    )
+    monkeypatch.setattr(
+        execution_module,
+        "_DIRECT_REUSED_INPUT_CALLABLE_REFS",
+        frozenset({"cache_runtime:step_c"}),
+    )
+
+    prepared = execution_module._prepare_reused_inputs(c_plan.forecast)
+
+    assert len(prepared.inputs) == 1
+    assert prepared.inputs[0].supplied_path == c_plan.reused_outputs[0].staging_path
+    assert prepared.inputs[0].supplied_path.is_file()
+
+
+@pytest.mark.parametrize(
+    ("direct_callable_refs", "expected_direct"),
+    [
+        (
+            frozenset(
+                {
+                    "cache_runtime:step_fit_file",
+                    "cache_runtime:step_apply_file",
+                }
+            ),
+            True,
+        ),
+        (frozenset({"cache_runtime:step_apply_file"}), False),
+    ],
+)
+def test_reused_occurrence_disposition_covers_every_reachable_consumer(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    direct_callable_refs: frozenset[str],
+    expected_direct: bool,
+) -> None:
+    project_dir, _runtime_dir, _log_path = _write_cache_project(
+        tmp_path,
+        monkeypatch,
+        entities=("sub_001",),
+    )
+    _write_sibling_workflow(
+        project_dir,
+        workflow_name="apply_flow",
+        step_names=["a_source", "b_transform", "fit_transform", "apply_transform"],
+    )
+    b_plan = build_run_plan(
+        project_dir=project_dir,
+        context="cache",
+        workflow_name="apply_flow",
+        step_name="b_transform",
+    )
+    assert execute_run_plan(b_plan, cores=1).all_selected_resolved
+    apply_plan = build_run_plan(
+        project_dir=project_dir,
+        context="cache",
+        workflow_name="apply_flow",
+        step_name="apply_transform",
+    )
+    assert len(apply_plan.reused_outputs) == 1
+    reused_b = apply_plan.reused_outputs[0]
+    assert execution_module._reused_input_consumers(apply_plan.forecast) == {
+        reused_b.source_artifact_id: frozenset(
+            {
+                "cache_runtime:step_fit_file",
+                "cache_runtime:step_apply_file",
+            }
+        )
+    }
+    monkeypatch.setattr(
+        execution_module,
+        "_DIRECT_REUSED_INPUT_CALLABLE_REFS",
+        direct_callable_refs,
+    )
+    real_copy = execution_module.shutil.copy2
+    copy_calls: list[tuple[Path, Path]] = []
+
+    def record_copy(source: Path, destination: Path) -> Path:
+        copy_calls.append((Path(source), Path(destination)))
+        return Path(real_copy(source, destination))
+
+    monkeypatch.setattr("nipact.execution.shutil.copy2", record_copy)
+    real_digest = execution_module._sha256_open_file
+    canonical_hashes: list[Path] = []
+
+    def record_digest(handle: object) -> str:
+        canonical_hashes.append(Path(handle.name).resolve())  # type: ignore[attr-defined]
+        return real_digest(handle)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(execution_module, "_sha256_open_file", record_digest)
+
+    prepared = execution_module._prepare_reused_inputs(apply_plan.forecast)
+
+    assert canonical_hashes == [reused_b.source_path.resolve()]
+    assert len(prepared.inputs) == 1
+    if expected_direct:
+        assert copy_calls == []
+        assert prepared.inputs[0].supplied_path == reused_b.source_path
+    else:
+        assert copy_calls == [(reused_b.source_path, reused_b.staging_path)]
+        assert prepared.inputs[0].supplied_path == reused_b.staging_path
+
+
 def test_cross_target_dry_run_maps_reused_upstream_without_copying(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
