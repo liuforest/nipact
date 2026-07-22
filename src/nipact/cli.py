@@ -380,7 +380,7 @@ def _run_workflow_command(args: argparse.Namespace) -> int | None:
             feedback.key_value(
                 "note",
                 "Dry run: reused registered artifacts are referenced at their "
-                "validated registered paths; no reused-input preparation, "
+                "metadata-checked registered paths; no reused-input preparation, "
                 "publication, or registry update occurs. Explicit recomputation "
                 "is not available in this release.",
             )

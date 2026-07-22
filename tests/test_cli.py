@@ -502,6 +502,7 @@ def test_workflow_run_dry_run_reports_mode_aware_summary(
     # Dry mode suppresses fields that describe the executable staging area.
     assert "existing_staged_outputs" not in summary
     assert summary["note"].startswith("Dry run:")
+    assert "metadata-checked registered paths" in summary["note"]
     assert (
         "no reused-input preparation, publication, or registry update occurs"
         in summary["note"]
