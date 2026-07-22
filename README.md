@@ -149,7 +149,8 @@ nipact gui \
 - A targeted run becomes the latest run for its step/output scope while keeping the original full source-population manifest binding; the published-output table remains a composite of coordinates from multiple runs, not proof of a complete cohort sweep.
 - Concurrent invocations for the same workflow, step, output, and address are unsupported.
 
+Successful workflow outputs are stored under the canonical `runtime/outputs/v1/` layout. Their executable-workspace staging files are temporary and are normally removed after the registry transaction commits, so a recorded `staging_path` is historical and may no longer exist. Real-run summaries report `published_outputs` and `published_bytes`; accepted artifact identity and reuse come from the canonical path and registry facts, not continued staging-file presence.
+
 `trace` and `gui` read `runtime/database/registry.db`. The GUI binds to `127.0.0.1` and serves a local browser view for current workflows, manifests, artifacts, workflow topology, and focused artifact lineage.
 
 The gui is for viewing only, not to execute workflows, registry rows, etc.
-

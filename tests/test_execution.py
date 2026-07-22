@@ -1994,8 +1994,8 @@ def test_multi_output_partial_sibling_prunes_orphan_child(
     outcome = execute_run_plan(run_plan, cores=1)
     assert outcome.published_count == 3
     assert outcome.all_selected_resolved is False
-    # source_text/sub_002 skips on the missing sibling; qc_echo/sub_002 published
-    # then prunes because its fresh parent did not.
+    # source_text/sub_002 skips on the missing sibling; qc_echo/sub_002 is pruned
+    # before materialization because its fresh parent did not prepare.
     assert outcome.failed_jobs == (
         ("qc_echo", "sub_002", "upstream not published"),
         ("source_text", "sub_002", "missing staged output"),
@@ -2540,6 +2540,75 @@ def test_stale_completion_receipts_cannot_publish_current_outputs(
     assert outcome.failed_jobs == (
         ("source_text", "sub_001", "invalid completion receipt"),
         ("uppercase_text", "sub_001", "invalid completion receipt"),
+    )
+    with sqlite3.connect(runtime_dir / "database/registry.db") as conn:
+        assert conn.execute("SELECT COUNT(*) FROM published_outputs").fetchone()[0] == 0
+
+
+@pytest.mark.parametrize(
+    "receipt_override",
+    (
+        {"job_id": "different_job"},
+        {"request_bundle_digest": "f" * 64},
+        {"outputs": ("raw_qc",)},
+        {"outputs": ("raw_qc", "raw_text", "unexpected")},
+    ),
+    ids=("job-id", "request-digest", "missing-sibling", "extra-sibling"),
+)
+def test_completion_receipt_must_match_exact_frozen_job_contract(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    receipt_override: dict[str, object],
+) -> None:
+    project_dir, runtime_dir = _write_tiny_multi_output_project(tmp_path, monkeypatch)
+    run_plan = build_run_plan(
+        project_dir=project_dir,
+        context="multi",
+        workflow_name="import_raw",
+        step_name="source_text",
+        address="sub_001",
+    )
+
+    def write_outputs_with_mismatched_receipt(
+        executable_plan: object,
+        *_args: object,
+        **_kwargs: object,
+    ) -> int:
+        payload = json.loads(
+            (executable_plan.run_workspace / "run_plan.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        assert len(executable_plan.jobs) == 1
+        job = executable_plan.jobs[0]
+        for output in job.outputs.values():
+            output.staging_path.parent.mkdir(parents=True, exist_ok=True)
+            output.staging_path.write_text("current bytes\n", encoding="utf-8")
+        job_payload = payload["jobs"][job.job_id]
+        receipt_fields: dict[str, object] = {
+            "invocation_token": payload["invocation_token"],
+            "job_id": job.job_id,
+            "request_bundle_digest": job_payload["request_bundle_digest"],
+            "outputs": tuple(job_payload["declared_outputs"]),
+        }
+        receipt_fields.update(receipt_override)
+        write_completion_receipt_atomic(
+            executable_plan.run_workspace / job_payload["completion_receipt_path"],
+            CompletionReceipt(**receipt_fields),
+        )
+        return 0
+
+    monkeypatch.setattr(
+        "nipact.execution._run_snakemake",
+        write_outputs_with_mismatched_receipt,
+    )
+
+    outcome = execute_run_plan(run_plan, cores=1)
+
+    assert outcome.published_count == 0
+    assert not outcome.all_selected_resolved
+    assert outcome.failed_jobs == (
+        ("source_text", "sub_001", "invalid completion receipt"),
     )
     with sqlite3.connect(runtime_dir / "database/registry.db") as conn:
         assert conn.execute("SELECT COUNT(*) FROM published_outputs").fetchone()[0] == 0
