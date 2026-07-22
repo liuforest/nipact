@@ -31,6 +31,7 @@ def _write_runtime_plan(
         "schema_version": RUN_PLAN_SCHEMA_VERSION,
         "invocation_token": invocation_token,
         "runtime_root": str(tmp_path),
+        "prepared_reused_inputs": [],
         "jobs": {
             job_id: {
                 "step_name": "step",
@@ -114,6 +115,159 @@ def test_runtime_rejects_nonexecutable_forecast_plan(
     )
 
     with pytest.raises(RuntimeError, match="no executable invocation token"):
+        runtime_module.run_job(run_plan_path=run_plan_path, job_id=job_id)
+
+
+def test_runtime_rejects_run_plan_schema_v1(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_plan_path, job_id = _write_runtime_plan(tmp_path)
+    payload = json.loads(run_plan_path.read_text(encoding="utf-8"))
+    payload["schema_version"] = 1
+    run_plan_path.write_text(json.dumps(payload), encoding="utf-8")
+    monkeypatch.setattr(
+        runtime_module,
+        "_load_callable",
+        lambda _ref: pytest.fail("callable must not be loaded"),
+    )
+
+    with pytest.raises(RuntimeError, match="unsupported run-plan schema version"):
+        runtime_module.run_job(run_plan_path=run_plan_path, job_id=job_id)
+
+
+@pytest.mark.parametrize("delivery", ["copied", "direct"])
+def test_runtime_resolves_prepared_reused_input(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    delivery: str,
+) -> None:
+    run_plan_path, job_id = _write_runtime_plan(tmp_path)
+    canonical = tmp_path / "outputs/v1/cache/upstream/sub_001/request/out/value.json"
+    canonical.parent.mkdir(parents=True)
+    canonical.write_text("upstream\n", encoding="utf-8")
+    if delivery == "copied":
+        supplied = "staging/upstream/out/sub_001.json"
+        supplied_path = run_plan_path.parent / supplied
+        supplied_path.parent.mkdir(parents=True)
+        supplied_path.write_text("upstream\n", encoding="utf-8")
+    else:
+        supplied_path = canonical
+        supplied = "../outputs/v1/cache/upstream/sub_001/request/out/value.json"
+
+    payload = json.loads(run_plan_path.read_text(encoding="utf-8"))
+    payload["prepared_reused_inputs"] = [
+        {
+            "artifact_id": 7,
+            "bound_occurrence_path": canonical.relative_to(tmp_path).as_posix(),
+            "supplied_path": supplied,
+        }
+    ]
+    job = payload["jobs"][job_id]
+    job["inputs"] = {"upstream": [supplied]}
+    job["input_records"] = [
+        {
+            "binding_name": "upstream",
+            "input_path": supplied,
+            "origin": "workflow_output",
+            "registry_source_artifact_id": 7,
+        }
+    ]
+    run_plan_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    def callable_obj(*, inputs, outputs, params, address):
+        assert inputs == {"upstream": (supplied_path.resolve(),)}
+        outputs["result"].write_text("complete\n", encoding="utf-8")
+
+    monkeypatch.setattr(runtime_module, "_load_callable", lambda _ref: callable_obj)
+
+    runtime_module.run_job(run_plan_path=run_plan_path, job_id=job_id)
+
+
+@pytest.mark.parametrize("failure", ["missing_authority", "wrong_canonical_path"])
+def test_runtime_rejects_mismatched_prepared_reuse(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+) -> None:
+    run_plan_path, job_id = _write_runtime_plan(tmp_path)
+    canonical = tmp_path / "outputs/v1/cache/upstream/sub_001/request/out/value.json"
+    other = tmp_path / "outputs/v1/cache/upstream/sub_001/other/out/value.json"
+    canonical.parent.mkdir(parents=True)
+    other.parent.mkdir(parents=True)
+    canonical.write_text("expected\n", encoding="utf-8")
+    other.write_text("other\n", encoding="utf-8")
+    supplied = "../outputs/v1/cache/upstream/sub_001/other/out/value.json"
+
+    payload = json.loads(run_plan_path.read_text(encoding="utf-8"))
+    if failure == "wrong_canonical_path":
+        payload["prepared_reused_inputs"] = [
+            {
+                "artifact_id": 7,
+                "bound_occurrence_path": canonical.relative_to(tmp_path).as_posix(),
+                "supplied_path": supplied,
+            }
+        ]
+    job = payload["jobs"][job_id]
+    job["inputs"] = {"upstream": [supplied]}
+    job["input_records"] = [
+        {
+            "binding_name": "upstream",
+            "input_path": supplied,
+            "origin": "workflow_output",
+            "registry_source_artifact_id": 7,
+        }
+    ]
+    run_plan_path.write_text(json.dumps(payload), encoding="utf-8")
+    monkeypatch.setattr(
+        runtime_module,
+        "_load_callable",
+        lambda _ref: pytest.fail("callable must not be loaded"),
+    )
+
+    expected = (
+        "exactly cover reused workflow inputs"
+        if failure == "missing_authority"
+        else "does not match its bound canonical occurrence"
+    )
+    with pytest.raises(RuntimeError, match=expected):
+        runtime_module.run_job(run_plan_path=run_plan_path, job_id=job_id)
+
+
+def test_runtime_rejects_duplicate_input_binding_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_plan_path, job_id = _write_runtime_plan(tmp_path)
+    input_path = run_plan_path.parent / "staging/upstream/out/sub_001.json"
+    input_path.parent.mkdir(parents=True)
+    input_path.write_text("upstream\n", encoding="utf-8")
+    relative = "staging/upstream/out/sub_001.json"
+    payload = json.loads(run_plan_path.read_text(encoding="utf-8"))
+    job = payload["jobs"][job_id]
+    job["inputs"] = {"upstream": [relative, relative]}
+    job["input_records"] = [
+        {
+            "binding_name": "upstream",
+            "input_path": relative,
+            "origin": "workflow_output",
+            "registry_source_artifact_id": None,
+        },
+        {
+            "binding_name": "upstream",
+            "input_path": relative,
+            "origin": "workflow_output",
+            "registry_source_artifact_id": None,
+        },
+    ]
+    run_plan_path.write_text(json.dumps(payload), encoding="utf-8")
+    monkeypatch.setattr(
+        runtime_module,
+        "_load_callable",
+        lambda _ref: pytest.fail("callable must not be loaded"),
+    )
+
+    with pytest.raises(RuntimeError, match="duplicate input path"):
         runtime_module.run_job(run_plan_path=run_plan_path, job_id=job_id)
 
 

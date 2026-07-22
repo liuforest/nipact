@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 from collections import Counter
+from dataclasses import dataclass
 from importlib import import_module
 from pathlib import Path
 from typing import Any, Callable
@@ -21,6 +22,13 @@ JobCallable = Callable[
     [dict[str, tuple[Path, ...]], dict[str, Path], dict[str, Any], str],
     None,
 ]
+
+
+@dataclass(frozen=True)
+class _PreparedReusedInputAuthority:
+    artifact_id: int
+    bound_occurrence: Path
+    supplied_path: str
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -56,13 +64,20 @@ def run_job(*, run_plan_path: Path, job_id: str) -> None:
         raise RuntimeError(f"unknown runtime job: {job_id}")
 
     output_paths = _resolve_outputs(job, run_workspace=run_workspace)
+    prepared_reused_inputs = _prepared_reused_input_authorities(
+        run_plan,
+        runtime_root=runtime_root,
+        run_workspace=run_workspace,
+    )
+    input_paths = _resolve_inputs(
+        job,
+        run_workspace=run_workspace,
+        runtime_root=runtime_root,
+        prepared_reused_inputs=prepared_reused_inputs,
+    )
     callable_obj = _load_callable(_required_string(job, "callable_ref"))
     callable_obj(
-        inputs=_resolve_inputs(
-            job,
-            run_workspace=run_workspace,
-            runtime_root=runtime_root,
-        ),
+        inputs=input_paths,
         outputs=output_paths,
         params=dict(_required_mapping(job, "params")),
         address=_required_string(job, "address"),
@@ -127,6 +142,7 @@ def _resolve_inputs(
     *,
     run_workspace: Path,
     runtime_root: Path,
+    prepared_reused_inputs: dict[int, _PreparedReusedInputAuthority],
 ) -> dict[str, tuple[Path, ...]]:
     raw_inputs = _required_mapping(job, "inputs")
     records = _input_records(job)
@@ -142,6 +158,10 @@ def _resolve_inputs(
         ):
             raise RuntimeError(f"job input {raw_name!r} must be a non-empty path list")
         paths = tuple(raw_paths)
+        if len(paths) != len(set(paths)):
+            raise RuntimeError(
+                f"job input {raw_name!r} contains a duplicate input path"
+            )
         raw_paths_by_binding[raw_name] = paths
         expected_pairs.update((raw_name, path) for path in paths)
 
@@ -151,6 +171,8 @@ def _resolve_inputs(
         binding_name = _required_string(record, "binding_name")
         input_path = _required_string(record, "input_path")
         pair = (binding_name, input_path)
+        if pair in records_by_pair:
+            raise RuntimeError("job input_records contain a duplicate input binding")
         actual_pairs[pair] += 1
         records_by_pair[pair] = record
     if actual_pairs != expected_pairs:
@@ -164,6 +186,7 @@ def _resolve_inputs(
                 input_path,
                 run_workspace=run_workspace,
                 runtime_root=runtime_root,
+                prepared_reused_inputs=prepared_reused_inputs,
             )
             for input_path in input_paths
         )
@@ -176,6 +199,7 @@ def _resolve_input_path(
     *,
     run_workspace: Path,
     runtime_root: Path,
+    prepared_reused_inputs: dict[int, _PreparedReusedInputAuthority],
 ) -> Path:
     origin = _required_string(record, "origin")
     if origin == "source":
@@ -199,6 +223,31 @@ def _resolve_input_path(
         return resolved_input
 
     if origin == "workflow_output":
+        artifact_id = record.get("registry_source_artifact_id")
+        if artifact_id is not None:
+            if (
+                not isinstance(artifact_id, int)
+                or isinstance(artifact_id, bool)
+                or artifact_id <= 0
+            ):
+                raise RuntimeError(
+                    "reused workflow input artifact ID must be a positive integer"
+                )
+            try:
+                prepared = prepared_reused_inputs[artifact_id]
+            except KeyError as exc:
+                raise RuntimeError(
+                    "reused workflow input has no prepared input authority"
+                ) from exc
+            if input_path != prepared.supplied_path:
+                raise RuntimeError(
+                    "reused workflow input path does not match prepared authority"
+                )
+            return _resolve_prepared_reused_input(
+                prepared,
+                run_workspace=run_workspace,
+            )
+
         resolved_input = _resolve_relative_under(
             base=run_workspace,
             relative_path=input_path,
@@ -210,6 +259,104 @@ def _resolve_input_path(
         return resolved_input
 
     raise RuntimeError(f"unsupported input origin: {origin}")
+
+
+def _prepared_reused_input_authorities(
+    run_plan: dict[str, Any],
+    *,
+    runtime_root: Path,
+    run_workspace: Path,
+) -> dict[int, _PreparedReusedInputAuthority]:
+    raw_entries = run_plan.get("prepared_reused_inputs")
+    if not isinstance(raw_entries, list):
+        raise RuntimeError("prepared_reused_inputs must be a list")
+
+    prepared: dict[int, _PreparedReusedInputAuthority] = {}
+    for raw_entry in raw_entries:
+        if not isinstance(raw_entry, dict) or set(raw_entry) != {
+            "artifact_id",
+            "bound_occurrence_path",
+            "supplied_path",
+        }:
+            raise RuntimeError("prepared reused-input fields are invalid")
+        artifact_id = raw_entry.get("artifact_id")
+        if (
+            not isinstance(artifact_id, int)
+            or isinstance(artifact_id, bool)
+            or artifact_id <= 0
+        ):
+            raise RuntimeError("prepared reused-input artifact ID is invalid")
+        if artifact_id in prepared:
+            raise RuntimeError("prepared reused-input artifact IDs must be unique")
+        bound_occurrence_path = _required_string(
+            raw_entry,
+            "bound_occurrence_path",
+        )
+        bound_occurrence = _resolve_relative_under(
+            base=runtime_root,
+            relative_path=bound_occurrence_path,
+            allowed_root=runtime_root / "outputs" / "v1",
+            label="bound reused occurrence",
+        )
+        supplied_path = _required_string(raw_entry, "supplied_path")
+        prepared[artifact_id] = _PreparedReusedInputAuthority(
+            artifact_id=artifact_id,
+            bound_occurrence=bound_occurrence,
+            supplied_path=supplied_path,
+        )
+
+    jobs = _required_mapping(run_plan, "jobs")
+    referenced_ids: set[int] = set()
+    for raw_job in jobs.values():
+        if not isinstance(raw_job, dict):
+            raise RuntimeError("run plan jobs must be objects")
+        for record in _input_records(raw_job):
+            if record.get("origin") != "workflow_output":
+                continue
+            artifact_id = record.get("registry_source_artifact_id")
+            if artifact_id is None:
+                continue
+            if (
+                not isinstance(artifact_id, int)
+                or isinstance(artifact_id, bool)
+                or artifact_id <= 0
+            ):
+                raise RuntimeError(
+                    "reused workflow input artifact ID must be a positive integer"
+                )
+            referenced_ids.add(artifact_id)
+    if referenced_ids != set(prepared):
+        raise RuntimeError(
+            "prepared reused inputs must exactly cover reused workflow inputs"
+        )
+    return prepared
+
+
+def _resolve_prepared_reused_input(
+    prepared: _PreparedReusedInputAuthority,
+    *,
+    run_workspace: Path,
+) -> Path:
+    if "\\" in prepared.supplied_path:
+        raise RuntimeError("reused workflow input must use POSIX path separators")
+    relative_path = Path(prepared.supplied_path)
+    if relative_path.is_absolute():
+        raise RuntimeError("reused workflow input must be a run-plan-relative path")
+    lexical_path = run_workspace / relative_path
+    if lexical_path.is_symlink():
+        raise RuntimeError("reused workflow input must not be a symlink")
+    resolved_input = lexical_path.resolve()
+    staging_root = (run_workspace / "staging").resolve()
+    if resolved_input != prepared.bound_occurrence and not _path_contains_or_same(
+        staging_root,
+        resolved_input,
+    ):
+        raise RuntimeError(
+            "reused workflow input does not match its bound canonical occurrence"
+        )
+    if not resolved_input.is_file():
+        raise RuntimeError(f"missing reused workflow input: {prepared.supplied_path}")
+    return resolved_input
 
 
 def _resolve_relative_under(

@@ -1474,6 +1474,13 @@ def test_cross_target_run_plan_reuses_upstream_from_registry(
         for record in c_job_payload["input_records"]
         if record["binding_name"] == "b_input"
     )["input_path"] == "staging/b_transform/b_out/sub_001.json"
+    assert execution_payload["prepared_reused_inputs"] == [
+        {
+            "artifact_id": c_plan.reused_outputs[0].source_artifact_id,
+            "bound_occurrence_path": registered_b_path,
+            "supplied_path": "staging/b_transform/b_out/sub_001.json",
+        }
+    ]
     assert (
         c_plan.run_workspace / c_job_payload["completion_receipt_path"]
     ).is_file()
@@ -1509,6 +1516,15 @@ def test_cross_target_run_plan_reuses_upstream_from_registry(
     assert _dependency_source_ids(runtime_dir, dependent_artifact_id=c_artifact_id) == [
         c_plan.reused_outputs[0].source_artifact_id
     ]
+    with sqlite3.connect(runtime_dir / "database/registry.db") as conn:
+        assert conn.execute(
+            """
+            SELECT input_path
+            FROM artifact_dependencies
+            WHERE dependent_artifact_id = ? AND source_artifact_id = ?
+            """,
+            (c_artifact_id, c_plan.reused_outputs[0].source_artifact_id),
+        ).fetchone() == ("staging/b_transform/b_out/sub_001.json",)
 
 
 def test_cross_target_dry_run_maps_reused_upstream_without_copying(
@@ -1574,15 +1590,8 @@ def test_cross_target_dry_run_maps_reused_upstream_without_copying(
     )["input_path"] == mapped_b
     assert json.dumps(mapped_b) in snakefile_text
     assert "staging/b_transform/b_out/sub_001.json" not in snakefile_text
-    # The serialized staging contract is unchanged: only the generated
-    # Snakefile maps reused inputs to registered sources.
-    run_plan_payload = json.loads(
-        (c_plan.run_workspace / "run_plan.json").read_text(encoding="utf-8")
-    )
-    assert run_plan_payload["reused_outputs"][0]["staging_path"] == (
-        "staging/b_transform/b_out/sub_001.json"
-    )
-    assert run_plan_payload["reused_outputs"][0]["source_path"] == registered_b_path
+    # Dry-run path substitutions are forecasts, not prepared input authority.
+    assert dry_payload["prepared_reused_inputs"] == []
     assert log_path.read_text(encoding="utf-8").splitlines() == ["B sub_001"]
     assert _registry_row_counts(runtime_dir) == counts_before
     outputs_after = {
@@ -1646,6 +1655,10 @@ def test_real_cli_reports_selected_reuse_without_snakemake(
     assert "Starting Snakemake..." not in lines
     assert "Publishing outputs..." not in lines
     assert log_path.read_text(encoding="utf-8") == log_before
+    reuse_only_payload = json.loads(
+        (initial_plan.run_workspace / "run_plan.json").read_text(encoding="utf-8")
+    )
+    assert reuse_only_payload["prepared_reused_inputs"] == []
 
 
 def test_dry_run_cli_reports_reuse_without_hydration(
@@ -3116,18 +3129,11 @@ def test_derivative_reuses_compatible_base_ancestor_artifact(
         (derivative_c_plan.run_workspace / "run_plan.json").read_text(encoding="utf-8")
     )
     assert run_plan_payload["base_workflow"] == "main"
-    assert run_plan_payload["reused_outputs"] == [
+    assert run_plan_payload["prepared_reused_inputs"] == [
         {
-            "step_name": "b_transform",
-            "output_name": "b_out",
-            "address": "sub_001",
-            "staging_path": "staging/b_transform/b_out/sub_001.json",
-            "source_path": registered_b_path,
-            "source_artifact_id": main_b_artifact_id,
-            "source_workflow_name": "main",
-            "source_run_id": main_b_run_id,
-            "content_digest": registered_b_digest,
-            "file_size": (runtime_dir / registered_b_path).stat().st_size,
+            "artifact_id": main_b_artifact_id,
+            "bound_occurrence_path": registered_b_path,
+            "supplied_path": "staging/b_transform/b_out/sub_001.json",
         }
     ]
     assert log_path.read_text(encoding="utf-8").splitlines() == ["B sub_001"]
@@ -4382,7 +4388,13 @@ def test_targeted_run_excludes_reuse_needed_only_by_unreachable_jobs(
     payload = json.loads(
         (c_plan.run_workspace / "run_plan.json").read_text(encoding="utf-8")
     )
-    assert [entry["address"] for entry in payload["reused_outputs"]] == ["sub_001"]
+    assert payload["prepared_reused_inputs"] == [
+        {
+            "artifact_id": c_plan.reused_outputs[0].source_artifact_id,
+            "bound_occurrence_path": c_plan.reused_outputs[0].source_path_relative,
+            "supplied_path": "staging/b_transform/b_out/sub_001.json",
+        }
+    ]
     staging = c_plan.run_workspace / "staging"
     assert (staging / "b_transform/b_out/sub_001.json").is_file()
     assert not (staging / "b_transform/b_out/sub_002.json").exists()

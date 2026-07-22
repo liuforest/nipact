@@ -764,6 +764,7 @@ def _execute_executable_run_plan(
             _write_run_workspace(
                 run_plan,
                 invocation_token=invocation_token,
+                prepared_reused_inputs=prepared_reused_inputs,
             )
             _remove_expected_staged_outputs(run_plan)
             _remove_expected_completion_receipts(run_plan)
@@ -822,6 +823,7 @@ def _execute_executable_run_plan(
         run_plan,
         published_results=published_results,
         actual_reused_artifacts=actual_reused_artifacts,
+        prepared_reused_inputs=prepared_reused_inputs,
     )
     projection_recipes = _retained_projection_recipes(
         run_plan,
@@ -1312,6 +1314,7 @@ def _write_run_workspace(
     *,
     invocation_token: str | None,
     supplied_input_paths: dict[str, str] | None = None,
+    prepared_reused_inputs: _PreparedReusedInputs | None = None,
 ) -> None:
     (run_plan.run_workspace / "staging").mkdir(exist_ok=True)
     (run_plan.run_workspace / "logs").mkdir(exist_ok=True)
@@ -1319,6 +1322,7 @@ def _write_run_workspace(
         run_plan,
         invocation_token=invocation_token,
         supplied_input_paths=supplied_input_paths,
+        prepared_reused_inputs=prepared_reused_inputs,
     )
     try:
         write_json_atomic(run_plan.run_workspace / "run_plan.json", payload)
@@ -1818,8 +1822,17 @@ def _run_plan_payload(
     *,
     invocation_token: str | None = None,
     supplied_input_paths: dict[str, str] | None = None,
+    prepared_reused_inputs: _PreparedReusedInputs | None = None,
 ) -> dict[str, Any]:
-    path_substitutions = supplied_input_paths or {}
+    if supplied_input_paths is not None and prepared_reused_inputs is not None:
+        raise ValidationError(
+            "run plan cannot combine forecast and prepared reused-input paths"
+        )
+    prepared_payload, prepared_paths = _prepared_reused_input_payload(
+        run_plan,
+        prepared_reused_inputs,
+    )
+    path_substitutions = supplied_input_paths or prepared_paths
     return {
         "schema_version": RUN_PLAN_SCHEMA_VERSION,
         "invocation_token": invocation_token,
@@ -1837,6 +1850,7 @@ def _run_plan_payload(
             _manifest_binding_payload(binding)
             for binding in run_plan.manifest_bindings
         ],
+        "prepared_reused_inputs": prepared_payload,
         "jobs": {
             job.job_id: {
                 "step_name": job.step_name,
@@ -1922,22 +1936,62 @@ def _run_plan_payload(
                 key=lambda value: (value.step_name, value.output_name, value.address),
             )
         ],
-        "reused_outputs": [
-            {
-                "step_name": output_ref.step_name,
-                "output_name": output_ref.output_name,
-                "address": output_ref.address,
-                "staging_path": output_ref.staging_path_relative,
-                "source_path": output_ref.source_path_relative,
-                "source_artifact_id": output_ref.source_artifact_id,
-                "source_workflow_name": output_ref.source_workflow_name,
-                "source_run_id": output_ref.source_run_id,
-                "content_digest": output_ref.content_digest,
-                "file_size": output_ref.file_size,
-            }
-            for output_ref in run_plan.reused_outputs
-        ],
     }
+
+
+def _prepared_reused_input_payload(
+    run_plan: ExecutableRunPlan,
+    prepared_reused_inputs: _PreparedReusedInputs | None,
+) -> tuple[list[dict[str, Any]], dict[str, str]]:
+    if prepared_reused_inputs is None:
+        return [], {}
+
+    expected = {ref.source_artifact_id: ref for ref in run_plan.reused_outputs}
+    if len(expected) != len(run_plan.reused_outputs):
+        raise ValidationError("reused run inputs contain duplicate artifact IDs")
+
+    prepared_by_artifact: dict[int, _PreparedReusedInput] = {}
+    for prepared in prepared_reused_inputs.inputs:
+        artifact_id = prepared.candidate.artifact_id
+        if artifact_id in prepared_by_artifact:
+            raise ValidationError("prepared reused inputs contain duplicate artifact IDs")
+        output_ref = expected.get(artifact_id)
+        if output_ref is None or output_ref != prepared.output_ref:
+            raise ValidationError("prepared reused input does not match the executable plan")
+        if prepared_reused_inputs.candidates.get(artifact_id) != prepared.candidate:
+            raise ValidationError("prepared reused input candidate is inconsistent")
+        expected_bound = run_plan.runtime_root / prepared.candidate.path
+        if prepared.bound_occurrence_path != expected_bound:
+            raise ValidationError("prepared reused input occurrence is inconsistent")
+        prepared_by_artifact[artifact_id] = prepared
+
+    if set(prepared_by_artifact) != set(expected):
+        raise ValidationError("prepared reused inputs do not cover executable reuse")
+
+    payload: list[dict[str, Any]] = []
+    substitutions: dict[str, str] = {}
+    for artifact_id, prepared in sorted(prepared_by_artifact.items()):
+        supplied_path = os.path.relpath(
+            prepared.supplied_path,
+            run_plan.run_workspace,
+        ).replace(os.sep, "/")
+        prior = substitutions.setdefault(
+            prepared.output_ref.staging_path_relative,
+            supplied_path,
+        )
+        if prior != supplied_path:
+            raise ValidationError("prepared reused input locator is inconsistent")
+        payload.append(
+            {
+                "artifact_id": artifact_id,
+                "bound_occurrence_path": _runtime_relative_path(
+                    run_plan.runtime_root,
+                    prepared.bound_occurrence_path,
+                ),
+                "supplied_path": supplied_path,
+            }
+        )
+    return payload, substitutions
 
 
 def _execution_population_payload(
@@ -2010,6 +2064,7 @@ def _workflow_output_artifact_rows(
     *,
     published_results: tuple[_MaterializedOutputResult, ...],
     actual_reused_artifacts: dict[int, ReusableArtifactCandidate],
+    prepared_reused_inputs: _PreparedReusedInputs,
 ) -> tuple[WorkflowOutputArtifactRow, ...]:
     published_by_key = {
         (result.row.step_name, result.row.output_name, result.row.address): result
@@ -2059,7 +2114,12 @@ def _workflow_output_artifact_rows(
                     is_selected_output=key in selected_output_keys,
                     is_published=True,
                     input_records=tuple(
-                        _actual_input_record(record, actual_reused_artifacts)
+                        _actual_input_record(
+                            record,
+                            actual_reused_artifacts,
+                            prepared_reused_inputs,
+                            run_workspace=run_plan.run_workspace,
+                        )
                         for record in output_ref.input_records
                     ),
                 )
@@ -2070,9 +2130,19 @@ def _workflow_output_artifact_rows(
 def _actual_input_record(
     record: ArtifactInputRow,
     actual_reused_artifacts: dict[int, ReusableArtifactCandidate],
+    prepared_reused_inputs: _PreparedReusedInputs,
+    *,
+    run_workspace: Path,
+    apply_supplied_locator: bool = True,
 ) -> ArtifactInputRow:
     nested = tuple(
-        _actual_input_record(source_record, actual_reused_artifacts)
+        _actual_input_record(
+            source_record,
+            actual_reused_artifacts,
+            prepared_reused_inputs,
+            run_workspace=run_workspace,
+            apply_supplied_locator=False,
+        )
         for source_record in record.source_input_records
     )
     artifact_id = record.registry_source_artifact_id
@@ -2083,8 +2153,29 @@ def _actual_input_record(
         raise ValidationError(
             "executed run is missing a frozen reused artifact dependency"
         )
+    input_path = record.input_path
+    if apply_supplied_locator:
+        matching = tuple(
+            prepared
+            for prepared in prepared_reused_inputs.inputs
+            if prepared.candidate.artifact_id == artifact_id
+        )
+        if len(matching) != 1:
+            raise ValidationError(
+                "executed run is missing its prepared reused-input locator"
+            )
+        prepared = matching[0]
+        if record.input_path != prepared.output_ref.staging_path_relative:
+            raise ValidationError(
+                "prepared reused-input locator does not match its input record"
+            )
+        input_path = os.path.relpath(
+            prepared.supplied_path,
+            run_workspace,
+        ).replace(os.sep, "/")
     return replace(
         record,
+        input_path=input_path,
         registry_source_artifact_id=candidate.artifact_id,
         source_extension=candidate.extension,
         source_input_records=nested,
