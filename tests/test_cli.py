@@ -334,7 +334,7 @@ def test_workflow_run_command_executes_step(
         "selected_outputs=1",
     ]
     # These values describe planner decisions before Snakemake runs. In the
-    # fresh demo path nothing is hydrated, but the scheduled job count still
+    # fresh demo path nothing is reused, but the scheduled job count still
     # matters because it tells the user how much work the concrete DAG contains.
     assert output[10] == "planned_selected_fresh_outputs=1"
     assert output[11] == "planned_selected_reused_outputs=0"
@@ -346,20 +346,18 @@ def test_workflow_run_command_executes_step(
     assert output[13] == f"planned_reachable_fresh_jobs={planned_jobs}"
     assert output[14] == "planned_reused_registered_artifacts=0"
     assert output[15] == "planned_reused_inputs=0"
-    assert output[16] == "planned_hydrated_inputs=0"
-    assert output[17] == "planned_hydration_bytes=0"
-    assert output[18] == "existing_staged_outputs=0"
-    assert output[19].endswith("/runs/colors/base/color_sector_analysis")
-    assert output[19].startswith("run_workspace=")
-    assert output[20].endswith(
+    assert output[16] == "existing_staged_outputs=0"
+    assert output[17].endswith("/runs/colors/base/color_sector_analysis")
+    assert output[17].startswith("run_workspace=")
+    assert output[18].endswith(
         "/runs/colors/base/color_sector_analysis/logs/snakemake.log"
     )
-    assert output[20].startswith("snakemake_log=")
-    assert output[21] == (
+    assert output[18].startswith("snakemake_log=")
+    assert output[19] == (
         "note=Valid selected outputs are reused; missing work executes through "
         "Snakemake. Explicit recomputation is not available in this release."
     )
-    assert output[22:] == [
+    assert output[20:] == [
         "",
         "Preparing run workspace...",
         "Starting Snakemake...",
@@ -501,14 +499,13 @@ def test_workflow_run_dry_run_reports_mode_aware_summary(
     )
     assert summary["dry_run"] == "true"
     assert summary["planned_reused_inputs"] == "0"
-    assert summary["planned_hydrated_inputs"] == "0"
-    # Dry mode suppresses the fields that only describe real hydration and
-    # the executable staging area.
+    # Dry mode suppresses fields that describe the executable staging area.
     assert "existing_staged_outputs" not in summary
-    assert "planned_hydration_bytes" not in summary
     assert summary["note"].startswith("Dry run:")
-    assert "no hydration, publication, or registry update occurs" in summary["note"]
-    assert "can be hydrated" not in captured.out
+    assert (
+        "no reused-input preparation, publication, or registry update occurs"
+        in summary["note"]
+    )
     assert summary["outputs_published"] == "false"
     assert summary["registry"] == "not_updated"
     assert "PASS: workflow run" in lines
@@ -525,7 +522,7 @@ def test_workflow_run_help_documents_dry_run_forecast(
     help_text = " ".join(capsys.readouterr().out.split())
     assert (
         "Forecast selected-output resolution and any required fresh Snakemake "
-        "work in an isolated dry-run workspace without hydrating reused "
+        "work in an isolated dry-run workspace without preparing reused "
         "artifacts, running jobs, or publishing outputs."
     ) in help_text
 
@@ -584,7 +581,6 @@ def test_workflow_run_targeted_summary_reports_selected_closure_job_count(
     assert targeted_summary["planned_reachable_fresh_jobs"] == "3"
     assert targeted_summary["planned_reused_registered_artifacts"] == "0"
     assert targeted_summary["planned_reused_inputs"] == "0"
-    assert targeted_summary["planned_hydrated_inputs"] == "0"
 
 
 def test_workflow_run_partial_publish_exits_non_zero(
