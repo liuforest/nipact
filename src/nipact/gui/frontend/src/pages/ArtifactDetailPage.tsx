@@ -99,7 +99,10 @@ function pathItems(artifact: Artifact): KeyValueItem[] {
     { label: "display path", value: <PathValue value={artifact.display_path} /> },
     { label: "registered path", value: <PathValue value={artifact.path} /> },
     { label: "published path", value: <PathValue value={artifact.published_path} /> },
-    { label: "staging path", value: <PathValue value={artifact.staging_path} /> },
+    {
+      label: "historical staging path (may not exist)",
+      value: <PathValue value={artifact.staging_path} />,
+    },
   ];
 }
 

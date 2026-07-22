@@ -218,6 +218,7 @@ describe("LineageGraphExplorer", () => {
     fireEvent.click(screen.getByRole("button", { name: "canvas tap artifact 2" }));
 
     expect(screen.getByRole("heading", { name: "Selected Artifact" })).toBeInTheDocument();
+    expect(screen.getByText("historical staging (may not exist)")).toBeInTheDocument();
     expect(canvas).toHaveAttribute("data-focus-token", "");
   });
 

@@ -85,5 +85,8 @@ describe("ArtifactDetailPage", () => {
     // The duplicate lower "Trace" panel is gone.
     expect(screen.queryByRole("heading", { name: "Trace" })).toBeNull();
     expect(screen.queryByRole("link", { name: "Trace artifact" })).toBeNull();
+    expect(
+      screen.getByText("historical staging path (may not exist)"),
+    ).toBeInTheDocument();
   });
 });

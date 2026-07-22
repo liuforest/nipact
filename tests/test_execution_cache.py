@@ -2114,7 +2114,7 @@ def test_dry_run_forecasts_selected_reuse_without_executor_files(
         real_plan.published_outputs
     )
     staged_real_c = real_plan.selected_fresh_output_refs[0].staging_path
-    assert staged_real_c.is_file()
+    assert not staged_real_c.exists()
 
     dry_plan = build_run_plan(
         project_dir=project_dir,
@@ -2142,7 +2142,7 @@ def test_dry_run_forecasts_selected_reuse_without_executor_files(
     assert not (dry_plan.run_workspace / "Snakefile").exists()
     assert not (dry_plan.run_workspace / "selected_outputs.txt").exists()
     assert not (dry_plan.run_workspace / "staging").exists()
-    assert staged_real_c.is_file()
+    assert not staged_real_c.exists()
 
 
 def test_dry_run_leaves_executable_workspace_byte_identical(
@@ -2612,6 +2612,7 @@ def test_publication_reuses_prepared_facts_for_each_fresh_staging_output(
         address="sub_001",
     )
     written_paths: dict[tuple[str, str, str], Path] = {}
+    written_facts: dict[tuple[str, str, str], tuple[str, int]] = {}
 
     def write_fresh_outputs(
         executable_plan: object,
@@ -2627,8 +2628,11 @@ def test_publication_reuses_prepared_facts_for_each_fresh_staging_output(
                     f"{job.job_id}:{output_name}\n",
                     encoding="utf-8",
                 )
-                written_paths[(job.step_name, output_name, job.address)] = (
-                    output.staging_path
+                key = (job.step_name, output_name, job.address)
+                written_paths[key] = output.staging_path
+                written_facts[key] = (
+                    sha256_file_digest(output.staging_path),
+                    output.staging_path.stat().st_size,
                 )
         _write_completion_receipts_for_jobs(executable_plan)
         return 0
@@ -2676,11 +2680,12 @@ def test_publication_reuses_prepared_facts_for_each_fresh_staging_output(
         published_digest,
         published_hash,
     ) in stored_rows:
-        staging_path = written_paths[(step_name, output_name, address)]
-        expected_digest = sha256_file_digest(staging_path)
+        expected_digest, expected_size = written_facts[
+            (step_name, output_name, address)
+        ]
         assert content_digest == published_digest == expected_digest
         assert output_hash == published_hash == expected_digest[:16]
-        assert file_size == staging_path.stat().st_size
+        assert file_size == expected_size
 
 
 def test_cross_workflow_membership_adopts_complete_transitive_reused_bundles(
@@ -4710,7 +4715,7 @@ def test_real_snakemake_targeted_command_receives_one_selected_target(
     # Snakemake resolved that target's reachable closure and nothing else.
     assert log_path.read_text(encoding="utf-8").splitlines() == ["B sub_001"]
     staging = run_plan.run_workspace / "staging"
-    assert (staging / "b_transform/b_out/sub_001.json").is_file()
+    assert not (staging / "b_transform/b_out/sub_001.json").exists()
     assert not (staging / "a_source/a_out/sub_002.json").exists()
     assert not (staging / "b_transform/b_out/sub_002.json").exists()
     with sqlite3.connect(runtime_dir / "database/registry.db") as conn:
@@ -4954,7 +4959,7 @@ def test_path_reads_share_one_artifact_across_workflow_memberships(
     ).artifact_id == current_id
 
 
-def test_membership_write_failure_restores_registry_and_removes_new_output(
+def test_membership_write_failure_restores_registry_and_retains_orphan_output(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -5037,11 +5042,13 @@ def test_membership_write_failure_restores_registry_and_removes_new_output(
             ORDER BY run_id
             """
         ).fetchall() == current_runs_before
-    assert {
+    output_files_after = {
         path.relative_to(runtime_dir).as_posix()
         for path in (runtime_dir / "outputs").rglob("*")
         if path.is_file()
-    } == output_files_before
+    }
+    assert output_files_before < output_files_after
+    assert len(output_files_after - output_files_before) == 1
 
 
 def test_selected_reused_bundle_seeds_validation_resolution_and_membership_closure(
@@ -5781,15 +5788,18 @@ def test_targeted_rerun_rejects_divergent_deterministic_output_and_rolls_back(
             status_callback=None,
         )
 
-    assert sorted(path.name for path in output_dir.glob("*.json")) == files_before
+    files_after = sorted(path.name for path in output_dir.glob("*.json"))
+    assert set(files_before) < set(files_after)
+    assert len(files_after) == len(files_before) + 1
     assert historical_path.read_bytes() == historical_bytes
     divergent_staging = next(
         job.outputs["b_out"].staging_path
         for job in rerun_plan.jobs
         if job.step_name == "b_transform"
     )
-    assert divergent_staging.is_file()
-    assert divergent_staging.read_bytes() != historical_bytes
+    assert not divergent_staging.exists()
+    orphan_name = next(name for name in files_after if name not in files_before)
+    assert (output_dir / orphan_name).read_bytes() != historical_bytes
     assert (rerun_plan.run_workspace / "run_plan.json").is_file()
     assert (rerun_plan.run_workspace / "Snakefile").is_file()
     assert (rerun_plan.run_workspace / "logs/snakemake.log").is_file()
@@ -5918,11 +5928,13 @@ def test_targeted_multi_output_rerun_rejects_one_divergent_sibling_atomically(
         )
 
     assert _registry_row_counts(runtime_dir) == counts_before
-    assert {
+    directory_entries_after = {
         path.relative_to(runtime_dir).as_posix()
         for output_name in rows_before
         for path in (runtime_dir / rows_before[output_name][1]).parent.glob("*.json")
-    } == directory_entries_before
+    }
+    assert directory_entries_before < directory_entries_after
+    assert len(directory_entries_after - directory_entries_before) == 1
     for output_name, row in rows_before.items():
         assert (runtime_dir / row[1]).read_bytes() == files_before[output_name]
         assert (
@@ -6105,7 +6117,7 @@ def test_failed_targeted_rerun_preserves_prior_published_coordinate(
     )
     digest_before = sha256_file_digest(runtime_dir / row_before[1])
     staged_output = plan_one.run_workspace / "staging/b_transform/b_out/sub_001.json"
-    assert staged_output.is_file()
+    assert not staged_output.exists()
 
     # A stable-path source content change creates a new requested computation,
     # so the second public invocation remains genuinely fresh after finalization.

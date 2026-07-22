@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import errno
 import json
 from importlib import metadata
 import os
 import platform
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
 from dataclasses import dataclass, replace
@@ -111,10 +113,20 @@ class PublishedOutputSpec:
 
 
 @dataclass(frozen=True)
-class _PublishedOutputResult:
+class _PreparedOutput:
     row: PublishedOutputRow
+    staging_path: Path
     file_size: int
-    created: bool
+    staged_device: int
+    staged_inode: int
+    staged_link_count: int
+
+
+@dataclass(frozen=True)
+class _MaterializedOutputResult:
+    row: PublishedOutputRow
+    staging_path: Path
+    file_size: int
 
 
 @dataclass(frozen=True)
@@ -358,6 +370,8 @@ class RunOutcome:
     selected_reused_count: int
     failed_jobs: tuple[tuple[str, str, str], ...]  # (step, address, coarse reason)
     all_selected_resolved: bool
+    published_bytes: int = 0
+    cleanup_warnings: tuple[str, ...] = ()
 
 
 def build_run_plan(
@@ -768,91 +782,94 @@ def _execute_executable_run_plan(
             run_plan,
             invocation_token=invocation_token,
         )
-        published_results, prune_failures = _prune_orphan_published_jobs(
-            run_plan,
-            published_results,
-        )
     else:
         published_results = ()
         publish_failures = ()
-        prune_failures = ()
-    failed_jobs = tuple(sorted(publish_failures + prune_failures))
+    failed_jobs = tuple(sorted(publish_failures))
     published_rows = tuple(result.row for result in published_results)
-    created_rows = tuple(result.row for result in published_results if result.created)
-    if not published_rows and returncode != 0 and not has_selected_reuse:
-        log_path = run_plan.run_workspace / "logs" / "snakemake.log"
-        raise ValidationError(
-            f"Snakemake failed with exit code {returncode}; see {log_path}"
-        )
-    try:
-        artifact_rows = _workflow_output_artifact_rows(
-            run_plan,
-            published_results=published_results,
-            actual_reused_artifacts=actual_reused_artifacts,
-        )
-        projection_recipes = _retained_projection_recipes(
-            run_plan,
-            published_rows=published_rows,
-        )
-        reused_projection_seeds = _reused_projection_seeds(
-            run_plan,
-            artifact_rows=artifact_rows,
-            actual_reused_artifacts=actual_reused_artifacts,
-        )
-        selected_resolution_intents = _selected_resolution_intents(
-            run_plan,
-            published_rows=published_rows,
-            actual_reused_artifacts=actual_reused_artifacts,
-        )
-        membership_intents = tuple(
-            MembershipIntent(row=row) for row in published_rows
-        ) + _reused_membership_intents(
-            run_plan,
-            published_rows=published_rows,
-            actual_reused_artifacts=actual_reused_artifacts,
-        )
-        published_count = record_workflow_run(
-            run_plan.runtime_root / REGISTRY_DB_PATH,
-            runtime_root=run_plan.runtime_root,
-            context=run_plan.context,
-            workflow_name=run_plan.workflow_name,
-            base_workflow_name=run_plan.base_workflow_name,
-            selected_step_name=run_plan.selected_step_name,
-            selected_output_name=run_plan.selected_output_name,
-            run_workspace=_runtime_relative_path(run_plan.runtime_root, run_plan.run_workspace),
-            run_plan_path=_runtime_relative_path(
-                run_plan.runtime_root,
-                run_plan.run_workspace / "run_plan.json",
-            ),
-            run_plan_digest=sha256_file_digest(run_plan.run_workspace / "run_plan.json"),
-            artifacts=artifact_rows,
-            projection_recipes=projection_recipes,
-            reused_projection_seeds=reused_projection_seeds,
-            selected_resolution_intents=selected_resolution_intents,
-            environment_observation=_environment_observation(),
-            execution_population=_run_execution_population_row(run_plan),
-            manifest_bindings=_run_manifest_binding_rows(run_plan),
-            membership_intents=membership_intents,
-        )
-        _emit_status(status_callback, "registry_updated")
-        selected_generated_count = sum(
-            intent.outcome == "generated" for intent in selected_resolution_intents
-        )
-        selected_reused_count = sum(
-            intent.outcome == "reused" for intent in selected_resolution_intents
-        )
+    published_bytes = sum(result.file_size for result in published_results)
+    if not published_rows and not has_selected_reuse:
+        if returncode != 0:
+            log_path = run_plan.run_workspace / "logs" / "snakemake.log"
+            raise ValidationError(
+                f"Snakemake failed with exit code {returncode}; see {log_path}"
+            )
         return RunOutcome(
-            published_count=published_count,
-            selected_generated_count=selected_generated_count,
-            selected_reused_count=selected_reused_count,
+            published_count=0,
+            selected_generated_count=0,
+            selected_reused_count=0,
             failed_jobs=failed_jobs,
-            all_selected_resolved=all(
-                intent.outcome is not None for intent in selected_resolution_intents
-            ),
+            all_selected_resolved=False,
+            published_bytes=0,
         )
-    except Exception:
-        _remove_published_output_files(run_plan.runtime_root, created_rows)
-        raise
+    artifact_rows = _workflow_output_artifact_rows(
+        run_plan,
+        published_results=published_results,
+        actual_reused_artifacts=actual_reused_artifacts,
+    )
+    projection_recipes = _retained_projection_recipes(
+        run_plan,
+        published_rows=published_rows,
+    )
+    reused_projection_seeds = _reused_projection_seeds(
+        run_plan,
+        artifact_rows=artifact_rows,
+        actual_reused_artifacts=actual_reused_artifacts,
+    )
+    selected_resolution_intents = _selected_resolution_intents(
+        run_plan,
+        published_rows=published_rows,
+        actual_reused_artifacts=actual_reused_artifacts,
+    )
+    membership_intents = tuple(
+        MembershipIntent(row=row) for row in published_rows
+    ) + _reused_membership_intents(
+        run_plan,
+        published_rows=published_rows,
+        actual_reused_artifacts=actual_reused_artifacts,
+    )
+    published_count = record_workflow_run(
+        run_plan.runtime_root / REGISTRY_DB_PATH,
+        runtime_root=run_plan.runtime_root,
+        context=run_plan.context,
+        workflow_name=run_plan.workflow_name,
+        base_workflow_name=run_plan.base_workflow_name,
+        selected_step_name=run_plan.selected_step_name,
+        selected_output_name=run_plan.selected_output_name,
+        run_workspace=_runtime_relative_path(run_plan.runtime_root, run_plan.run_workspace),
+        run_plan_path=_runtime_relative_path(
+            run_plan.runtime_root,
+            run_plan.run_workspace / "run_plan.json",
+        ),
+        run_plan_digest=sha256_file_digest(run_plan.run_workspace / "run_plan.json"),
+        artifacts=artifact_rows,
+        projection_recipes=projection_recipes,
+        reused_projection_seeds=reused_projection_seeds,
+        selected_resolution_intents=selected_resolution_intents,
+        environment_observation=_environment_observation(),
+        execution_population=_run_execution_population_row(run_plan),
+        manifest_bindings=_run_manifest_binding_rows(run_plan),
+        membership_intents=membership_intents,
+    )
+    _emit_status(status_callback, "registry_updated")
+    cleanup_warnings = _finalize_published_output_staging(published_results)
+    selected_generated_count = sum(
+        intent.outcome == "generated" for intent in selected_resolution_intents
+    )
+    selected_reused_count = sum(
+        intent.outcome == "reused" for intent in selected_resolution_intents
+    )
+    return RunOutcome(
+        published_count=published_count,
+        selected_generated_count=selected_generated_count,
+        selected_reused_count=selected_reused_count,
+        failed_jobs=failed_jobs,
+        all_selected_resolved=all(
+            intent.outcome is not None for intent in selected_resolution_intents
+        ),
+        published_bytes=published_bytes,
+        cleanup_warnings=cleanup_warnings,
+    )
 
 
 def _emit_status(callback: RunStatusCallback | None, event: str) -> None:
@@ -877,23 +894,38 @@ def _publish_run_outputs(
     run_plan: ExecutableRunPlan,
     *,
     invocation_token: str,
-) -> tuple[tuple[_PublishedOutputResult, ...], tuple[tuple[str, str, str], ...]]:
-    """Publish declared outputs from reachable non-reused jobs, best-effort per job.
+) -> tuple[tuple[_MaterializedOutputResult, ...], tuple[tuple[str, str, str], ...]]:
+    """Prepare, prune, and materialize fresh outputs best-effort per job."""
+    prepared, preparation_failures = _prepare_run_outputs(
+        run_plan,
+        invocation_token=invocation_token,
+    )
+    prepared, prune_failures = _prune_orphan_prepared_jobs(run_plan, prepared)
+    job_order = _dependency_ordered_prepared_jobs(run_plan, prepared)
+    materialized, materialization_failures = _materialize_prepared_jobs(
+        run_plan,
+        prepared,
+        job_order=job_order,
+    )
+    return materialized, (
+        preparation_failures + prune_failures + materialization_failures
+    )
 
-    The atomic unit is the job (step + address): a job publishes iff all of its
-    declared sibling outputs are present in staging. A job with any missing or
-    invalid sibling is skipped without rolling back the jobs that did publish.
-    Returns the published results and a list of skipped jobs as
-    ``(step, address, reason)``. Only plan-construction errors still raise.
-    """
+
+def _prepare_run_outputs(
+    run_plan: ExecutableRunPlan,
+    *,
+    invocation_token: str,
+) -> tuple[tuple[_PreparedOutput, ...], tuple[tuple[str, str, str], ...]]:
+    """Validate and hash complete fresh jobs without mutating final storage."""
     publishable_outputs = _output_refs_by_key(run_plan.jobs)
     specs_by_job: dict[tuple[str, str], list[PublishedOutputSpec]] = {}
     for spec in run_plan.published_outputs:
         specs_by_job.setdefault((spec.step_name, spec.address), []).append(spec)
-    results: list[_PublishedOutputResult] = []
+    results: list[_PreparedOutput] = []
     failed: list[tuple[str, str, str]] = []
     for (step_name, address), specs in specs_by_job.items():
-        rows, reason = _publish_one_job(
+        rows, reason = _prepare_one_job(
             run_plan,
             specs,
             publishable_outputs,
@@ -906,16 +938,16 @@ def _publish_run_outputs(
     return tuple(results), tuple(failed)
 
 
-def _publish_one_job(
+def _prepare_one_job(
     run_plan: ExecutableRunPlan,
     specs: list[PublishedOutputSpec],
     publishable_outputs: dict[tuple[str, str, str], RunJobOutputRef],
     *,
     invocation_token: str,
-) -> tuple[list[_PublishedOutputResult], str | None]:
-    """Publish one job's siblings; return ``(rows, reason)``.
+) -> tuple[list[_PreparedOutput], str | None]:
+    """Prepare one complete sibling bundle without mutating final storage.
 
-    ``reason`` is ``None`` when the whole job published, else a coarse receipt,
+    ``reason`` is ``None`` when the whole job prepared, else a coarse receipt,
     staging, or digest failure category.
     """
     if not specs:
@@ -923,7 +955,11 @@ def _publish_one_job(
     job_ids = {spec.job_id for spec in specs}
     request_digests = {spec.request_bundle_digest for spec in specs}
     output_names = tuple(sorted(spec.output_name for spec in specs))
-    if len(job_ids) != 1 or len(request_digests) != 1:
+    if (
+        len(job_ids) != 1
+        or len(request_digests) != 1
+        or len(output_names) != len(set(output_names))
+    ):
         raise ValidationError("publishable siblings disagree on their job contract")
     request_bundle_digest = next(iter(request_digests))
     if request_bundle_digest is None:
@@ -946,23 +982,36 @@ def _publish_one_job(
     if receipt != expected_receipt:
         return [], "invalid completion receipt"
 
-    preflight_rows: list[
-        tuple[PublishedOutputSpec, RunJobOutputRef, str, str, int, str]
-    ] = []
+    prepared: list[_PreparedOutput] = []
     for spec in specs:
         key = (spec.step_name, spec.output_name, spec.address)
         try:
             output_ref = publishable_outputs[key]
         except KeyError as exc:
             raise ValidationError("run plan is missing a publishable output") from exc
-        if not output_ref.staging_path.is_file():
-            # A missing or non-file sibling means the producing job is incomplete
-            # (its process did not write every declared output). Skip the whole
-            # job rather than publish a partial set of siblings.
+        try:
+            before = os.lstat(output_ref.staging_path)
+        except FileNotFoundError:
             return [], "missing staged output"
-        output_digest = sha256_file_digest(output_ref.staging_path)
+        except OSError:
+            return [], "unreadable staged output"
+        if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
+            return [], "invalid staged output"
+        try:
+            output_digest = sha256_file_digest(output_ref.staging_path)
+            after = os.lstat(output_ref.staging_path)
+        except FileNotFoundError:
+            return [], "staged output changed"
+        except OSError:
+            return [], "unreadable staged output"
+        if (
+            not stat.S_ISREG(after.st_mode)
+            or after.st_nlink != 1
+            or (after.st_dev, after.st_ino, after.st_size)
+            != (before.st_dev, before.st_ino, before.st_size)
+        ):
+            return [], "staged output changed"
         output_hash = short_hash(output_digest)
-        file_size = output_ref.staging_path.stat().st_size
         if spec.request_bundle_digest is None:
             raise ValidationError("publishable output request identity is unresolved")
         final_path_relative = canonical_output_path(
@@ -978,118 +1027,56 @@ def _publish_one_job(
             run_plan.runtime_root,
             final_path_relative,
         )
-        preflight_rows.append(
-            (
-                spec,
-                output_ref,
-                output_digest,
-                output_hash,
-                file_size,
-                final_path_relative,
+        prepared.append(
+            _PreparedOutput(
+                row=PublishedOutputRow(
+                    context=spec.context,
+                    workflow_name=spec.workflow_name,
+                    step_name=spec.step_name,
+                    output_name=spec.output_name,
+                    address=spec.address,
+                    path=final_path_relative,
+                    output_digest=output_digest,
+                    output_hash=output_hash,
+                ),
+                staging_path=output_ref.staging_path,
+                file_size=after.st_size,
+                staged_device=after.st_dev,
+                staged_inode=after.st_ino,
+                staged_link_count=after.st_nlink,
             )
         )
+    return prepared, None
 
-    results: list[_PublishedOutputResult] = []
-    temp_paths: list[Path] = []
-    try:
-        for (
-            spec,
-            output_ref,
-            output_digest,
-            output_hash,
-            file_size,
-            final_path_relative,
-        ) in preflight_rows:
-            final_path = run_plan.runtime_root / final_path_relative
-            final_path.parent.mkdir(parents=True, exist_ok=True)
-            final_path_existed = final_path.exists()
-            if final_path_existed:
-                _validate_existing_published_file(final_path, expected_digest=output_digest)
-            else:
-                temp_path = final_path.with_name(
-                    f".{final_path.name}.{os.getpid()}.tmp"
-                )
-                temp_paths.append(temp_path)
-                if temp_path.exists() or temp_path.is_symlink():
-                    if not temp_path.is_file() and not temp_path.is_symlink():
-                        raise ValidationError(f"temporary output path is not a file: {temp_path}")
-                    temp_path.unlink()
-                shutil.copy2(output_ref.staging_path, temp_path)
-                _validate_existing_published_file(
-                    temp_path,
-                    expected_digest=output_digest,
-                )
-                os.replace(temp_path, final_path)
-            row = PublishedOutputRow(
-                context=spec.context,
-                workflow_name=spec.workflow_name,
-                step_name=spec.step_name,
-                output_name=spec.output_name,
-                address=spec.address,
-                path=final_path_relative,
-                output_digest=output_digest,
-                output_hash=output_hash,
-            )
-            results.append(
-                _PublishedOutputResult(
-                    row=row,
-                    file_size=file_size,
-                    created=not final_path_existed,
-                )
-            )
-    except ValidationError:
-        # Skip this job only. Any sibling already copied stays as an inert,
-        # content-addressed orphan: it is never reusable without a registry row,
-        # which a skipped job never gets, so no batch rollback is needed.
-        return [], "digest mismatch"
-    finally:
-        for temp_path in temp_paths:
-            if temp_path.is_file() or temp_path.is_symlink():
-                try:
-                    temp_path.unlink()
-                except OSError:
-                    pass
-
-    return results, None
-
-
-def _prune_orphan_published_jobs(
+def _prune_orphan_prepared_jobs(
     run_plan: ExecutableRunPlan,
-    published_results: tuple[_PublishedOutputResult, ...],
-) -> tuple[tuple[_PublishedOutputResult, ...], tuple[tuple[str, str, str], ...]]:
-    """Drop published jobs whose fresh workflow-output parents were not published.
-
-    Best-effort publishing can land a child while skipping a parent (e.g. a
-    multi-output parent missing one sibling). Recording such an orphan would make
-    ``record_workflow_run`` raise on the dangling dependency and roll back the
-    entire partial record, so prune orphans to a fixpoint first (a child dropped
-    this round can orphan its own children the next round). Reused parents are
-    validated separately by ``record_workflow_run`` and need no pruning.
-    """
+    prepared_results: tuple[_PreparedOutput, ...],
+) -> tuple[tuple[_PreparedOutput, ...], tuple[tuple[str, str, str], ...]]:
+    """Drop prepared jobs whose fresh workflow-output parents did not prepare."""
     jobs_by_address = {(job.step_name, job.address): job for job in run_plan.jobs}
-    published_keys = {
+    prepared_keys = {
         (result.row.step_name, result.row.output_name, result.row.address)
-        for result in published_results
+        for result in prepared_results
     }
     dropped: set[tuple[str, str]] = set()
     changed = True
     while changed:
         changed = False
-        for result in published_results:
+        for result in prepared_results:
             job_address = (result.row.step_name, result.row.address)
             if job_address in dropped:
                 continue
             job = jobs_by_address.get(job_address)
-            if job is None or not _has_unpublished_fresh_parent(job, published_keys):
+            if job is None or not _has_unprepared_fresh_parent(job, prepared_keys):
                 continue
             dropped.add(job_address)
-            published_keys -= {
-                key for key in published_keys if (key[0], key[2]) == job_address
+            prepared_keys -= {
+                key for key in prepared_keys if (key[0], key[2]) == job_address
             }
             changed = True
     survivors = tuple(
         result
-        for result in published_results
+        for result in prepared_results
         if (result.row.step_name, result.row.address) not in dropped
     )
     dropped_failures = tuple(
@@ -1099,9 +1086,134 @@ def _prune_orphan_published_jobs(
     return survivors, dropped_failures
 
 
-def _has_unpublished_fresh_parent(
+def _dependency_ordered_prepared_jobs(
+    run_plan: ExecutableRunPlan,
+    prepared_results: tuple[_PreparedOutput, ...],
+) -> tuple[tuple[str, str], ...]:
+    """Return a stable parent-before-descendant order for prepared fresh jobs."""
+    prepared_jobs = {
+        (result.row.step_name, result.row.address) for result in prepared_results
+    }
+    jobs_by_key: dict[tuple[str, str], RunJob] = {}
+    plan_order: dict[tuple[str, str], int] = {}
+    for index, job in enumerate(run_plan.jobs):
+        key = (job.step_name, job.address)
+        if key in jobs_by_key:
+            raise ValidationError(f"run plan contains a duplicate job coordinate: {key}")
+        jobs_by_key[key] = job
+        plan_order[key] = index
+    if prepared_jobs - jobs_by_key.keys():
+        raise ValidationError("prepared output has no matching run job")
+    parents = {
+        key: _fresh_parent_job_keys(jobs_by_key[key]) & prepared_jobs
+        for key in prepared_jobs
+    }
+    ordered: list[tuple[str, str]] = []
+    remaining = set(prepared_jobs)
+    while remaining:
+        ready = sorted(
+            (key for key in remaining if not (parents[key] & remaining)),
+            key=plan_order.__getitem__,
+        )
+        if not ready:
+            raise ValidationError("prepared fresh-job dependency graph contains a cycle")
+        ordered.extend(ready)
+        remaining.difference_update(ready)
+    return tuple(ordered)
+
+
+def _fresh_parent_job_keys(job: RunJob) -> set[tuple[str, str]]:
+    return {
+        (record.source_step_name, record.source_address)
+        for record in job.input_records
+        if record.origin == "workflow_output"
+        and record.registry_source_artifact_id is None
+        and record.source_step_name is not None
+        and record.source_address is not None
+    }
+
+
+def _materialize_prepared_jobs(
+    run_plan: ExecutableRunPlan,
+    prepared_results: tuple[_PreparedOutput, ...],
+    *,
+    job_order: tuple[tuple[str, str], ...],
+) -> tuple[
+    tuple[_MaterializedOutputResult, ...],
+    tuple[tuple[str, str, str], ...],
+]:
+    """Materialize prepared jobs in dependency order, preserving survivors."""
+    prepared_by_job: dict[tuple[str, str], list[_PreparedOutput]] = {}
+    for result in prepared_results:
+        prepared_by_job.setdefault(
+            (result.row.step_name, result.row.address), []
+        ).append(result)
+    jobs_by_key = {(job.step_name, job.address): job for job in run_plan.jobs}
+    failed_jobs: set[tuple[str, str]] = set()
+    results: list[_MaterializedOutputResult] = []
+    failures: list[tuple[str, str, str]] = []
+    for job_key in job_order:
+        job = jobs_by_key[job_key]
+        if _fresh_parent_job_keys(job) & failed_jobs:
+            failed_jobs.add(job_key)
+            failures.append((*job_key, "upstream materialization failed"))
+            continue
+        job_results, reason = _materialize_one_prepared_job(
+            run_plan,
+            prepared_by_job[job_key],
+        )
+        if reason is None:
+            results.extend(job_results)
+        else:
+            failed_jobs.add(job_key)
+            failures.append((*job_key, reason))
+    return tuple(results), tuple(failures)
+
+
+def _materialize_one_prepared_job(
+    run_plan: ExecutableRunPlan,
+    prepared_outputs: list[_PreparedOutput],
+) -> tuple[list[_MaterializedOutputResult], str | None]:
+    results: list[_MaterializedOutputResult] = []
+    try:
+        for prepared in prepared_outputs:
+            final_path = _contained_canonical_output_path(
+                run_plan.runtime_root,
+                prepared.row.path,
+            )
+            final_path.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                os.lstat(final_path)
+            except FileNotFoundError:
+                _recheck_prepared_staging(prepared)
+                try:
+                    os.replace(prepared.staging_path, final_path)
+                except OSError as exc:
+                    if exc.errno == errno.EXDEV:
+                        return [], "cross-filesystem publication unsupported"
+                    raise
+            else:
+                _validate_existing_published_file(
+                    final_path,
+                    expected_digest=prepared.row.output_digest,
+                )
+            results.append(
+                _MaterializedOutputResult(
+                    row=prepared.row,
+                    staging_path=prepared.staging_path,
+                    file_size=prepared.file_size,
+                )
+            )
+    except ValidationError:
+        return [], "materialization validation failed"
+    except OSError:
+        return [], "materialization failed"
+    return results, None
+
+
+def _has_unprepared_fresh_parent(
     job: RunJob,
-    published_keys: set[tuple[str, str, str]],
+    prepared_keys: set[tuple[str, str, str]],
 ) -> bool:
     for record in job.input_records:
         if record.origin != "workflow_output" or record.registry_source_artifact_id is not None:
@@ -1111,18 +1223,61 @@ def _has_unpublished_fresh_parent(
             record.source_output_name,
             record.source_address,
         )
-        if parent_key not in published_keys:
+        if parent_key not in prepared_keys:
             return True
     return False
 
 
 def _validate_existing_published_file(path: Path, *, expected_digest: str) -> None:
-    if path.is_dir():
-        raise ValidationError(f"published output path is a directory: {path}")
-    if not path.is_file():
-        raise ValidationError(f"missing published output file: {path}")
+    try:
+        path_stat = os.lstat(path)
+    except FileNotFoundError as exc:
+        raise ValidationError(f"missing published output file: {path}") from exc
+    if not stat.S_ISREG(path_stat.st_mode):
+        raise ValidationError(f"published output path is not a regular file: {path}")
+    if path_stat.st_nlink != 1:
+        raise ValidationError(f"published output path has multiple hardlinks: {path}")
     if sha256_file_digest(path) != expected_digest:
         raise ValidationError("published output artifact digest mismatch")
+
+
+def _recheck_prepared_staging(prepared: _PreparedOutput) -> None:
+    try:
+        current = os.lstat(prepared.staging_path)
+    except FileNotFoundError as exc:
+        raise ValidationError(
+            f"prepared staged output is missing: {prepared.staging_path}"
+        ) from exc
+    if (
+        not stat.S_ISREG(current.st_mode)
+        or current.st_nlink != 1
+        or current.st_nlink != prepared.staged_link_count
+        or (current.st_dev, current.st_ino, current.st_size)
+        != (prepared.staged_device, prepared.staged_inode, prepared.file_size)
+    ):
+        raise ValidationError(
+            f"prepared staged output changed before materialization: {prepared.staging_path}"
+        )
+
+
+def _finalize_published_output_staging(
+    results: tuple[_MaterializedOutputResult, ...],
+) -> tuple[str, ...]:
+    """Remove retained successful output staging after registry commit."""
+    warnings: list[str] = []
+    for staging_path in dict.fromkeys(result.staging_path for result in results):
+        try:
+            os.lstat(staging_path)
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            warnings.append(f"could not inspect published staging {staging_path}: {exc}")
+            continue
+        try:
+            staging_path.unlink()
+        except OSError as exc:
+            warnings.append(f"could not remove published staging {staging_path}: {exc}")
+    return tuple(warnings)
 
 
 def _remove_expected_staged_outputs(run_plan: ExecutableRunPlan) -> None:
@@ -1147,27 +1302,6 @@ def _remove_expected_completion_receipts(run_plan: ExecutableRunPlan) -> None:
             raise ValidationError(f"completion receipt path is a directory: {path}")
         if path.exists() or path.is_symlink():
             path.unlink()
-
-
-def _remove_published_output_files(
-    runtime_root: Path,
-    rows: tuple[PublishedOutputRow, ...],
-) -> None:
-    outputs_root = (runtime_root / "outputs").resolve()
-    for row in rows:
-        relative_path = Path(row.path).expanduser()
-        if relative_path.is_absolute() or ".." in relative_path.parts:
-            continue
-        output_path = (runtime_root / relative_path).resolve()
-        try:
-            output_path.relative_to(outputs_root)
-        except ValueError:
-            continue
-        if output_path.is_file():
-            try:
-                output_path.unlink()
-            except OSError:
-                pass
 
 
 def _write_run_workspace(
@@ -1752,7 +1886,7 @@ def _input_record_payload(
 def _workflow_output_artifact_rows(
     run_plan: ExecutableRunPlan,
     *,
-    published_results: tuple[_PublishedOutputResult, ...],
+    published_results: tuple[_MaterializedOutputResult, ...],
     actual_reused_artifacts: dict[int, ReusableArtifactCandidate],
 ) -> tuple[WorkflowOutputArtifactRow, ...]:
     published_by_key = {

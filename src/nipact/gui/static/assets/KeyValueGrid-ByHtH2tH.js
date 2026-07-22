@@ -1,0 +1,1 @@
+import{j as e}from"./index-IeSfVU4x.js";function s({items:d}){return e.jsx("dl",{className:"detail-grid",children:d.map(l=>e.jsxs("div",{children:[e.jsx("dt",{children:l.label}),e.jsx("dd",{children:l.value??"none"})]},l.label))})}export{s as K};

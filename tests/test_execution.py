@@ -39,6 +39,10 @@ from nipact.manifest import build_manifest_value, load_manifest
 from nipact.projection import ResolvedRequestBundleProjectionV3
 from nipact.registry import EnvironmentObservationV1
 from nipact.runtime import run_job
+from nipact.runtime_lock import (
+    RuntimeLockUnavailableError,
+    acquire_mutating_runtime_lock,
+)
 from nipact.trace import build_trace_graph_for_workflow_coordinate
 
 
@@ -1292,6 +1296,10 @@ def test_execute_run_plan_publishes_selected_outputs_without_real_snakemake(
             snakemake_version="test-snakemake",
         ),
     )
+    monkeypatch.setattr(
+        "nipact.execution.shutil.copy2",
+        lambda *_args, **_kwargs: pytest.fail("publication copied artifact bytes"),
+    )
     events: list[str] = []
 
     outcome = execute_run_plan(
@@ -1319,7 +1327,15 @@ def test_execute_run_plan_publishes_selected_outputs_without_real_snakemake(
     output_dir = runtime_dir / "outputs/v1/colors/color_sector_analysis/cohort"
     outputs = sorted(output_dir.rglob("*.json"))
     assert len(outputs) == 1
+    all_outputs = list((runtime_dir / "outputs/v1").rglob("*.json"))
+    assert outcome.published_bytes == sum(path.stat().st_size for path in all_outputs)
     assert outputs[0].name.startswith("cohort.")
+    assert outputs[0].stat().st_nlink == 1
+    assert all(
+        not output.staging_path.exists()
+        for job in run_plan.jobs
+        for output in job.outputs.values()
+    )
     selected_relative_path = outputs[0].relative_to(runtime_dir).as_posix()
     with sqlite3.connect(runtime_dir / "database/registry.db") as conn:
         rows = conn.execute(
@@ -1422,10 +1438,11 @@ def test_execute_run_plan_publishes_selected_outputs_without_real_snakemake(
         "snakemake_version": "test-snakemake",
     }
     assert main(["validate", "--project-dir", str(project_dir), "--context", "colors"]) == 0
-    assert f"published_outputs={len(run_plan.published_outputs)}" in capsys.readouterr().out
+    cli_output = capsys.readouterr().out
+    assert f"published_outputs={len(run_plan.published_outputs)}" in cli_output
 
 
-def test_execute_run_plan_removes_published_files_when_registration_fails(
+def test_execute_run_plan_retains_orphan_finals_when_registration_fails(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
     monkeypatch: pytest.MonkeyPatch,
@@ -1451,7 +1468,13 @@ def test_execute_run_plan_removes_published_files_when_registration_fails(
     with pytest.raises(ValidationError, match="registry write failed"):
         execute_run_plan(run_plan, cores=1)
 
-    assert list((runtime_dir / "outputs/v1").rglob("*.json")) == []
+    orphan_finals = list((runtime_dir / "outputs/v1").rglob("*.json"))
+    assert len(orphan_finals) == len(run_plan.published_outputs)
+    assert all(
+        not output.staging_path.exists()
+        for job in run_plan.jobs
+        for output in job.outputs.values()
+    )
     with sqlite3.connect(runtime_dir / "database/registry.db") as conn:
         assert conn.execute("SELECT COUNT(*) FROM published_outputs").fetchone()[0] == 0
         assert conn.execute("SELECT COUNT(*) FROM workflow_runs").fetchone()[0] == 0
@@ -1996,6 +2019,404 @@ def test_multi_output_partial_sibling_prunes_orphan_child(
     assert published == expected
     assert artifacts == expected
     assert workflow_runs == 1
+    assert not list(
+        (runtime_dir / "outputs/v1/multi/qc_echo/sub_002").rglob("*.json")
+    )
+
+
+@pytest.mark.parametrize("invalid_kind", ["symlink", "hardlink"])
+def test_publication_rejects_aliased_staged_output(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    invalid_kind: str,
+) -> None:
+    project_dir, runtime_dir = _write_tiny_non_colors_project(tmp_path, monkeypatch)
+    run_plan = build_run_plan(
+        project_dir=project_dir,
+        context="mini",
+        workflow_name="main",
+        step_name="uppercase_text",
+        address="sub_001",
+    )
+
+    def write_then_alias(executable_plan: object, **_kwargs: object) -> int:
+        run_plan_path = executable_plan.run_workspace / "run_plan.json"
+        for job in executable_plan.jobs:
+            run_job(run_plan_path=run_plan_path, job_id=job.job_id)
+        staged = next(
+            job.outputs["raw_text"].staging_path
+            for job in executable_plan.jobs
+            if job.step_name == "source_text"
+        )
+        alias = staged.with_name(f"{staged.stem}.alias{staged.suffix}")
+        if invalid_kind == "symlink":
+            staged.rename(alias)
+            staged.symlink_to(alias.name)
+        else:
+            os.link(staged, alias)
+        return 0
+
+    monkeypatch.setattr("nipact.execution._run_snakemake", write_then_alias)
+
+    outcome = execute_run_plan(run_plan, cores=1)
+
+    assert outcome.published_count == 0
+    assert not outcome.all_selected_resolved
+    assert outcome.failed_jobs == (
+        ("source_text", "sub_001", "invalid staged output"),
+        ("uppercase_text", "sub_001", "upstream not published"),
+    )
+    assert not list((runtime_dir / "outputs/v1").rglob("*.json"))
+    with sqlite3.connect(runtime_dir / "database/registry.db") as conn:
+        assert conn.execute("SELECT COUNT(*) FROM workflow_runs").fetchone()[0] == 0
+
+
+def test_cross_filesystem_publication_fails_without_copying(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project_dir, runtime_dir = _write_tiny_non_colors_project(tmp_path, monkeypatch)
+    run_plan = build_run_plan(
+        project_dir=project_dir,
+        context="mini",
+        workflow_name="main",
+        step_name="uppercase_text",
+        address="sub_001",
+    )
+    real_replace = os.replace
+
+    def run_then_reject_move(executable_plan: object, **_kwargs: object) -> int:
+        run_plan_path = executable_plan.run_workspace / "run_plan.json"
+        for job in executable_plan.jobs:
+            run_job(run_plan_path=run_plan_path, job_id=job.job_id)
+
+        def reject_publication_move(source: object, destination: object) -> None:
+            if "/staging/" in str(source) and "/outputs/v1/" in str(destination):
+                raise OSError(execution_module.errno.EXDEV, "cross-device link")
+            real_replace(source, destination)
+
+        monkeypatch.setattr(execution_module.os, "replace", reject_publication_move)
+        return 0
+
+    monkeypatch.setattr("nipact.execution._run_snakemake", run_then_reject_move)
+    monkeypatch.setattr(
+        "nipact.execution.shutil.copy2",
+        lambda *_args, **_kwargs: pytest.fail("EXDEV used a copy fallback"),
+    )
+
+    outcome = execute_run_plan(run_plan, cores=1)
+
+    assert outcome.published_count == 0
+    assert outcome.failed_jobs == (
+        ("source_text", "sub_001", "cross-filesystem publication unsupported"),
+        ("uppercase_text", "sub_001", "upstream materialization failed"),
+    )
+    assert all(
+        output.staging_path.is_file()
+        for job in run_plan.jobs
+        for output in job.outputs.values()
+    )
+    assert not list((runtime_dir / "outputs/v1").rglob("*.json"))
+
+
+def test_parent_materialization_failure_skips_descendant_only(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project_dir, runtime_dir = _write_tiny_non_colors_project(tmp_path, monkeypatch)
+    run_plan = build_run_plan(
+        project_dir=project_dir,
+        context="mini",
+        workflow_name="main",
+        step_name="uppercase_text",
+    )
+    real_replace = os.replace
+
+    def run_then_fail_one_parent(executable_plan: object, **_kwargs: object) -> int:
+        run_plan_path = executable_plan.run_workspace / "run_plan.json"
+        for job in executable_plan.jobs:
+            run_job(run_plan_path=run_plan_path, job_id=job.job_id)
+
+        def fail_one_parent(source: object, destination: object) -> None:
+            source_path = Path(source)
+            if (
+                source_path.name == "sub_002.json"
+                and "source_text/raw_text" in source_path.as_posix()
+            ):
+                raise OSError("synthetic parent move failure")
+            real_replace(source, destination)
+
+        monkeypatch.setattr(execution_module.os, "replace", fail_one_parent)
+        return 0
+
+    monkeypatch.setattr("nipact.execution._run_snakemake", run_then_fail_one_parent)
+
+    outcome = execute_run_plan(run_plan, cores=1)
+
+    assert outcome.published_count == 2
+    assert outcome.failed_jobs == (
+        ("source_text", "sub_002", "materialization failed"),
+        ("uppercase_text", "sub_002", "upstream materialization failed"),
+    )
+    assert not outcome.all_selected_resolved
+    assert not list(
+        (runtime_dir / "outputs/v1/mini/uppercase_text/sub_002").rglob("*.json")
+    )
+    assert run_plan.run_workspace.joinpath(
+        "staging/uppercase_text/upper_text/sub_002.json"
+    ).is_file()
+
+
+def test_multi_output_materialization_failure_leaves_only_moved_sibling_orphan(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project_dir, runtime_dir = _write_tiny_multi_output_project(tmp_path, monkeypatch)
+    run_plan = build_run_plan(
+        project_dir=project_dir,
+        context="multi",
+        workflow_name="import_raw",
+        step_name="source_text",
+        address="sub_001",
+    )
+    real_replace = os.replace
+    publication_moves = 0
+
+    def run_then_fail_second_sibling(executable_plan: object, **_kwargs: object) -> int:
+        run_plan_path = executable_plan.run_workspace / "run_plan.json"
+        for job in executable_plan.jobs:
+            run_job(run_plan_path=run_plan_path, job_id=job.job_id)
+
+        def fail_second_move(source: object, destination: object) -> None:
+            nonlocal publication_moves
+            publication_moves += 1
+            if publication_moves == 2:
+                raise OSError("synthetic sibling move failure")
+            real_replace(source, destination)
+
+        monkeypatch.setattr(execution_module.os, "replace", fail_second_move)
+        return 0
+
+    monkeypatch.setattr(
+        "nipact.execution._run_snakemake",
+        run_then_fail_second_sibling,
+    )
+
+    outcome = execute_run_plan(run_plan, cores=1)
+
+    assert outcome.published_count == 0
+    assert outcome.failed_jobs == (
+        ("source_text", "sub_001", "materialization failed"),
+    )
+    orphan_finals = list((runtime_dir / "outputs/v1").rglob("*.json"))
+    assert len(orphan_finals) == 1
+    job = next(job for job in run_plan.jobs if job.step_name == "source_text")
+    staging_exists = [output.staging_path.exists() for output in job.outputs.values()]
+    assert sorted(staging_exists) == [False, True]
+    with sqlite3.connect(runtime_dir / "database/registry.db") as conn:
+        assert conn.execute("SELECT COUNT(*) FROM workflow_runs").fetchone()[0] == 0
+
+
+def test_orphan_rerun_registers_existing_finals_and_reports_cleanup_warning(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project_dir, runtime_dir = _write_tiny_non_colors_project(tmp_path, monkeypatch)
+    real_record = execution_module.record_workflow_run
+
+    def run_every_job(executable_plan: object, **_kwargs: object) -> int:
+        run_plan_path = executable_plan.run_workspace / "run_plan.json"
+        for job in executable_plan.jobs:
+            run_job(run_plan_path=run_plan_path, job_id=job.job_id)
+        return 0
+
+    first_plan = build_run_plan(
+        project_dir=project_dir,
+        context="mini",
+        workflow_name="main",
+        step_name="uppercase_text",
+        address="sub_001",
+    )
+    monkeypatch.setattr("nipact.execution._run_snakemake", run_every_job)
+
+    def fail_recording(*_args: object, **_kwargs: object) -> int:
+        raise ValidationError("synthetic registry failure")
+
+    monkeypatch.setattr(
+        "nipact.execution.record_workflow_run",
+        fail_recording,
+    )
+
+    with pytest.raises(ValidationError, match="synthetic registry failure"):
+        execute_run_plan(first_plan, cores=1)
+
+    orphan_finals = {
+        path.relative_to(runtime_dir).as_posix()
+        for path in (runtime_dir / "outputs/v1").rglob("*.json")
+    }
+    assert len(orphan_finals) == 2
+
+    rerun_plan = build_run_plan(
+        project_dir=project_dir,
+        context="mini",
+        workflow_name="main",
+        step_name="uppercase_text",
+        address="sub_001",
+    )
+    retained_staging = next(
+        job.outputs["raw_text"].staging_path
+        for job in rerun_plan.jobs
+        if job.step_name == "source_text"
+    )
+    real_unlink = Path.unlink
+
+    def record_then_block_one_cleanup(*args: object, **kwargs: object) -> int:
+        count = real_record(*args, **kwargs)
+
+        def block_retained_staging(
+            path: Path,
+            *unlink_args: object,
+            **unlink_kwargs: object,
+        ) -> None:
+            if path == retained_staging:
+                raise OSError("synthetic cleanup failure")
+            real_unlink(path, *unlink_args, **unlink_kwargs)
+
+        monkeypatch.setattr(Path, "unlink", block_retained_staging)
+        return count
+
+    monkeypatch.setattr(
+        "nipact.execution.record_workflow_run",
+        record_then_block_one_cleanup,
+    )
+
+    outcome = execute_run_plan(rerun_plan, cores=1)
+
+    assert outcome.published_count == 2
+    assert len(outcome.cleanup_warnings) == 1
+    assert "synthetic cleanup failure" in outcome.cleanup_warnings[0]
+    assert retained_staging.is_file()
+    assert {
+        path.relative_to(runtime_dir).as_posix()
+        for path in (runtime_dir / "outputs/v1").rglob("*.json")
+    } == orphan_finals
+    with sqlite3.connect(runtime_dir / "database/registry.db") as conn:
+        assert conn.execute("SELECT COUNT(*) FROM workflow_runs").fetchone()[0] == 1
+
+
+def test_existing_final_rejects_symlink_and_hardlink_aliases(tmp_path: Path) -> None:
+    target = tmp_path / "target.json"
+    target.write_text("value\n", encoding="utf-8")
+    digest = sha256_file_digest(target)
+
+    symlink = tmp_path / "symlink.json"
+    symlink.symlink_to(target.name)
+    with pytest.raises(ValidationError, match="not a regular file"):
+        execution_module._validate_existing_published_file(
+            symlink,
+            expected_digest=digest,
+        )
+
+    hardlink = tmp_path / "hardlink.json"
+    os.link(target, hardlink)
+    with pytest.raises(ValidationError, match="multiple hardlinks"):
+        execution_module._validate_existing_published_file(
+            hardlink,
+            expected_digest=digest,
+        )
+
+
+def test_staging_replacement_after_prepare_is_rejected_before_move(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project_dir, runtime_dir = _write_tiny_non_colors_project(tmp_path, monkeypatch)
+    run_plan = build_run_plan(
+        project_dir=project_dir,
+        context="mini",
+        workflow_name="main",
+        step_name="uppercase_text",
+        address="sub_001",
+    )
+
+    def run_every_job(executable_plan: object, **_kwargs: object) -> int:
+        run_plan_path = executable_plan.run_workspace / "run_plan.json"
+        for job in executable_plan.jobs:
+            run_job(run_plan_path=run_plan_path, job_id=job.job_id)
+        return 0
+
+    real_order = execution_module._dependency_ordered_prepared_jobs
+    replaced = False
+
+    def replace_one_staged_inode(
+        executable_plan: object,
+        prepared: tuple[object, ...],
+    ) -> tuple[tuple[str, str], ...]:
+        nonlocal replaced
+        if not replaced:
+            staged = prepared[0].staging_path
+            replacement = staged.with_name(f".{staged.name}.replacement")
+            replacement.write_bytes(staged.read_bytes())
+            os.replace(replacement, staged)
+            replaced = True
+        return real_order(executable_plan, prepared)
+
+    monkeypatch.setattr("nipact.execution._run_snakemake", run_every_job)
+    monkeypatch.setattr(
+        execution_module,
+        "_dependency_ordered_prepared_jobs",
+        replace_one_staged_inode,
+    )
+
+    outcome = execute_run_plan(run_plan, cores=1)
+
+    assert outcome.published_count == 0
+    assert outcome.failed_jobs == (
+        ("source_text", "sub_001", "materialization validation failed"),
+        ("uppercase_text", "sub_001", "upstream materialization failed"),
+    )
+    assert not list((runtime_dir / "outputs/v1").rglob("*.json"))
+
+
+def test_runtime_lock_remains_held_through_publication_finalize(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project_dir, runtime_dir = _write_tiny_non_colors_project(tmp_path, monkeypatch)
+    run_plan = build_run_plan(
+        project_dir=project_dir,
+        context="mini",
+        workflow_name="main",
+        step_name="uppercase_text",
+        address="sub_001",
+    )
+
+    def run_every_job(executable_plan: object, **_kwargs: object) -> int:
+        run_plan_path = executable_plan.run_workspace / "run_plan.json"
+        for job in executable_plan.jobs:
+            run_job(run_plan_path=run_plan_path, job_id=job.job_id)
+        return 0
+
+    real_finalize = execution_module._finalize_published_output_staging
+    finalize_checked = False
+
+    def assert_lock_then_finalize(results: tuple[object, ...]) -> tuple[str, ...]:
+        nonlocal finalize_checked
+        with pytest.raises(RuntimeLockUnavailableError, match="already in use"):
+            with acquire_mutating_runtime_lock(runtime_dir):
+                pass
+        finalize_checked = True
+        return real_finalize(results)
+
+    monkeypatch.setattr("nipact.execution._run_snakemake", run_every_job)
+    monkeypatch.setattr(
+        execution_module,
+        "_finalize_published_output_staging",
+        assert_lock_then_finalize,
+    )
+
+    assert execute_run_plan(run_plan, cores=1).all_selected_resolved
+    assert finalize_checked
 
 
 def test_rerun_reuses_partial_survivors_without_recompute(
