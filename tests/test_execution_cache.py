@@ -2576,6 +2576,89 @@ def test_multi_output_selected_step_publishes_siblings_for_reuse(
     assert log_path.read_text(encoding="utf-8").splitlines() == ["B sub_001"]
 
 
+def test_publication_reuses_prepared_facts_for_each_fresh_staging_output(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project_dir, runtime_dir, _log_path = _write_cache_project(tmp_path, monkeypatch)
+    run_plan = build_run_plan(
+        project_dir=project_dir,
+        context="cache",
+        workflow_name="main",
+        step_name="multi_transform",
+        address="sub_001",
+    )
+    written_paths: dict[tuple[str, str, str], Path] = {}
+
+    def write_fresh_outputs(
+        executable_plan: object,
+        *,
+        cores: int,
+        dry_run: bool,
+    ) -> int:
+        assert not dry_run
+        for job in executable_plan.jobs:
+            for output_name, output in job.outputs.items():
+                output.staging_path.parent.mkdir(parents=True, exist_ok=True)
+                output.staging_path.write_text(
+                    f"{job.job_id}:{output_name}\n",
+                    encoding="utf-8",
+                )
+                written_paths[(job.step_name, output_name, job.address)] = (
+                    output.staging_path
+                )
+        return 0
+
+    hashed_paths: list[Path] = []
+    original_digest = execution_module.sha256_file_digest
+
+    def record_digest(path: Path) -> str:
+        hashed_paths.append(path)
+        return original_digest(path)
+
+    monkeypatch.setattr(execution_module, "_run_snakemake", write_fresh_outputs)
+    monkeypatch.setattr(execution_module, "sha256_file_digest", record_digest)
+
+    outcome = execute_run_plan(run_plan, cores=1)
+
+    assert outcome.all_selected_resolved
+    assert outcome.published_count == len(written_paths)
+    assert len(written_paths) >= 4
+    for staging_path in written_paths.values():
+        assert hashed_paths.count(staging_path) == 1
+
+    with sqlite3.connect(runtime_dir / "database/registry.db") as conn:
+        stored_rows = conn.execute(
+            """
+            SELECT a.step_name, a.output_name, a.address,
+                   a.content_digest, a.output_hash, a.file_size,
+                   po.output_digest, po.output_hash
+            FROM artifacts AS a
+            JOIN published_outputs AS po ON po.artifact_id = a.artifact_id
+            WHERE a.context = 'cache'
+              AND a.origin = 'workflow_output'
+            ORDER BY a.step_name, a.output_name, a.address
+            """
+        ).fetchall()
+
+    assert len(stored_rows) == len(written_paths)
+    for (
+        step_name,
+        output_name,
+        address,
+        content_digest,
+        output_hash,
+        file_size,
+        published_digest,
+        published_hash,
+    ) in stored_rows:
+        staging_path = written_paths[(step_name, output_name, address)]
+        expected_digest = sha256_file_digest(staging_path)
+        assert content_digest == published_digest == expected_digest
+        assert output_hash == published_hash == expected_digest[:16]
+        assert file_size == staging_path.stat().st_size
+
+
 def test_cross_workflow_membership_adopts_complete_transitive_reused_bundles(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

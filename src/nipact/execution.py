@@ -100,6 +100,7 @@ class PublishedOutputSpec:
 @dataclass(frozen=True)
 class _PublishedOutputResult:
     row: PublishedOutputRow
+    file_size: int
     created: bool
 
 
@@ -756,7 +757,7 @@ def _execute_executable_run_plan(
     try:
         artifact_rows = _workflow_output_artifact_rows(
             run_plan,
-            published_rows=published_rows,
+            published_results=published_results,
             actual_reused_artifacts=actual_reused_artifacts,
         )
         projection_recipes = _retained_projection_recipes(
@@ -871,7 +872,9 @@ def _publish_one_job(
     ``reason`` is ``None`` when the whole job published, else a coarse skip
     category (``"missing staged output"`` or ``"digest mismatch"``).
     """
-    preflight_rows: list[tuple[PublishedOutputSpec, RunJobOutputRef, str, str, str]] = []
+    preflight_rows: list[
+        tuple[PublishedOutputSpec, RunJobOutputRef, str, str, int, str]
+    ] = []
     for spec in specs:
         key = (spec.step_name, spec.output_name, spec.address)
         try:
@@ -885,17 +888,27 @@ def _publish_one_job(
             return [], "missing staged output"
         output_digest = sha256_file_digest(output_ref.staging_path)
         output_hash = short_hash(output_digest)
+        file_size = output_ref.staging_path.stat().st_size
         final_name = output_filename(
             address=spec.address,
             output_hash=output_hash,
             declared_extension=spec.declared_extension,
         )
-        preflight_rows.append((spec, output_ref, output_digest, output_hash, final_name))
+        preflight_rows.append(
+            (spec, output_ref, output_digest, output_hash, file_size, final_name)
+        )
 
     results: list[_PublishedOutputResult] = []
     temp_paths: list[Path] = []
     try:
-        for spec, output_ref, output_digest, output_hash, final_name in preflight_rows:
+        for (
+            spec,
+            output_ref,
+            output_digest,
+            output_hash,
+            file_size,
+            final_name,
+        ) in preflight_rows:
             final_path = spec.output_directory / final_name
             final_path.parent.mkdir(parents=True, exist_ok=True)
             final_path_existed = final_path.exists()
@@ -929,6 +942,7 @@ def _publish_one_job(
             results.append(
                 _PublishedOutputResult(
                     row=row,
+                    file_size=file_size,
                     created=not final_path_existed,
                 )
             )
@@ -1528,14 +1542,16 @@ def _input_record_payload(record: ArtifactInputRow) -> dict[str, Any]:
 def _workflow_output_artifact_rows(
     run_plan: ExecutableRunPlan,
     *,
-    published_rows: tuple[PublishedOutputRow, ...],
+    published_results: tuple[_PublishedOutputResult, ...],
     actual_reused_artifacts: dict[int, ReusableArtifactCandidate],
 ) -> tuple[WorkflowOutputArtifactRow, ...]:
     published_by_key = {
-        (row.step_name, row.output_name, row.address): row
-        for row in published_rows
+        (result.row.step_name, result.row.output_name, result.row.address): result
+        for result in published_results
     }
-    published_jobs = {(row.step_name, row.address) for row in published_rows}
+    published_jobs = {
+        (result.row.step_name, result.row.address) for result in published_results
+    }
     selected_output_keys = {
         (output_ref.step_name, output_ref.output_name, output_ref.address)
         for output_ref in run_plan.selected_fresh_output_refs
@@ -1554,9 +1570,7 @@ def _workflow_output_artifact_rows(
         for output_name in job.outputs:
             output_ref = job.output_ref(output_name)
             key = (output_ref.step_name, output_ref.output_name, output_ref.address)
-            published_row = published_by_key[key]
-            digest = sha256_file_digest(output_ref.staging_path)
-            output_hash = short_hash(digest)
+            published_result = published_by_key[key]
             staging_path = _runtime_relative_path(
                 run_plan.runtime_root,
                 output_ref.staging_path,
@@ -1567,12 +1581,12 @@ def _workflow_output_artifact_rows(
                     output_name=output_ref.output_name,
                     address=output_ref.address,
                     job_id=output_ref.job_id,
-                    path=published_row.path,
+                    path=published_result.row.path,
                     staging_path=staging_path,
-                    published_path=published_row.path,
-                    content_digest=digest,
-                    output_hash=output_hash,
-                    file_size=output_ref.staging_path.stat().st_size,
+                    published_path=published_result.row.path,
+                    content_digest=published_result.row.output_digest,
+                    output_hash=published_result.row.output_hash,
+                    file_size=published_result.file_size,
                     extension=output_ref.declared_extension,
                     parameters_json=_compact_json(output_ref.params),
                     callable_ref=output_ref.callable_ref,
