@@ -238,7 +238,7 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help=(
             "Forecast selected-output resolution and any required fresh "
-            "Snakemake work in an isolated dry-run workspace without hydrating "
+            "Snakemake work in an isolated dry-run workspace without preparing "
             "reused artifacts, running jobs, or publishing outputs."
         ),
     )
@@ -361,19 +361,7 @@ def _run_workflow_command(args: argparse.Namespace) -> int | None:
             ),
         )
         feedback.key_value("planned_reused_inputs", len(run_plan.reused_outputs))
-        if run_plan.dry_run:
-            feedback.key_value("planned_hydrated_inputs", 0)
-        else:
-            feedback.key_value(
-                "planned_hydrated_inputs", len(run_plan.reused_outputs)
-            )
-            # reused_outputs holds one ref per output coordinate — one per
-            # staged copy — so summing file_size counts a fanned-out
-            # artifact once, not per consumer edge.
-            feedback.key_value(
-                "planned_hydration_bytes",
-                sum(output_ref.file_size for output_ref in run_plan.reused_outputs),
-            )
+        if not run_plan.dry_run:
             feedback.key_value(
                 "existing_staged_outputs",
                 sum(
@@ -392,9 +380,9 @@ def _run_workflow_command(args: argparse.Namespace) -> int | None:
             feedback.key_value(
                 "note",
                 "Dry run: reused registered artifacts are referenced at their "
-                "validated registered paths; no hydration, publication, or "
-                "registry update occurs. Explicit recomputation is not available "
-                "in this release.",
+                "validated registered paths; no reused-input preparation, "
+                "publication, or registry update occurs. Explicit recomputation "
+                "is not available in this release.",
             )
         else:
             feedback.key_value(

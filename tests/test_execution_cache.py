@@ -1849,7 +1849,7 @@ def test_real_cli_reports_selected_reuse_without_snakemake(
     assert reuse_only_payload["prepared_reused_inputs"] == []
 
 
-def test_dry_run_cli_reports_reuse_without_hydration(
+def test_dry_run_cli_reports_reuse_without_input_preparation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
@@ -1892,13 +1892,11 @@ def test_dry_run_cli_reports_reuse_without_hydration(
     summary = dict(line.split("=", maxsplit=1) for line in lines if "=" in line)
     assert summary["dry_run"] == "true"
     # b is reused, so the forecast is the single fresh c job while the reuse
-    # counters report the reference without any hydration.
+    # counters report the reference without preparing an executable input.
     assert summary["planned_reachable_fresh_jobs"] == "1"
     assert summary["planned_reused_registered_artifacts"] == "1"
     assert summary["planned_reused_inputs"] == "1"
-    assert summary["planned_hydrated_inputs"] == "0"
     assert "existing_staged_outputs" not in summary
-    assert "planned_hydration_bytes" not in summary
     assert summary["note"].startswith("Dry run:")
     assert summary["outputs_published"] == "false"
     assert summary["registry"] == "not_updated"
@@ -1910,12 +1908,12 @@ def test_dry_run_cli_reports_reuse_without_hydration(
     assert list((dry_workspace / "staging").rglob("*")) == []
 
 
-def test_real_run_cli_reports_planned_hydration_bytes_fanout_once(
+def test_real_run_cli_reports_reused_occurrences_once_across_fanout(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    project_dir, runtime_dir, _log_path = _write_cache_project(
+    project_dir, _runtime_dir, _log_path = _write_cache_project(
         tmp_path,
         monkeypatch,
         entities=("sub_001", "sub_002"),
@@ -1934,22 +1932,6 @@ def test_real_run_cli_reports_planned_hydration_bytes_fanout_once(
     assert execute_run_plan(fit_plan, cores=1).published_count == len(
         fit_plan.published_outputs
     )
-    # Expected bytes come from the published files themselves, independent of
-    # the plan's file_size bookkeeping the CLI sums.
-    expected_bytes = sum(
-        (runtime_dir / _latest_registered_path(
-            runtime_dir,
-            step_name=step_name,
-            output_name=output_name,
-            address=address,
-        )).stat().st_size
-        for step_name, output_name, address in (
-            ("b_transform", "b_out", "sub_001"),
-            ("b_transform", "b_out", "sub_002"),
-            ("fit_transform", "fit_out", "cohort"),
-        )
-    )
-
     captured_plans = []
 
     def publish_stub(run_plan: object, **_kwargs: object) -> RunOutcome:
@@ -1989,8 +1971,8 @@ def test_real_run_cli_reports_planned_hydration_bytes_fanout_once(
         if "=" in line
     )
     (apply_plan,) = captured_plans
-    # The cohort fit fans out to both apply jobs but is one reused ref — one
-    # staged copy — so the aggregate counts its bytes once, not per consumer.
+    # The cohort fit fans out to both apply jobs but remains one reused input
+    # reference, independent of its later direct/copied delivery disposition.
     fit_ref = next(
         ref for ref in apply_plan.reused_outputs if ref.step_name == "fit_transform"
     )
@@ -2006,9 +1988,8 @@ def test_real_run_cli_reports_planned_hydration_bytes_fanout_once(
     assert summary["planned_reachable_fresh_jobs"] == "2"
     assert summary["planned_reused_registered_artifacts"] == "3"
     assert summary["planned_reused_inputs"] == "3"
-    # Real execution hydrates everything it reuses: the two counters agree.
-    assert summary["planned_hydrated_inputs"] == "3"
-    assert summary["planned_hydration_bytes"] == str(expected_bytes)
+    assert "planned_hydrated_inputs" not in summary
+    assert "planned_hydration_bytes" not in summary
     assert summary["existing_staged_outputs"] == "0"
     assert "missing work executes through Snakemake" in summary["note"]
 
