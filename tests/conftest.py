@@ -17,6 +17,7 @@ import pytest
 
 from nipact.cli import main
 from nipact.execution import build_run_plan, execute_run_plan
+from nipact.execution_evidence import CompletionReceipt, write_completion_receipt_atomic
 from nipact.registry import REGISTRY_DB_PATH, list_artifacts
 
 
@@ -56,6 +57,19 @@ def _write_all_staged_outputs(run_plan: object) -> None:
         job.staging_path.write_text(
             json.dumps(payload, indent=2, sort_keys=True) + "\n",
             encoding="utf-8",
+        )
+    execution_payload = json.loads(
+        (run_plan.run_workspace / "run_plan.json").read_text(encoding="utf-8")
+    )
+    for job_id, job_payload in execution_payload["jobs"].items():
+        write_completion_receipt_atomic(
+            run_plan.run_workspace / job_payload["completion_receipt_path"],
+            CompletionReceipt(
+                invocation_token=execution_payload["invocation_token"],
+                job_id=job_id,
+                request_bundle_digest=job_payload["request_bundle_digest"],
+                outputs=tuple(job_payload["declared_outputs"]),
+            ),
         )
 
 

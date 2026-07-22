@@ -9,6 +9,14 @@ from importlib import import_module
 from pathlib import Path
 from typing import Any, Callable
 
+from .execution_evidence import (
+    RUN_PLAN_SCHEMA_VERSION,
+    CompletionReceipt,
+    completion_receipt_relative_path,
+    validate_invocation_token,
+    write_completion_receipt_atomic,
+)
+
 JobCallable = Callable[
     [dict[str, tuple[Path, ...]], dict[str, Path], dict[str, Any], str],
     None,
@@ -32,6 +40,14 @@ def main(argv: list[str] | None = None) -> int:
 def run_job(*, run_plan_path: Path, job_id: str) -> None:
     """Run one job from a generated run plan."""
     run_plan = _read_json(run_plan_path)
+    if run_plan.get("schema_version") != RUN_PLAN_SCHEMA_VERSION:
+        raise RuntimeError("unsupported run-plan schema version")
+    try:
+        invocation_token = validate_invocation_token(
+            run_plan.get("invocation_token")
+        )
+    except ValueError as exc:
+        raise RuntimeError("run plan has no executable invocation token") from exc
     runtime_root = Path(_required_string(run_plan, "runtime_root")).expanduser().resolve()
     run_workspace = run_plan_path.parent.resolve()
     jobs = _required_mapping(run_plan, "jobs")
@@ -56,6 +72,29 @@ def run_job(*, run_plan_path: Path, job_id: str) -> None:
             raise RuntimeError(
                 f"runtime job did not create output {output_name!r}: {output_path}"
             )
+    raw_declared_outputs = job.get("declared_outputs")
+    if (
+        not isinstance(raw_declared_outputs, list)
+        or not all(isinstance(output, str) for output in raw_declared_outputs)
+        or raw_declared_outputs != sorted(output_paths)
+    ):
+        raise RuntimeError("job declared_outputs do not match runtime outputs")
+    receipt_relative = _required_string(job, "completion_receipt_path")
+    if receipt_relative != completion_receipt_relative_path(job_id):
+        raise RuntimeError("job completion receipt path is invalid")
+    receipt_path = _resolve_relative_under(
+        base=run_workspace,
+        relative_path=receipt_relative,
+        allowed_root=run_workspace / "receipts",
+        label="completion receipt",
+    )
+    receipt = CompletionReceipt(
+        invocation_token=invocation_token,
+        job_id=job_id,
+        request_bundle_digest=_required_string(job, "request_bundle_digest"),
+        outputs=tuple(raw_declared_outputs),
+    )
+    write_completion_receipt_atomic(receipt_path, receipt)
 
 
 def _resolve_outputs(

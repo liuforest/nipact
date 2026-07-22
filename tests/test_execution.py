@@ -20,6 +20,12 @@ from nipact.artifacts import (
 from nipact.examples.colors_processing_demo.model import build_color_grid
 from nipact.examples.colors_processing_demo.runtime import color_sector_analysis_file
 from nipact.errors import ValidationError
+from nipact.execution_evidence import (
+    RUN_PLAN_SCHEMA_VERSION,
+    CompletionReceipt,
+    validate_invocation_token,
+    write_completion_receipt_atomic,
+)
 from nipact.execution import (
     _run_plan_payload,
     _run_snakemake,
@@ -73,6 +79,20 @@ def _write_all_staged_outputs(
         job.staging_path.write_text(
             json.dumps(payload, indent=2, sort_keys=True) + "\n",
             encoding="utf-8",
+        )
+    run_plan_payload = json.loads(
+        (run_plan.run_workspace / "run_plan.json").read_text(encoding="utf-8")
+    )
+    for job_id, job_payload in run_plan_payload["jobs"].items():
+        receipt = CompletionReceipt(
+            invocation_token=run_plan_payload["invocation_token"],
+            job_id=job_id,
+            request_bundle_digest=job_payload["request_bundle_digest"],
+            outputs=tuple(job_payload["declared_outputs"]),
+        )
+        write_completion_receipt_atomic(
+            run_plan.run_workspace / job_payload["completion_receipt_path"],
+            receipt,
         )
 
 
@@ -826,6 +846,12 @@ def test_real_execution_rejects_missing_canonical_output_root_before_workspace(
     )
     (runtime_dir / "outputs/v1").rmdir()
     snakemake_called = False
+    token_generated = False
+
+    def unexpected_token() -> str:
+        nonlocal token_generated
+        token_generated = True
+        return "a" * 32
 
     def unexpected_snakemake(*_args: object, **_kwargs: object) -> int:
         nonlocal snakemake_called
@@ -833,12 +859,14 @@ def test_real_execution_rejects_missing_canonical_output_root_before_workspace(
         return 0
 
     monkeypatch.setattr("nipact.execution._run_snakemake", unexpected_snakemake)
+    monkeypatch.setattr("nipact.execution.generate_invocation_token", unexpected_token)
 
     with pytest.raises(ValidationError, match="canonical output root"):
         execute_run_plan(run_plan, cores=1)
 
     assert not run_plan.run_workspace.exists()
     assert not snakemake_called
+    assert not token_generated
 
 
 def test_build_run_plan_without_address_selects_all_entities(
@@ -1537,6 +1565,24 @@ def test_tiny_non_colors_run_registers_used_sources_and_trace(
 
     assert execute_run_plan(run_plan, cores=1).published_count == len(run_plan.published_outputs)
 
+    run_plan_payload = json.loads(
+        (run_plan.run_workspace / "run_plan.json").read_text(encoding="utf-8")
+    )
+    assert run_plan_payload["schema_version"] == RUN_PLAN_SCHEMA_VERSION
+    validate_invocation_token(run_plan_payload["invocation_token"])
+    for job_payload in run_plan_payload["jobs"].values():
+        assert is_valid_digest(job_payload["request_bundle_digest"])
+        assert job_payload["declared_outputs"] == sorted(job_payload["outputs"])
+        assert job_payload["completion_receipt_path"].startswith("receipts/job__")
+        assert {
+            (record["binding_name"], record["input_path"])
+            for record in job_payload["input_records"]
+        } == {
+            (binding_name, path)
+            for binding_name, paths in job_payload["inputs"].items()
+            for path in paths
+        }
+
     registry_path = runtime_dir / "database/registry.db"
     with sqlite3.connect(registry_path) as conn:
         source_rows = conn.execute(
@@ -1763,8 +1809,8 @@ def test_partial_publish_records_surviving_jobs(
     assert outcome.selected_reused_count == 0
     assert outcome.all_selected_resolved is False
     assert outcome.failed_jobs == (
-        ("source_text", "sub_002", "missing staged output"),
-        ("uppercase_text", "sub_002", "missing staged output"),
+        ("source_text", "sub_002", "missing completion receipt"),
+        ("uppercase_text", "sub_002", "missing completion receipt"),
     )
 
     with sqlite3.connect(runtime_dir / "database/registry.db") as conn:
@@ -2019,6 +2065,63 @@ def test_rerun_reuses_partial_survivors_without_recompute(
             "WHERE step_name = 'uppercase_text' ORDER BY address"
         ).fetchall()
     assert [row[0] for row in addresses] == ["sub_001", "sub_002"]
+
+
+def test_stale_completion_receipts_cannot_publish_current_outputs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project_dir, runtime_dir = _write_tiny_non_colors_project(tmp_path, monkeypatch)
+    run_plan = build_run_plan(
+        project_dir=project_dir,
+        context="mini",
+        workflow_name="main",
+        step_name="uppercase_text",
+        address="sub_001",
+    )
+
+    def write_outputs_with_stale_receipts(
+        executable_plan: object,
+        *_args: object,
+        **_kwargs: object,
+    ) -> int:
+        payload = json.loads(
+            (executable_plan.run_workspace / "run_plan.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        for job in executable_plan.jobs:
+            for output in job.outputs.values():
+                output.staging_path.parent.mkdir(parents=True, exist_ok=True)
+                output.staging_path.write_text("current bytes\n", encoding="utf-8")
+            job_payload = payload["jobs"][job.job_id]
+            write_completion_receipt_atomic(
+                executable_plan.run_workspace
+                / job_payload["completion_receipt_path"],
+                CompletionReceipt(
+                    invocation_token="c" * 32,
+                    job_id=job.job_id,
+                    request_bundle_digest=job_payload["request_bundle_digest"],
+                    outputs=tuple(job_payload["declared_outputs"]),
+                ),
+            )
+        return 0
+
+    monkeypatch.setattr(
+        "nipact.execution._run_snakemake",
+        write_outputs_with_stale_receipts,
+    )
+
+    outcome = execute_run_plan(run_plan, cores=1)
+
+    assert outcome.published_count == 0
+    assert not outcome.all_selected_resolved
+    assert outcome.failed_jobs == (
+        ("source_text", "sub_001", "invalid completion receipt"),
+        ("uppercase_text", "sub_001", "invalid completion receipt"),
+    )
+    with sqlite3.connect(runtime_dir / "database/registry.db") as conn:
+        assert conn.execute("SELECT COUNT(*) FROM published_outputs").fetchone()[0] == 0
 
 
 def test_mixed_run_records_reused_selection_when_fresh_address_fails(
