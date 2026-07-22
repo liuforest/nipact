@@ -290,6 +290,8 @@ def test_workflow_run_command_executes_step(
             selected_reused_count=0,
             failed_jobs=(),
             all_selected_resolved=True,
+            published_bytes=123,
+            cleanup_warnings=("retained diagnostic staging",),
         )
 
     monkeypatch.setattr("nipact.execution.execute_run_plan", publish_stub)
@@ -366,9 +368,11 @@ def test_workflow_run_command_executes_step(
         "Registry updated.",
         "",
         "published_outputs=1",
+        "published_bytes=123",
         "selected_generated_outputs=1",
         "selected_reused_outputs=0",
         "registry=updated",
+        "warning=retained diagnostic staging",
         "elapsed_seconds=2.500",
         "PASS: workflow run",
     ]

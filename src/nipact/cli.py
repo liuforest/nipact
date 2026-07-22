@@ -453,6 +453,7 @@ def _run_workflow_command(args: argparse.Namespace) -> int | None:
             feedback.key_value("registry", "not_updated")
         else:
             feedback.key_value("published_outputs", outcome.published_count)
+            feedback.key_value("published_bytes", outcome.published_bytes)
             feedback.key_value(
                 "selected_generated_outputs", outcome.selected_generated_count
             )
@@ -462,6 +463,8 @@ def _run_workflow_command(args: argparse.Namespace) -> int | None:
             feedback.key_value("registry", "updated")
             for step_name, address, reason in outcome.failed_jobs:
                 feedback.key_value("failed_job", f"{step_name} {address} ({reason})")
+            for warning in outcome.cleanup_warnings:
+                feedback.key_value("warning", warning)
         feedback.key_value("elapsed_seconds", f"{elapsed_seconds:.3f}")
         if outcome.all_selected_resolved:
             feedback.pass_line("PASS: workflow run")

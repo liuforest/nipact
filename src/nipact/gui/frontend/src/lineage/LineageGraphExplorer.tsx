@@ -326,7 +326,7 @@ function LineageSelectionPanel({
         <DetailItem label="published">
           <PathValue value={selectedArtifact.published_path} />
         </DetailItem>
-        <DetailItem label="staging">
+        <DetailItem label="historical staging (may not exist)">
           <PathValue value={selectedArtifact.staging_path} />
         </DetailItem>
         <DetailItem label="parameter">
