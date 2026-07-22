@@ -4012,29 +4012,6 @@ def _create_schema(conn: sqlite3.Connection) -> None:
     )
 
 
-def _source_file_path(runtime_root: Path, source_artifact_path: str) -> Path:
-    relative_path = Path(source_artifact_path).expanduser()
-    if relative_path.is_absolute():
-        raise ValidationError("source artifact path must be relative to runtime dir")
-    if ".." in relative_path.parts:
-        raise ValidationError("source artifact path must stay inside data/")
-    if not source_artifact_path.startswith("data/"):
-        raise ValidationError("source artifact path must be under data/")
-    source_path = (runtime_root / relative_path).resolve()
-    data_root = (runtime_root / "data").resolve()
-    if not _path_contains_or_same(data_root, source_path):
-        raise ValidationError("source artifact path must stay inside data/")
-    if not source_path.is_file():
-        raise ValidationError(f"missing source artifact: {source_artifact_path}")
-    return source_path
-
-
-def _path_extension(path: str) -> str:
-    if path.endswith(".nii.gz"):
-        return ".nii.gz"
-    return Path(path).suffix
-
-
 def _compact_json(payload: dict[str, Any]) -> str:
     return json.dumps(payload, allow_nan=False, sort_keys=True, separators=(",", ":"))
 

@@ -696,14 +696,14 @@ def _execute_executable_run_plan(
     _prepare_run_workspace(run_plan)
     actual_reused_artifacts: dict[int, ReusableArtifactCandidate] = {}
     if run_plan.dry_run:
-        # Dry runs re-resolve the active reused closure using metadata only. A
-        # fresh plan needs the registered input paths in its Snakefile; a
-        # reuse-only plan writes no executor files at all.
+        # Dry runs may refresh the active reused closure as a metadata-only
+        # forecast. A fresh plan needs the forecast input paths in its
+        # Snakefile; a reuse-only plan writes no executor files at all.
         if not has_fresh_selection:
             _write_reuse_only_workspace(run_plan)
         if has_selected_reuse:
             _emit_status(status_callback, "validating_selected_reuse")
-        reused_input_paths = _dry_run_reused_input_paths(run_plan)
+        reused_input_paths = _dry_run_forecast_input_paths(run_plan)
         if has_fresh_selection:
             _write_run_workspace(run_plan, reused_input_paths=reused_input_paths)
     else:
@@ -1096,17 +1096,17 @@ def _remove_stale_executor_file(path: Path) -> None:
         path.unlink()
 
 
-def _dry_run_reused_input_paths(run_plan: ExecutableRunPlan) -> dict[str, str]:
-    """Map reachable reused staging inputs to validated registered source paths.
+def _dry_run_forecast_input_paths(run_plan: ExecutableRunPlan) -> dict[str, str]:
+    """Map forecast reused staging inputs to metadata-valid registered paths.
 
     Keys derive from the in-memory validated ``ReusedRunJobOutputRef``s, never
-    from the serialized run plan. The mapped target is the freshly re-resolved
-    candidate's registered path — not the planned snapshot — so a registry
-    change between planning and execution is either revalidated or rejected.
-    Resolution re-checks identity, dependencies, outputs/ containment,
-    existence, and size without hashing bytes.
+    from the serialized run plan. This forecast may refresh the planned
+    candidate's registered path while checking identity, dependencies, output
+    containment, existence, and size without hashing bytes. Real execution does
+    not use this path: it resolves once under the runtime lock and hydration
+    consumes those frozen exact occurrences without another resolver query.
     """
-    candidates = _forecast_reresolve_reused_bundles(run_plan)
+    candidates = _resolve_dry_run_forecast_bundles(run_plan)
     mapping: dict[str, str] = {}
     for output_ref in run_plan.reused_outputs:
         candidate = candidates[output_ref.source_artifact_id]
@@ -1183,7 +1183,7 @@ def _verify_selected_reused_outputs(
     return verified_artifact_ids
 
 
-def _forecast_reresolve_reused_bundles(
+def _resolve_dry_run_forecast_bundles(
     run_plan: ExecutableRunPlan,
 ) -> dict[int, ReusableArtifactCandidate]:
     refs_by_request: dict[
