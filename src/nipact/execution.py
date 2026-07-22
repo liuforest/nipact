@@ -21,6 +21,15 @@ from .artifacts import (
     canonical_output_path,
 )
 from .errors import ValidationError
+from .execution_evidence import (
+    RUN_PLAN_SCHEMA_VERSION,
+    CompletionReceipt,
+    ExecutionEvidenceError,
+    completion_receipt_relative_path,
+    generate_invocation_token,
+    read_completion_receipt,
+    write_json_atomic,
+)
 from .hashing import sha256_file_digest, short_hash
 from .identity import validate_path_token
 from .manifest import Manifest
@@ -91,6 +100,7 @@ RunStatusCallback = Callable[[str], None]
 
 @dataclass(frozen=True)
 class PublishedOutputSpec:
+    job_id: str
     context: str
     workflow_name: str
     step_name: str
@@ -698,6 +708,7 @@ def _execute_executable_run_plan(
     has_fresh_selection = bool(run_plan.selected_fresh_output_refs)
     has_selected_reuse = bool(run_plan.selected_reused_output_refs)
     _preflight_publication_layout(run_plan)
+    invocation_token = None if run_plan.dry_run else generate_invocation_token()
     _prepare_run_workspace(run_plan)
     actual_reused_artifacts: dict[int, ReusableArtifactCandidate] = {}
     if run_plan.dry_run:
@@ -705,22 +716,32 @@ def _execute_executable_run_plan(
         # forecast. A fresh plan needs the forecast input paths in its
         # Snakefile; a reuse-only plan writes no executor files at all.
         if not has_fresh_selection:
-            _write_reuse_only_workspace(run_plan)
+            _write_reuse_only_workspace(run_plan, invocation_token=None)
         if has_selected_reuse:
             _emit_status(status_callback, "validating_selected_reuse")
         reused_input_paths = _dry_run_forecast_input_paths(run_plan)
         if has_fresh_selection:
-            _write_run_workspace(run_plan, reused_input_paths=reused_input_paths)
+            _write_run_workspace(
+                run_plan,
+                invocation_token=None,
+                supplied_input_paths=reused_input_paths,
+            )
     else:
-        if has_fresh_selection:
-            _write_run_workspace(run_plan)
-        else:
-            _write_reuse_only_workspace(run_plan)
         if has_selected_reuse:
             _emit_status(status_callback, "validating_selected_reuse")
         actual_reused_artifacts = _hydrate_reused_outputs(run_plan)
         if has_fresh_selection:
+            _write_run_workspace(
+                run_plan,
+                invocation_token=invocation_token,
+            )
             _remove_expected_staged_outputs(run_plan)
+            _remove_expected_completion_receipts(run_plan)
+        else:
+            _write_reuse_only_workspace(
+                run_plan,
+                invocation_token=invocation_token,
+            )
     returncode = 0
     if has_fresh_selection:
         _emit_status(status_callback, "starting_snakemake")
@@ -741,7 +762,12 @@ def _execute_executable_run_plan(
         )
     if has_fresh_selection:
         _emit_status(status_callback, "publishing_outputs")
-        published_results, publish_failures = _publish_run_outputs(run_plan)
+        if invocation_token is None:
+            raise ValidationError("real execution is missing its invocation token")
+        published_results, publish_failures = _publish_run_outputs(
+            run_plan,
+            invocation_token=invocation_token,
+        )
         published_results, prune_failures = _prune_orphan_published_jobs(
             run_plan,
             published_results,
@@ -834,14 +860,23 @@ def _emit_status(callback: RunStatusCallback | None, event: str) -> None:
         callback(event)
 
 
-def publish_run_outputs(run_plan: ExecutableRunPlan) -> tuple[PublishedOutputRow, ...]:
+def publish_run_outputs(
+    run_plan: ExecutableRunPlan,
+    *,
+    invocation_token: str,
+) -> tuple[PublishedOutputRow, ...]:
     """Publish planned outputs and return registry row facts."""
-    results, _failed = _publish_run_outputs(run_plan)
+    results, _failed = _publish_run_outputs(
+        run_plan,
+        invocation_token=invocation_token,
+    )
     return tuple(result.row for result in results)
 
 
 def _publish_run_outputs(
     run_plan: ExecutableRunPlan,
+    *,
+    invocation_token: str,
 ) -> tuple[tuple[_PublishedOutputResult, ...], tuple[tuple[str, str, str], ...]]:
     """Publish declared outputs from reachable non-reused jobs, best-effort per job.
 
@@ -858,7 +893,12 @@ def _publish_run_outputs(
     results: list[_PublishedOutputResult] = []
     failed: list[tuple[str, str, str]] = []
     for (step_name, address), specs in specs_by_job.items():
-        rows, reason = _publish_one_job(run_plan, specs, publishable_outputs)
+        rows, reason = _publish_one_job(
+            run_plan,
+            specs,
+            publishable_outputs,
+            invocation_token=invocation_token,
+        )
         if reason is None:
             results.extend(rows)
         else:
@@ -870,12 +910,42 @@ def _publish_one_job(
     run_plan: ExecutableRunPlan,
     specs: list[PublishedOutputSpec],
     publishable_outputs: dict[tuple[str, str, str], RunJobOutputRef],
+    *,
+    invocation_token: str,
 ) -> tuple[list[_PublishedOutputResult], str | None]:
     """Publish one job's siblings; return ``(rows, reason)``.
 
-    ``reason`` is ``None`` when the whole job published, else a coarse skip
-    category (``"missing staged output"`` or ``"digest mismatch"``).
+    ``reason`` is ``None`` when the whole job published, else a coarse receipt,
+    staging, or digest failure category.
     """
+    if not specs:
+        raise ValidationError("publishable job has no declared outputs")
+    job_ids = {spec.job_id for spec in specs}
+    request_digests = {spec.request_bundle_digest for spec in specs}
+    output_names = tuple(sorted(spec.output_name for spec in specs))
+    if len(job_ids) != 1 or len(request_digests) != 1:
+        raise ValidationError("publishable siblings disagree on their job contract")
+    request_bundle_digest = next(iter(request_digests))
+    if request_bundle_digest is None:
+        raise ValidationError("publishable output request identity is unresolved")
+    expected_receipt = CompletionReceipt(
+        invocation_token=invocation_token,
+        job_id=next(iter(job_ids)),
+        request_bundle_digest=request_bundle_digest,
+        outputs=output_names,
+    )
+    receipt_path = run_plan.run_workspace / completion_receipt_relative_path(
+        expected_receipt.job_id
+    )
+    if not receipt_path.is_file():
+        return [], "missing completion receipt"
+    try:
+        receipt = read_completion_receipt(receipt_path)
+    except ExecutionEvidenceError:
+        return [], "invalid completion receipt"
+    if receipt != expected_receipt:
+        return [], "invalid completion receipt"
+
     preflight_rows: list[
         tuple[PublishedOutputSpec, RunJobOutputRef, str, str, int, str]
     ] = []
@@ -1070,6 +1140,15 @@ def _remove_expected_staged_outputs(run_plan: ExecutableRunPlan) -> None:
             path.unlink()
 
 
+def _remove_expected_completion_receipts(run_plan: ExecutableRunPlan) -> None:
+    for job in run_plan.jobs:
+        path = run_plan.run_workspace / completion_receipt_relative_path(job.job_id)
+        if path.is_dir():
+            raise ValidationError(f"completion receipt path is a directory: {path}")
+        if path.exists() or path.is_symlink():
+            path.unlink()
+
+
 def _remove_published_output_files(
     runtime_root: Path,
     rows: tuple[PublishedOutputRow, ...],
@@ -1094,11 +1173,20 @@ def _remove_published_output_files(
 def _write_run_workspace(
     run_plan: ExecutableRunPlan,
     *,
-    reused_input_paths: dict[str, str] | None = None,
+    invocation_token: str | None,
+    supplied_input_paths: dict[str, str] | None = None,
 ) -> None:
     (run_plan.run_workspace / "staging").mkdir(exist_ok=True)
     (run_plan.run_workspace / "logs").mkdir(exist_ok=True)
-    _write_json_file(run_plan.run_workspace / "run_plan.json", _run_plan_payload(run_plan))
+    payload = _run_plan_payload(
+        run_plan,
+        invocation_token=invocation_token,
+        supplied_input_paths=supplied_input_paths,
+    )
+    try:
+        write_json_atomic(run_plan.run_workspace / "run_plan.json", payload)
+    except ExecutionEvidenceError as exc:
+        raise ValidationError(str(exc)) from exc
     selected_outputs = [
         output_ref.staging_path_relative
         for output_ref in run_plan.selected_fresh_output_refs
@@ -1109,14 +1197,24 @@ def _write_run_workspace(
     )
     _write_text_file(
         run_plan.run_workspace / "Snakefile",
-        _snakefile_text(run_plan, reused_input_paths=reused_input_paths),
+        _snakefile_text(run_plan, run_plan_payload=payload),
     )
 
 
-def _write_reuse_only_workspace(run_plan: ExecutableRunPlan) -> None:
+def _write_reuse_only_workspace(
+    run_plan: ExecutableRunPlan,
+    *,
+    invocation_token: str | None,
+) -> None:
     _remove_stale_executor_file(run_plan.run_workspace / "Snakefile")
     _remove_stale_executor_file(run_plan.run_workspace / "selected_outputs.txt")
-    _write_json_file(run_plan.run_workspace / "run_plan.json", _run_plan_payload(run_plan))
+    try:
+        write_json_atomic(
+            run_plan.run_workspace / "run_plan.json",
+            _run_plan_payload(run_plan, invocation_token=invocation_token),
+        )
+    except ExecutionEvidenceError as exc:
+        raise ValidationError(str(exc)) from exc
 
 
 def _preflight_publication_layout(run_plan: ExecutableRunPlan) -> None:
@@ -1401,8 +1499,10 @@ def _run_snakemake(run_plan: ExecutableRunPlan, *, cores: int, dry_run: bool) ->
 def _snakefile_text(
     run_plan: ExecutableRunPlan,
     *,
-    reused_input_paths: dict[str, str] | None = None,
+    run_plan_payload: dict[str, Any] | None = None,
 ) -> str:
+    payload = run_plan_payload or _run_plan_payload(run_plan)
+    payload_jobs = payload["jobs"]
     if run_plan.dry_run:
         lines = [
             "# Generated by NIPACT for a dry run. Do not edit.",
@@ -1415,13 +1515,16 @@ def _snakefile_text(
             "",
         ]
     for index, job in enumerate(run_plan.jobs):
-        inputs = ["run_plan.json", *job.inputs_as_relative_paths()]
-        if reused_input_paths:
-            # Substitution touches rule inputs only: a coordinate is either
-            # reused (no producing rule) or fresh (rule output), so a reused
-            # staging path can never collide with a fresh output line.
-            inputs = [reused_input_paths.get(path, path) for path in inputs]
-        outputs = [output.staging_path_relative for output in job.outputs.values()]
+        job_payload = payload_jobs[job.job_id]
+        inputs = [
+            "run_plan.json",
+            *(
+                path
+                for paths in job_payload["inputs"].values()
+                for path in paths
+            ),
+        ]
+        outputs = list(job_payload["outputs"].values())
         shell_text = shlex.join(
             [
                 sys.executable,
@@ -1454,8 +1557,16 @@ def _snakefile_output_lines(outputs: list[str]) -> list[str]:
     return [f"        {json.dumps(path)}," for path in outputs]
 
 
-def _run_plan_payload(run_plan: ExecutableRunPlan) -> dict[str, Any]:
+def _run_plan_payload(
+    run_plan: ExecutableRunPlan,
+    *,
+    invocation_token: str | None = None,
+    supplied_input_paths: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    path_substitutions = supplied_input_paths or {}
     return {
+        "schema_version": RUN_PLAN_SCHEMA_VERSION,
+        "invocation_token": invocation_token,
         "context": run_plan.context,
         "workflow": run_plan.workflow_name,
         "base_workflow": run_plan.base_workflow_name,
@@ -1475,13 +1586,35 @@ def _run_plan_payload(run_plan: ExecutableRunPlan) -> dict[str, Any]:
                 "step_name": job.step_name,
                 "address": job.address,
                 "callable_ref": job.callable_ref,
+                "request_bundle_digest": (
+                    job.projection_state.request_bundle_digest
+                    if isinstance(
+                        job.projection_state,
+                        ResolvedRequestBundleProjectionV3,
+                    )
+                    else None
+                ),
+                "declared_outputs": sorted(job.outputs),
+                "completion_receipt_path": completion_receipt_relative_path(
+                    job.job_id
+                ),
                 "outputs": {
                     output_name: output.staging_path_relative
                     for output_name, output in sorted(job.outputs.items())
                 },
-                "inputs": {name: list(paths) for name, paths in job.inputs.items()},
+                "inputs": {
+                    name: [path_substitutions.get(path, path) for path in paths]
+                    for name, paths in job.inputs.items()
+                },
                 "input_records": [
-                    _input_record_payload(record) for record in job.input_records
+                    _input_record_payload(
+                        record,
+                        supplied_input_path=path_substitutions.get(
+                            record.input_path,
+                            record.input_path,
+                        ),
+                    )
+                    for record in job.input_records
                 ],
                 "params": job.params,
             }
@@ -1581,10 +1714,14 @@ def _manifest_binding_payload(
     }
 
 
-def _input_record_payload(record: ArtifactInputRow) -> dict[str, Any]:
+def _input_record_payload(
+    record: ArtifactInputRow,
+    *,
+    supplied_input_path: str | None = None,
+) -> dict[str, Any]:
     return {
         "binding_name": record.binding_name,
-        "input_path": record.input_path,
+        "input_path": supplied_input_path or record.input_path,
         "dependency_role": record.dependency_role,
         "origin": record.origin,
         "source_step_name": record.source_step_name,
@@ -2029,6 +2166,7 @@ def _published_output_specs(
         for output_name, output in job.outputs.items():
             specs.append(
                 PublishedOutputSpec(
+                    job_id=job.job_id,
                     context=loaded.context,
                     workflow_name=plan.workflow_name,
                     step_name=job.step_name,
@@ -2086,19 +2224,6 @@ def _compact_json(payload: dict[str, object]) -> str:
         )
     except ValueError as exc:
         raise ValidationError("workflow parameters must be finite JSON values") from exc
-
-
-def _write_json_file(path: Path, payload: dict[str, Any]) -> None:
-    try:
-        content = json.dumps(
-            payload,
-            allow_nan=False,
-            indent=2,
-            sort_keys=True,
-        ) + "\n"
-    except ValueError as exc:
-        raise ValidationError("runtime JSON payload must be finite JSON values") from exc
-    _write_text_file(path, content)
 
 
 def _write_text_file(path: Path, content: str) -> None:

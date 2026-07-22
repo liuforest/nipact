@@ -19,6 +19,10 @@ from nipact.execution import (
     build_run_plan,
     execute_run_plan,
 )
+from nipact.execution_evidence import (
+    CompletionReceipt,
+    write_completion_receipt_atomic,
+)
 from nipact.hashing import sha256_file_digest
 from nipact.manifest import load_manifest
 from nipact.projection import (
@@ -35,6 +39,29 @@ from nipact.trace import build_trace_graph_for_workflow_coordinate
 
 def _write_yaml(path: Path, payload: dict[str, object]) -> None:
     path.write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")
+
+
+def _write_completion_receipts_for_jobs(
+    run_plan: object,
+    *,
+    job_ids: set[str] | None = None,
+) -> None:
+    payload = json.loads(
+        (run_plan.run_workspace / "run_plan.json").read_text(encoding="utf-8")
+    )
+    for job_id, job_payload in payload["jobs"].items():
+        if job_ids is not None and job_id not in job_ids:
+            continue
+        receipt = CompletionReceipt(
+            invocation_token=payload["invocation_token"],
+            job_id=job_id,
+            request_bundle_digest=job_payload["request_bundle_digest"],
+            outputs=tuple(job_payload["declared_outputs"]),
+        )
+        write_completion_receipt_atomic(
+            run_plan.run_workspace / job_payload["completion_receipt_path"],
+            receipt,
+        )
 
 
 def _write_cache_project(
@@ -1352,6 +1379,7 @@ def test_dependency_free_workflow_output_remains_reusable_as_an_input(
                     json.dumps({"job_id": job.job_id}) + "\n",
                     encoding="utf-8",
                 )
+        _write_completion_receipts_for_jobs(plan)
         return 0
 
     constant_plan = build_run_plan(
@@ -1433,6 +1461,22 @@ def test_cross_target_run_plan_reuses_upstream_from_registry(
     hydrated_b = c_plan.run_workspace / "staging/b_transform/b_out/sub_001.json"
     assert hydrated_b.is_file()
     assert sha256_file_digest(hydrated_b) == registered_b_digest
+    execution_payload = json.loads(
+        (c_plan.run_workspace / "run_plan.json").read_text(encoding="utf-8")
+    )
+    assert isinstance(execution_payload["invocation_token"], str)
+    c_job_payload = execution_payload["jobs"][c_job.job_id]
+    assert c_job_payload["inputs"]["b_input"] == [
+        "staging/b_transform/b_out/sub_001.json"
+    ]
+    assert next(
+        record
+        for record in c_job_payload["input_records"]
+        if record["binding_name"] == "b_input"
+    )["input_path"] == "staging/b_transform/b_out/sub_001.json"
+    assert (
+        c_plan.run_workspace / c_job_payload["completion_receipt_path"]
+    ).is_file()
     assert "job__b_transform__b_out__sub_001" not in (
         c_plan.run_workspace / "Snakefile"
     ).read_text(encoding="utf-8")
@@ -1513,10 +1557,21 @@ def test_cross_target_dry_run_maps_reused_upstream_without_copying(
     assert "b_transform" not in [job.step_name for job in c_plan.jobs]
     assert list((c_plan.run_workspace / "staging").rglob("*")) == []
     snakefile_text = (c_plan.run_workspace / "Snakefile").read_text(encoding="utf-8")
+    dry_payload = json.loads(
+        (c_plan.run_workspace / "run_plan.json").read_text(encoding="utf-8")
+    )
+    assert dry_payload["invocation_token"] is None
     mapped_b = os.path.relpath(
         runtime_dir / registered_b_path,
         c_plan.run_workspace,
     ).replace(os.sep, "/")
+    c_job_payload = next(iter(dry_payload["jobs"].values()))
+    assert c_job_payload["inputs"]["b_input"] == [mapped_b]
+    assert next(
+        record
+        for record in c_job_payload["input_records"]
+        if record["binding_name"] == "b_input"
+    )["input_path"] == mapped_b
     assert json.dumps(mapped_b) in snakefile_text
     assert "staging/b_transform/b_out/sub_001.json" not in snakefile_text
     # The serialized staging contract is unchanged: only the generated
@@ -2575,6 +2630,7 @@ def test_publication_reuses_prepared_facts_for_each_fresh_staging_output(
                 written_paths[(job.step_name, output_name, job.address)] = (
                     output.staging_path
                 )
+        _write_completion_receipts_for_jobs(executable_plan)
         return 0
 
     hashed_paths: list[Path] = []
@@ -2826,6 +2882,10 @@ def test_failed_fresh_branch_does_not_adopt_its_reused_memberships(
         output = job.outputs["c_out"]
         output.staging_path.parent.mkdir(parents=True, exist_ok=True)
         output.staging_path.write_text('{"value":"retained"}\n', encoding="utf-8")
+        _write_completion_receipts_for_jobs(
+            derivative_plan,
+            job_ids={job.job_id},
+        )
         return 1
 
     monkeypatch.setattr("nipact.execution._run_snakemake", write_one_selected_output)
