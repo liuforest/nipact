@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import pytest
 
 import nipact.registry as registry
+from nipact.artifacts import canonical_output_path
 from nipact.cli import main
 from nipact.errors import ValidationError
 from nipact.execution import build_run_plan, execute_run_plan
@@ -776,8 +777,15 @@ def test_accepted_artifact_validation_hashes_shared_occurrence_once(
     payload = b"shared artifact\n"
     digest = registry.sha256_digest(payload)
     output_hash = digest[:16]
-    relative_path = (
-        f"outputs/colors/base/example/result/subject.{output_hash}.json"
+    request_bundle_digest = "a" * 64
+    relative_path = canonical_output_path(
+        context="colors",
+        step_name="example",
+        address="subject",
+        request_bundle_digest=request_bundle_digest,
+        output_name="result",
+        output_hash=output_hash,
+        declared_extension=".json",
     )
     artifact_path = tmp_path / relative_path
     artifact_path.parent.mkdir(parents=True)
@@ -798,6 +806,7 @@ def test_accepted_artifact_validation_hashes_shared_occurrence_once(
             output_hash,
             len(payload),
             ".json",
+            request_bundle_digest,
         )
         for artifact_id in (10, 11)
     ]
@@ -840,7 +849,16 @@ def test_accepted_artifact_validation_checks_size_and_extension(
     payload = b"artifact\n"
     digest = registry.sha256_digest(payload)
     output_hash = digest[:16]
-    relative_path = f"outputs/colors/base/example/result/subject.{output_hash}.json"
+    request_bundle_digest = "a" * 64
+    relative_path = canonical_output_path(
+        context="colors",
+        step_name="example",
+        address="subject",
+        request_bundle_digest=request_bundle_digest,
+        output_name="result",
+        output_hash=output_hash,
+        declared_extension=".json",
+    )
     artifact_path = tmp_path / relative_path
     artifact_path.parent.mkdir(parents=True)
     artifact_path.write_bytes(payload)
@@ -860,6 +878,7 @@ def test_accepted_artifact_validation_checks_size_and_extension(
             output_hash,
             len(payload),
             ".json",
+            request_bundle_digest,
         )
     )
     row[field_index] = bad_value

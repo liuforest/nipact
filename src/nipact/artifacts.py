@@ -1,9 +1,68 @@
-"""Small helpers for published artifact filenames."""
+"""Helpers for canonical published-artifact paths and filenames."""
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from .errors import ValidationError
+from .hashing import is_valid_digest
 from .identity import validate_hash_alias, validate_path_token
+
+STORAGE_LAYOUT_VERSION = 1
+CANONICAL_OUTPUT_ROOT = Path("outputs") / f"v{STORAGE_LAYOUT_VERSION}"
+
+
+def canonical_output_directory(
+    *,
+    context: str,
+    step_name: str,
+    address: str,
+    request_bundle_digest: str,
+    output_name: str,
+) -> str:
+    """Return the canonical runtime-relative directory for one requested output."""
+    context = validate_path_token(context, label="output context")
+    step_name = validate_path_token(step_name, label="output step name")
+    address = validate_path_token(address, label="output address")
+    output_name = validate_path_token(output_name, label="output name")
+    if not is_valid_digest(request_bundle_digest):
+        raise ValidationError(
+            "request bundle digest must be a lowercase 64-character hexadecimal string"
+        )
+    return (
+        CANONICAL_OUTPUT_ROOT
+        / context
+        / step_name
+        / address
+        / request_bundle_digest
+        / output_name
+    ).as_posix()
+
+
+def canonical_output_path(
+    *,
+    context: str,
+    step_name: str,
+    address: str,
+    request_bundle_digest: str,
+    output_name: str,
+    output_hash: str,
+    declared_extension: str,
+) -> str:
+    """Return the complete canonical runtime-relative path for one output."""
+    directory = canonical_output_directory(
+        context=context,
+        step_name=step_name,
+        address=address,
+        request_bundle_digest=request_bundle_digest,
+        output_name=output_name,
+    )
+    filename = output_filename(
+        address=address,
+        output_hash=output_hash,
+        declared_extension=declared_extension,
+    )
+    return f"{directory}/{filename}"
 
 
 def output_filename(*, address: str, output_hash: str, declared_extension: str) -> str:

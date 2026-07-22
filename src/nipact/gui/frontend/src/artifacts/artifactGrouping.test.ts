@@ -71,7 +71,7 @@ describe("artifact grouping helpers", () => {
         software_ref: "nipact-demo/1",
         step_name: "color_sector_analysis",
         output_name: "sector_counts",
-        path: "outputs/colors/base/color_sector_analysis/sector_counts/color_002.json",
+        path: "outputs/v1/colors/color_sector_analysis/color_002/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/sector_counts/color_002.1234567890abcdef.json",
         content_digest: "b".repeat(64),
       }),
     ];

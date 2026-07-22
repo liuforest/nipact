@@ -1757,7 +1757,7 @@ def test_real_run_cli_reports_planned_hydration_bytes_fanout_once(
     assert "missing work executes through Snakemake" in summary["note"]
 
 
-def test_dry_run_forecast_refreshes_candidate_path_when_registry_path_moves(
+def test_dry_run_forecast_rejects_noncanonical_registry_path(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1778,17 +1778,12 @@ def test_dry_run_forecast_refreshes_candidate_path_when_registry_path_moves(
         dry_run=True,
     )
     assert len(c_plan.reused_outputs) == 1
-    planned_source = c_plan.reused_outputs[0].source_path
     old_rel = c_plan.reused_outputs[0].source_path_relative
     artifact_id = c_plan.reused_outputs[0].source_artifact_id
 
-    # Move the registered occurrence under outputs/ while leaving the old file
-    # present with a valid size. The dry-run metadata forecast refreshes the
-    # candidate path; it does not establish authority for real execution.
+    # Workflow-output locations are canonical storage facts. A dry-run forecast
+    # may refresh candidate metadata, but it must not accept a relocated path.
     new_rel = "/".join([*old_rel.split("/")[:-1], "moved", old_rel.split("/")[-1]])
-    new_path = runtime_dir / new_rel
-    new_path.parent.mkdir(parents=True, exist_ok=True)
-    new_path.write_bytes(planned_source.read_bytes())
     with sqlite3.connect(runtime_dir / "database/registry.db") as conn:
         conn.execute(
             "UPDATE artifacts SET path = ?, published_path = ? WHERE artifact_id = ?",
@@ -1798,8 +1793,6 @@ def test_dry_run_forecast_refreshes_candidate_path_when_registry_path_moves(
             "UPDATE published_outputs SET path = ? WHERE artifact_id = ?",
             (new_rel, artifact_id),
         )
-    assert planned_source.is_file()
-
     calls: list[bool] = []
 
     def record_run(run_plan: object, *, cores: int, dry_run: bool) -> int:
@@ -1807,20 +1800,12 @@ def test_dry_run_forecast_refreshes_candidate_path_when_registry_path_moves(
         return 0
 
     monkeypatch.setattr("nipact.execution._run_snakemake", record_run)
-    assert execute_run_plan(c_plan, cores=1).published_count == 0
-    assert calls == [True]
-
-    snakefile_text = (c_plan.run_workspace / "Snakefile").read_text(encoding="utf-8")
-    mapped_new = os.path.relpath(
-        runtime_dir / new_rel,
-        c_plan.run_workspace,
-    ).replace(os.sep, "/")
-    mapped_old = os.path.relpath(
-        runtime_dir / old_rel,
-        c_plan.run_workspace,
-    ).replace(os.sep, "/")
-    assert json.dumps(mapped_new) in snakefile_text
-    assert mapped_old not in snakefile_text
+    with pytest.raises(
+        ValidationError,
+        match="registered reusable artifact path does not match its request identity",
+    ):
+        execute_run_plan(c_plan, cores=1)
+    assert calls == []
 
 
 @pytest.mark.parametrize(
@@ -1979,7 +1964,7 @@ def test_final_resolution_replans_retracted_forecast_as_fresh(
     assert not outcome.all_selected_resolved
 
 
-def test_real_hydration_reads_final_resolved_registered_path(
+def test_real_hydration_reads_final_resolved_canonical_path(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2000,23 +1985,7 @@ def test_real_hydration_reads_final_resolved_registered_path(
         step_name="c_transform",
     )
     reused = c_plan.reused_outputs[0]
-    old_path = reused.source_path
-    new_rel = (
-        "outputs/cache/main/b_transform/b_out/relocated/"
-        f"{old_path.name}"
-    )
-    new_path = runtime_dir / new_rel
-    new_path.parent.mkdir(parents=True, exist_ok=True)
-    new_path.write_bytes(old_path.read_bytes())
-    with sqlite3.connect(runtime_dir / "database/registry.db") as conn:
-        conn.execute(
-            """
-            UPDATE artifacts
-            SET path = ?, published_path = ?
-            WHERE artifact_id = ?
-            """,
-            (new_rel, new_rel, reused.source_artifact_id),
-        )
+    canonical_path = reused.source_path
 
     original_digest = execution_module.sha256_file_digest
     hashed_paths: list[Path] = []
@@ -2027,8 +1996,7 @@ def test_real_hydration_reads_final_resolved_registered_path(
 
     monkeypatch.setattr(execution_module, "sha256_file_digest", recording_digest)
     assert execute_run_plan(c_plan, cores=1).all_selected_resolved
-    assert new_path in hashed_paths
-    assert old_path not in hashed_paths
+    assert canonical_path in hashed_paths
 
 
 def test_dry_run_accepts_same_size_corruption_real_run_rejects_it(
@@ -4798,8 +4766,8 @@ def test_final_resolution_adopts_artifact_created_after_structural_planning(
     assert execute_run_plan(full_plan, cores=1).published_count == len(
         full_plan.published_outputs
     )
-    output_dir = runtime_dir / "outputs/cache/main/b_transform/b_out"
-    files_before = sorted(path.name for path in output_dir.glob("*.json"))
+    output_dir = runtime_dir / "outputs/v1/cache/b_transform"
+    files_before = sorted(path.name for path in output_dir.rglob("*.json"))
     row_before = _published_output_row(
         runtime_dir,
         step_name="b_transform",
@@ -4832,7 +4800,7 @@ def test_final_resolution_adopts_artifact_created_after_structural_planning(
     )
     assert row_after[1] == row_before[1]
     assert row_after == row_before
-    assert sorted(path.name for path in output_dir.glob("*.json")) == files_before
+    assert sorted(path.name for path in output_dir.rglob("*.json")) == files_before
     assert sha256_file_digest(runtime_dir / row_after[1]) == digest_before
     with sqlite3.connect(runtime_dir / "database/registry.db") as conn:
         assert conn.execute("SELECT COUNT(*) FROM workflow_runs").fetchone()[0] == 2
@@ -5235,13 +5203,10 @@ def test_bundle_reresolution_records_the_equivalent_artifact_actually_consumed(
         conn.execute(
             """
             UPDATE artifacts
-            SET path = ?, published_path = NULL, is_published = 0
+            SET published_path = NULL, is_published = 0
             WHERE artifact_id = ?
             """,
-            (
-                "outputs/cache/main/b_transform/b_out/missing.json",
-                older_id,
-            ),
+            (older_id,),
         )
 
     assert execute_run_plan(second_c_plan, cores=1).all_selected_resolved
@@ -5475,14 +5440,10 @@ def test_multi_output_substitution_records_all_siblings_and_transitive_membershi
             conn.execute(
                 """
                 UPDATE artifacts
-                SET path = ?, published_path = ?
+                SET published_path = NULL, is_published = 0
                 WHERE artifact_id = ?
                 """,
-                (
-                    f"outputs/cache/main/missing/{artifact_id}.json",
-                    f"outputs/cache/main/missing/{artifact_id}.json",
-                    artifact_id,
-                ),
+                (artifact_id,),
             )
 
     assert execute_run_plan(derivative_plan, cores=1).all_selected_resolved
@@ -6277,7 +6238,10 @@ def test_targeted_dry_run_writes_no_outputs_and_no_registry_rows(
     )
     assert (run_plan.run_workspace / "run_plan.json").is_file()
     assert not log_path.exists()
-    assert list((runtime_dir / "outputs").rglob("*")) == []
+    assert all(
+        spec.request_bundle_digest is None for spec in run_plan.published_outputs
+    )
+    assert list((runtime_dir / "outputs/v1").rglob("*")) == []
     assert _registry_row_counts(runtime_dir) == {
         "workflow_runs": 0,
         "workflow_outputs": 0,

@@ -8,7 +8,7 @@ import yaml
 
 import nipact.registry as registry_module
 from nipact.cli import main
-from nipact.artifacts import output_filename
+from nipact.artifacts import canonical_output_path
 from nipact.examples.colors_processing_demo.model import DEFAULT_ENTITY_COUNT
 from nipact.examples.colors_processing_demo.demo_names import (
     analysis_entity_ids,
@@ -245,22 +245,52 @@ def _insert_published_output(
 ) -> tuple[Path, str, str]:
     if payload is None:
         payload = {"status": "ok", "address": address}
-    output_dir = runtime_dir / "outputs" / "colors" / workflow_name / step_name / output_name
-    output_dir.mkdir(parents=True, exist_ok=True)
-    staging_path = output_dir / f"{address}{extension}"
+    projection_json = json.dumps(
+        {
+            "address": address,
+            "canonical_parameters": {},
+            "determinism_contract": "deterministic",
+            "identity_contract_version": 3,
+            "namespace": "colors",
+            "output_contract": {
+                "output_contract_version": 1,
+                "sibling_outputs": [
+                    {"declared_extension": extension, "output_name": output_name}
+                ],
+            },
+            "result_affecting_settings": {},
+            "role_labelled_bindings": [],
+            "step_contract": {
+                "callable_ref": "tests:manual",
+                "runner_contract_version": "2",
+                "step_contract_id": step_name,
+                "step_contract_version": "1",
+            },
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    projection_digest = sha256_digest(projection_json.encode("utf-8"))
+    staging_path = runtime_dir / f"runs/colors/manual/{address}{extension}"
+    staging_path.parent.mkdir(parents=True, exist_ok=True)
     staging_path.write_text(
         json.dumps(payload, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
     )
     output_digest = sha256_file_digest(staging_path)
     output_hash = short_hash(output_digest)
-    output_path = output_dir / output_filename(
+    relative_path = canonical_output_path(
+        context="colors",
+        step_name=step_name,
         address=address,
+        request_bundle_digest=projection_digest,
+        output_name=output_name,
         output_hash=output_hash,
         declared_extension=extension,
     )
+    output_path = runtime_dir / relative_path
+    output_path.parent.mkdir(parents=True, exist_ok=True)
     staging_path.rename(output_path)
-    relative_path = output_path.relative_to(runtime_dir).as_posix()
     with sqlite3.connect(runtime_dir / "database/registry.db") as conn:
         conn.execute("PRAGMA foreign_keys = ON")
         run_id = int(
@@ -305,32 +335,6 @@ def _insert_published_output(
                 ),
             ).lastrowid
         )
-        projection_json = json.dumps(
-            {
-                "address": address,
-                "canonical_parameters": {},
-                "determinism_contract": "deterministic",
-                "identity_contract_version": 3,
-                "namespace": "colors",
-                "output_contract": {
-                    "output_contract_version": 1,
-                    "sibling_outputs": [
-                        {"declared_extension": extension, "output_name": output_name}
-                    ],
-                },
-                "result_affecting_settings": {},
-                "role_labelled_bindings": [],
-                "step_contract": {
-                    "callable_ref": "tests:manual",
-                    "runner_contract_version": "2",
-                    "step_contract_id": step_name,
-                    "step_contract_version": "1",
-                },
-            },
-            sort_keys=True,
-            separators=(",", ":"),
-        )
-        projection_digest = sha256_digest(projection_json.encode("utf-8"))
         conn.execute(
             """
             INSERT OR IGNORE INTO request_bundle_projections (
@@ -516,6 +520,13 @@ def test_init_creates_project_runtime_databases_and_validates(
 
     with sqlite3.connect(runtime_dir / "database/registry.db") as conn:
         schema_version = conn.execute("PRAGMA user_version").fetchone()[0]
+        context_row = conn.execute(
+            """
+            SELECT runtime_path, storage_layout_version
+            FROM contexts
+            WHERE context = 'colors'
+            """
+        ).fetchone()
         manifest_rows = conn.execute(
             """
             SELECT d.manifest_name, d.declared_path, v.value_schema,
@@ -539,6 +550,7 @@ def test_init_creates_project_runtime_databases_and_validates(
     with registry_module._connect_readonly(runtime_dir / "database/registry.db") as conn:
         foreign_keys = conn.execute("PRAGMA foreign_keys").fetchone()[0]
     assert schema_version == REGISTRY_SCHEMA_VERSION
+    assert context_row == (str(runtime_dir), 1)
     assert foreign_keys == 1
     assert manifest_rows == [
         (
@@ -560,7 +572,8 @@ def test_init_creates_project_runtime_databases_and_validates(
     ]
     assert artifact_rows == []
     assert published_rows == []
-    assert list((runtime_dir / "outputs").rglob("*")) == []
+    assert (runtime_dir / "outputs/v1").is_dir()
+    assert list((runtime_dir / "outputs/v1").rglob("*")) == []
 
     _assert_validate_passes(project_dir, capsys)
 
@@ -662,7 +675,11 @@ def test_init_creates_prepared_neuro_demo_project_and_registry(
     with sqlite3.connect(runtime_dir / "database/registry.db") as conn:
         schema_version = conn.execute("PRAGMA user_version").fetchone()[0]
         context_row = conn.execute(
-            "SELECT runtime_path FROM contexts WHERE context = ?",
+            """
+            SELECT runtime_path, storage_layout_version
+            FROM contexts
+            WHERE context = ?
+            """,
             (demo,),
         ).fetchone()
         manifest_rows = conn.execute(
@@ -683,7 +700,7 @@ def test_init_creates_prepared_neuro_demo_project_and_registry(
             (demo,),
         ).fetchone()[0]
     assert schema_version == REGISTRY_SCHEMA_VERSION
-    assert context_row == (str(runtime_dir),)
+    assert context_row == (str(runtime_dir), 1)
     assert manifest_rows == [
         (
             name,
@@ -968,7 +985,7 @@ def test_validate_rejects_missing_upstream_request_projection(
     _assert_validate_fails(project_dir, capsys, "missing upstream projection")
 
 
-def test_registry_v17_projection_observation_and_membership_constraints(
+def test_registry_v18_projection_observation_and_membership_constraints(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
@@ -993,7 +1010,7 @@ def test_registry_v17_projection_observation_and_membership_constraints(
         observations=(observation,),
     )
     with sqlite3.connect(registry_path) as conn:
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 17
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 18
         artifact_columns = {
             row[1]: row for row in conn.execute("PRAGMA table_info(artifacts)")
         }
@@ -1170,9 +1187,13 @@ def test_registry_v17_projection_observation_and_membership_constraints(
 @pytest.mark.parametrize(
     ("output_artifact_path", "expected_error"),
     [
-        ("../outside.json", "must be under outputs/"),
+        ("../outside.json", "must be under outputs/v1/"),
         ("/tmp/outside.json", "must be relative to runtime dir"),
-        ("data/outside.json", "must be under outputs/"),
+        ("data/outside.json", "must be under outputs/v1/"),
+        (
+            "outputs/colors/base/analysis/result/cohort.1234567890abcdef.json",
+            "must be under outputs/v1/",
+        ),
     ],
 )
 def test_validate_fails_for_published_output_path_escape(

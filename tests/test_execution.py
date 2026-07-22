@@ -11,7 +11,12 @@ import yaml
 import nipact.registry as registry_module
 import nipact.execution as execution_module
 from nipact.cli import main
-from nipact.artifacts import output_filename, parse_output_filename
+from nipact.artifacts import (
+    canonical_output_directory,
+    canonical_output_path,
+    output_filename,
+    parse_output_filename,
+)
 from nipact.examples.colors_processing_demo.model import build_color_grid
 from nipact.examples.colors_processing_demo.runtime import color_sector_analysis_file
 from nipact.errors import ValidationError
@@ -508,6 +513,63 @@ def test_output_filename_parses_declared_extension_not_path_suffix() -> None:
     )
 
 
+def test_canonical_output_path_is_request_addressed_and_workflow_independent() -> None:
+    request_digest = "a" * 64
+
+    assert canonical_output_directory(
+        context="colors",
+        step_name="color_sector_analysis",
+        address="cohort",
+        request_bundle_digest=request_digest,
+        output_name="sector_counts",
+    ) == (
+        "outputs/v1/colors/color_sector_analysis/cohort/"
+        f"{request_digest}/sector_counts"
+    )
+    assert canonical_output_path(
+        context="colors",
+        step_name="color_sector_analysis",
+        address="cohort",
+        request_bundle_digest=request_digest,
+        output_name="sector_counts",
+        output_hash="1234567890abcdef",
+        declared_extension=".json",
+    ) == (
+        "outputs/v1/colors/color_sector_analysis/cohort/"
+        f"{request_digest}/sector_counts/cohort.1234567890abcdef.json"
+    )
+    assert canonical_output_directory(
+        context="colors",
+        step_name="color_sector_analysis",
+        address="cohort",
+        request_bundle_digest="b" * 64,
+        output_name="sector_counts",
+    ) != canonical_output_directory(
+        context="colors",
+        step_name="color_sector_analysis",
+        address="cohort",
+        request_bundle_digest=request_digest,
+        output_name="sector_counts",
+    )
+
+
+@pytest.mark.parametrize(
+    "request_digest",
+    ("a" * 63, "A" * 64, "g" * 64),
+)
+def test_canonical_output_path_rejects_invalid_request_digest(
+    request_digest: str,
+) -> None:
+    with pytest.raises(ValidationError, match="request bundle digest"):
+        canonical_output_directory(
+            context="colors",
+            step_name="analysis",
+            address="cohort",
+            request_bundle_digest=request_digest,
+            output_name="result",
+        )
+
+
 def test_build_run_plan_for_base_entity_step(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
@@ -710,6 +772,7 @@ def test_exact_scientific_fan_in_rejects_invalid_collections(
     [
         ("missing_context", "unknown context: mini"),
         ("runtime_mismatch", "registry.db context runtime path is out of date"),
+        ("storage_layout_mismatch", "storage layout version is incompatible"),
         ("incompatible_schema", "registry.db schema version is incompatible"),
     ],
 )
@@ -729,8 +792,13 @@ def test_build_run_plan_validates_registry_binding_before_workspace_creation(
                 "UPDATE contexts SET runtime_path = ? WHERE context = 'mini'",
                 (str(tmp_path / "other-runtime"),),
             )
+        elif registry_mutation == "storage_layout_mismatch":
+            conn.execute("PRAGMA ignore_check_constraints = ON")
+            conn.execute(
+                "UPDATE contexts SET storage_layout_version = 2 WHERE context = 'mini'"
+            )
         else:
-            conn.execute("PRAGMA user_version = 14")
+            conn.execute("PRAGMA user_version = 17")
 
     with pytest.raises(ValidationError, match=message):
         build_run_plan(
@@ -742,6 +810,35 @@ def test_build_run_plan_validates_registry_binding_before_workspace_creation(
         )
 
     assert not (runtime_dir / "runs").exists()
+
+
+def test_real_execution_rejects_missing_canonical_output_root_before_workspace(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project_dir, runtime_dir = _write_tiny_non_colors_project(tmp_path, monkeypatch)
+    run_plan = build_run_plan(
+        project_dir=project_dir,
+        context="mini",
+        workflow_name="main",
+        step_name="uppercase_text",
+        address="sub_001",
+    )
+    (runtime_dir / "outputs/v1").rmdir()
+    snakemake_called = False
+
+    def unexpected_snakemake(*_args: object, **_kwargs: object) -> int:
+        nonlocal snakemake_called
+        snakemake_called = True
+        return 0
+
+    monkeypatch.setattr("nipact.execution._run_snakemake", unexpected_snakemake)
+
+    with pytest.raises(ValidationError, match="canonical output root"):
+        execute_run_plan(run_plan, cores=1)
+
+    assert not run_plan.run_workspace.exists()
+    assert not snakemake_called
 
 
 def test_build_run_plan_without_address_selects_all_entities(
@@ -1191,10 +1288,11 @@ def test_execute_run_plan_publishes_selected_outputs_without_real_snakemake(
     assert (run_plan.run_workspace / "Snakefile").is_file()
     assert (run_plan.run_workspace / "run_plan.json").is_file()
     assert (run_plan.run_workspace / "selected_outputs.txt").is_file()
-    output_dir = runtime_dir / "outputs/colors/base/color_sector_analysis/sector_counts"
-    outputs = sorted(output_dir.glob("*.json"))
+    output_dir = runtime_dir / "outputs/v1/colors/color_sector_analysis/cohort"
+    outputs = sorted(output_dir.rglob("*.json"))
     assert len(outputs) == 1
     assert outputs[0].name.startswith("cohort.")
+    selected_relative_path = outputs[0].relative_to(runtime_dir).as_posix()
     with sqlite3.connect(runtime_dir / "database/registry.db") as conn:
         rows = conn.execute(
             """
@@ -1251,7 +1349,7 @@ def test_execute_run_plan_publishes_selected_outputs_without_real_snakemake(
         "color_sector_analysis",
         "sector_counts",
         "cohort",
-        f"outputs/colors/base/color_sector_analysis/sector_counts/{outputs[0].name}",
+        selected_relative_path,
     )
     assert selected_row[5] is not None
     assert provenance_counts == {
@@ -1264,10 +1362,10 @@ def test_execute_run_plan_publishes_selected_outputs_without_real_snakemake(
     }
     assert selected_artifact == (
         "workflow_output",
-        f"outputs/colors/base/color_sector_analysis/sector_counts/{outputs[0].name}",
+        selected_relative_path,
         1,
         1,
-        f"outputs/colors/base/color_sector_analysis/sector_counts/{outputs[0].name}",
+        selected_relative_path,
         "runs/colors/base/color_sector_analysis/staging/color_sector_analysis/sector_counts/cohort.json",
     )
     assert json.loads(run_observations[0]) == {
@@ -1325,8 +1423,7 @@ def test_execute_run_plan_removes_published_files_when_registration_fails(
     with pytest.raises(ValidationError, match="registry write failed"):
         execute_run_plan(run_plan, cores=1)
 
-    output_dir = runtime_dir / "outputs/colors/base/color_sector_analysis/sector_counts"
-    assert list(output_dir.glob("*.json")) == []
+    assert list((runtime_dir / "outputs/v1").rglob("*.json")) == []
     with sqlite3.connect(runtime_dir / "database/registry.db") as conn:
         assert conn.execute("SELECT COUNT(*) FROM published_outputs").fetchone()[0] == 0
         assert conn.execute("SELECT COUNT(*) FROM workflow_runs").fetchone()[0] == 0
@@ -2077,9 +2174,7 @@ def test_dry_run_does_not_publish_outputs(
         "dependencies": 0,
         "manifest_bindings": 0,
     }
-    assert not (
-        runtime_dir / "outputs/colors/base/color_sector_analysis/sector_counts"
-    ).exists()
+    assert list((runtime_dir / "outputs/v1").rglob("*.json")) == []
 
 
 def test_snakefile_header_marks_dry_run_workspaces_only(
@@ -2161,6 +2256,4 @@ def test_dry_run_fails_on_nonzero_snakemake_exit(
         "dependencies": 0,
         "manifest_bindings": 0,
     }
-    assert not (
-        runtime_dir / "outputs/colors/base/color_sector_analysis/sector_counts"
-    ).exists()
+    assert list((runtime_dir / "outputs/v1").rglob("*.json")) == []

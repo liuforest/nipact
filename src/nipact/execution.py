@@ -15,7 +15,11 @@ from pathlib import Path
 from typing import Any, Callable
 
 from ._version import __version__
-from .artifacts import output_filename
+from .artifacts import (
+    CANONICAL_OUTPUT_ROOT,
+    canonical_output_directory,
+    canonical_output_path,
+)
 from .errors import ValidationError
 from .hashing import sha256_file_digest, short_hash
 from .identity import validate_path_token
@@ -93,8 +97,7 @@ class PublishedOutputSpec:
     output_name: str
     address: str
     declared_extension: str
-    output_directory: Path
-    output_directory_relative: str
+    request_bundle_digest: str | None
 
 
 @dataclass(frozen=True)
@@ -694,6 +697,7 @@ def _execute_executable_run_plan(
     _emit_status(status_callback, "building_workspace")
     has_fresh_selection = bool(run_plan.selected_fresh_output_refs)
     has_selected_reuse = bool(run_plan.selected_reused_output_refs)
+    _preflight_publication_layout(run_plan)
     _prepare_run_workspace(run_plan)
     actual_reused_artifacts: dict[int, ReusableArtifactCandidate] = {}
     if run_plan.dry_run:
@@ -889,13 +893,30 @@ def _publish_one_job(
         output_digest = sha256_file_digest(output_ref.staging_path)
         output_hash = short_hash(output_digest)
         file_size = output_ref.staging_path.stat().st_size
-        final_name = output_filename(
+        if spec.request_bundle_digest is None:
+            raise ValidationError("publishable output request identity is unresolved")
+        final_path_relative = canonical_output_path(
+            context=spec.context,
+            step_name=spec.step_name,
             address=spec.address,
+            request_bundle_digest=spec.request_bundle_digest,
+            output_name=spec.output_name,
             output_hash=output_hash,
             declared_extension=spec.declared_extension,
         )
+        _contained_canonical_output_path(
+            run_plan.runtime_root,
+            final_path_relative,
+        )
         preflight_rows.append(
-            (spec, output_ref, output_digest, output_hash, file_size, final_name)
+            (
+                spec,
+                output_ref,
+                output_digest,
+                output_hash,
+                file_size,
+                final_path_relative,
+            )
         )
 
     results: list[_PublishedOutputResult] = []
@@ -907,9 +928,9 @@ def _publish_one_job(
             output_digest,
             output_hash,
             file_size,
-            final_name,
+            final_path_relative,
         ) in preflight_rows:
-            final_path = spec.output_directory / final_name
+            final_path = run_plan.runtime_root / final_path_relative
             final_path.parent.mkdir(parents=True, exist_ok=True)
             final_path_existed = final_path.exists()
             if final_path_existed:
@@ -935,7 +956,7 @@ def _publish_one_job(
                 step_name=spec.step_name,
                 output_name=spec.output_name,
                 address=spec.address,
-                path=f"{spec.output_directory_relative}/{final_name}",
+                path=final_path_relative,
                 output_digest=output_digest,
                 output_hash=output_hash,
             )
@@ -1096,6 +1117,58 @@ def _write_reuse_only_workspace(run_plan: ExecutableRunPlan) -> None:
     _remove_stale_executor_file(run_plan.run_workspace / "Snakefile")
     _remove_stale_executor_file(run_plan.run_workspace / "selected_outputs.txt")
     _write_json_file(run_plan.run_workspace / "run_plan.json", _run_plan_payload(run_plan))
+
+
+def _preflight_publication_layout(run_plan: ExecutableRunPlan) -> None:
+    """Validate canonical fresh-output destinations without mutating the workspace."""
+    layout_root = run_plan.runtime_root / CANONICAL_OUTPUT_ROOT
+    if layout_root.is_symlink() or not layout_root.is_dir():
+        raise ValidationError("canonical output root must be a real directory")
+    resolved_runtime_root = run_plan.runtime_root.resolve()
+    resolved_layout_root = layout_root.resolve()
+    if not _path_contains_or_same(resolved_runtime_root, resolved_layout_root):
+        raise ValidationError("canonical output root must stay inside runtime dir")
+    for spec in run_plan.published_outputs:
+        if spec.request_bundle_digest is None:
+            if run_plan.dry_run:
+                continue
+            raise ValidationError("publishable output request identity is unresolved")
+        relative_directory = canonical_output_directory(
+            context=spec.context,
+            step_name=spec.step_name,
+            address=spec.address,
+            request_bundle_digest=spec.request_bundle_digest,
+            output_name=spec.output_name,
+        )
+        _contained_canonical_output_path(
+            run_plan.runtime_root,
+            relative_directory,
+        )
+
+
+def _contained_canonical_output_path(runtime_root: Path, relative_path: str) -> Path:
+    path = Path(relative_path)
+    if path.is_absolute() or ".." in path.parts:
+        raise ValidationError("canonical output path must be runtime-relative")
+    expected_prefix = CANONICAL_OUTPUT_ROOT.parts
+    if path.parts[: len(expected_prefix)] != expected_prefix:
+        raise ValidationError("canonical output path must be under outputs/v1/")
+    resolved_runtime_root = runtime_root.resolve()
+    resolved_layout_root = (runtime_root / CANONICAL_OUTPUT_ROOT).resolve()
+    resolved_path = (runtime_root / path).resolve()
+    if not _path_contains_or_same(resolved_runtime_root, resolved_path):
+        raise ValidationError("canonical output path must stay inside runtime dir")
+    if not _path_contains_or_same(resolved_layout_root, resolved_path):
+        raise ValidationError("canonical output path must stay inside outputs/v1/")
+    return resolved_path
+
+
+def _path_contains_or_same(parent: Path, child: Path) -> bool:
+    try:
+        child.relative_to(parent)
+    except ValueError:
+        return False
+    return True
 
 
 def _prepare_run_workspace(run_plan: ExecutableRunPlan) -> None:
@@ -1948,10 +2021,12 @@ def _published_output_specs(
     for job in jobs:
         if job.job_id not in reachable_job_ids:
             continue
+        request_bundle_digest = (
+            job.projection_state.request_bundle_digest
+            if isinstance(job.projection_state, ResolvedRequestBundleProjectionV3)
+            else None
+        )
         for output_name, output in job.outputs.items():
-            output_directory_relative = (
-                f"outputs/{loaded.context}/{plan.workflow_name}/{job.step_name}/{output_name}"
-            )
             specs.append(
                 PublishedOutputSpec(
                     context=loaded.context,
@@ -1960,8 +2035,7 @@ def _published_output_specs(
                     output_name=output_name,
                     address=job.address,
                     declared_extension=output.declared_extension,
-                    output_directory=loaded.runtime_root / output_directory_relative,
-                    output_directory_relative=output_directory_relative,
+                    request_bundle_digest=request_bundle_digest,
                 )
             )
     return tuple(specs)

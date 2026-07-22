@@ -11,7 +11,11 @@ import sqlite3
 from typing import Any, Iterable, Iterator
 from urllib.parse import quote
 
-from .artifacts import parse_output_filename
+from .artifacts import (
+    CANONICAL_OUTPUT_ROOT,
+    STORAGE_LAYOUT_VERSION,
+    canonical_output_path,
+)
 from .errors import ValidationError
 from .hashing import is_valid_digest, sha256_digest, sha256_file_digest, short_hash
 from .identity import validate_hash_alias, validate_path_token
@@ -34,7 +38,7 @@ from .source_authority import (
 )
 
 REGISTRY_DB_PATH = "database/registry.db"
-REGISTRY_SCHEMA_VERSION = 17
+REGISTRY_SCHEMA_VERSION = 18
 PARAMETER_HASH_VERSION = 1
 
 
@@ -358,6 +362,35 @@ _ARTIFACT_SELECT_COLUMNS = """
 """
 
 
+def _initialize_storage_layout(runtime_root: Path) -> None:
+    runtime_root = runtime_root.resolve()
+    outputs_root = runtime_root / "outputs"
+    if outputs_root.is_symlink():
+        raise ValidationError("runtime outputs path must be a real directory")
+    outputs_root.mkdir(parents=True, exist_ok=True)
+    if not outputs_root.is_dir():
+        raise ValidationError("runtime outputs path must be a directory")
+    layout_root = runtime_root / CANONICAL_OUTPUT_ROOT
+    if layout_root.is_symlink():
+        raise ValidationError("canonical output root must be a real directory")
+    layout_root.mkdir(parents=True, exist_ok=True)
+    _validate_storage_layout(runtime_root)
+
+
+def _validate_storage_layout(runtime_root: Path) -> None:
+    runtime_root = runtime_root.resolve()
+    outputs_root = runtime_root / "outputs"
+    layout_root = runtime_root / CANONICAL_OUTPUT_ROOT
+    if outputs_root.is_symlink() or not outputs_root.is_dir():
+        raise ValidationError("runtime outputs path must be a real directory")
+    if not layout_root.is_dir():
+        raise ValidationError("canonical output root must be a real directory")
+    if layout_root.is_symlink():
+        raise ValidationError("canonical output root must be a real directory")
+    if not _path_contains_or_same(runtime_root, layout_root.resolve()):
+        raise ValidationError("canonical output root must stay inside runtime dir")
+
+
 def initialize_registry_db(
     path: Path,
     *,
@@ -367,16 +400,18 @@ def initialize_registry_db(
     manifest_paths: dict[str, str],
 ) -> None:
     """Create the initial registry database for a new runtime root."""
+    _initialize_storage_layout(runtime_root)
     with _connect(path) as conn:
         _create_schema(conn)
         conn.execute(
             """
-            INSERT INTO contexts (context, runtime_path)
-            VALUES (?, ?)
+            INSERT INTO contexts (context, runtime_path, storage_layout_version)
+            VALUES (?, ?, ?)
             ON CONFLICT(context) DO UPDATE SET
-                runtime_path = excluded.runtime_path
+                runtime_path = excluded.runtime_path,
+                storage_layout_version = excluded.storage_layout_version
             """,
-            (context, str(runtime_root)),
+            (context, str(runtime_root), STORAGE_LAYOUT_VERSION),
         )
         _insert_manifest_declarations(
             conn,
@@ -395,16 +430,18 @@ def initialize_prepared_demo_registry_db(
     manifest_paths: dict[str, str],
 ) -> None:
     """Create the small prepared-project registry surface for synthetic demos."""
+    _initialize_storage_layout(runtime_root)
     with _connect(path) as conn:
         _create_schema(conn)
         conn.execute(
             """
-            INSERT INTO contexts (context, runtime_path)
-            VALUES (?, ?)
+            INSERT INTO contexts (context, runtime_path, storage_layout_version)
+            VALUES (?, ?, ?)
             ON CONFLICT(context) DO UPDATE SET
-                runtime_path = excluded.runtime_path
+                runtime_path = excluded.runtime_path,
+                storage_layout_version = excluded.storage_layout_version
             """,
-            (context, str(runtime_root)),
+            (context, str(runtime_root), STORAGE_LAYOUT_VERSION),
         )
         _insert_manifest_declarations(
             conn,
@@ -487,16 +524,21 @@ def validate_registry_db(
     loaded_workflow_project: Any,
 ) -> dict[str, int]:
     """Validate registry rows against current project declarations and artifacts."""
+    _validate_storage_layout(runtime_root)
     try:
         with _connect_readonly(path) as conn:
             _validate_schema_version(conn)
             context_row = conn.execute(
-                "SELECT runtime_path FROM contexts WHERE context = ?",
+                """
+                SELECT runtime_path, storage_layout_version
+                FROM contexts
+                WHERE context = ?
+                """,
                 (context,),
             ).fetchone()
             if context_row is None:
                 raise ValidationError("registry.db missing context row")
-            if context_row != (str(runtime_root),):
+            if context_row != (str(runtime_root), STORAGE_LAYOUT_VERSION):
                 raise ValidationError("registry.db context row is out of date")
             rows = conn.execute(
                 """
@@ -517,7 +559,8 @@ def validate_registry_db(
                        po.path, po.output_digest, po.output_hash, po.artifact_id,
                        a.context, a.workflow_name, a.step_name, a.output_name,
                        a.address, a.origin, a.is_published, a.published_path,
-                       a.content_digest, a.output_hash
+                       a.content_digest, a.output_hash, a.request_bundle_digest,
+                       a.extension
                 FROM published_outputs po
                 JOIN artifacts a ON a.artifact_id = po.artifact_id
                 WHERE po.context = ?
@@ -529,7 +572,8 @@ def validate_registry_db(
                 """
                 SELECT artifact_id, context, workflow_name, step_name, output_name,
                        address, origin, is_published, path, published_path,
-                       content_digest, output_hash, file_size, extension
+                       content_digest, output_hash, file_size, extension,
+                       request_bundle_digest
                 FROM artifacts
                 WHERE context = ?
                   AND origin = 'workflow_output'
@@ -580,16 +624,21 @@ def validate_prepared_registry_db(
     loaded_workflow_project: Any,
 ) -> dict[str, int]:
     """Validate the small registry surface needed by generic prepared projects."""
+    _validate_storage_layout(runtime_root)
     try:
         with _connect_readonly(path) as conn:
             _validate_schema_version(conn)
             context_row = conn.execute(
-                "SELECT runtime_path FROM contexts WHERE context = ?",
+                """
+                SELECT runtime_path, storage_layout_version
+                FROM contexts
+                WHERE context = ?
+                """,
                 (context,),
             ).fetchone()
             if context_row is None:
                 raise ValidationError("registry.db missing context row")
-            if context_row != (str(runtime_root),):
+            if context_row != (str(runtime_root), STORAGE_LAYOUT_VERSION):
                 raise ValidationError("registry.db context row is out of date")
             published_outputs = conn.execute(
                 """
@@ -605,7 +654,8 @@ def validate_prepared_registry_db(
                        po.path, po.output_digest, po.output_hash, po.artifact_id,
                        a.context, a.workflow_name, a.step_name, a.output_name,
                        a.address, a.origin, a.is_published, a.published_path,
-                       a.content_digest, a.output_hash
+                       a.content_digest, a.output_hash, a.request_bundle_digest,
+                       a.extension
                 FROM published_outputs po
                 JOIN artifacts a ON a.artifact_id = po.artifact_id
                 WHERE po.context = ?
@@ -617,7 +667,8 @@ def validate_prepared_registry_db(
                 """
                 SELECT artifact_id, context, workflow_name, step_name, output_name,
                        address, origin, is_published, path, published_path,
-                       content_digest, output_hash, file_size, extension
+                       content_digest, output_hash, file_size, extension,
+                       request_bundle_digest
                 FROM artifacts
                 WHERE context = ?
                   AND origin = 'workflow_output'
@@ -1734,6 +1785,7 @@ def resolve_reusable_artifact_bundle(
                     if (
                         reason := _reusable_artifact_occurrence_error(
                             runtime_root=runtime_root,
+                            context=request.context,
                             candidate=candidate,
                             declared_extension=declared_outputs[candidate.output_name],
                         )
@@ -2051,6 +2103,7 @@ def _dependency_source_artifact(
 def _reusable_artifact_occurrence_error(
     *,
     runtime_root: Path,
+    context: str,
     candidate: ReusableArtifactCandidate,
     declared_extension: str,
 ) -> str | None:
@@ -2068,11 +2121,26 @@ def _reusable_artifact_occurrence_error(
         )
     if not is_valid_digest(candidate.content_digest):
         raise ValidationError("registered reusable artifact digest is invalid")
+    if candidate.output_hash != short_hash(candidate.content_digest):
+        raise ValidationError("registered reusable artifact hash is invalid")
+    expected_path = canonical_output_path(
+        context=context,
+        step_name=candidate.step_name,
+        address=candidate.address,
+        request_bundle_digest=candidate.request_bundle_digest,
+        output_name=candidate.output_name,
+        output_hash=candidate.output_hash,
+        declared_extension=declared_extension,
+    )
+    if candidate.path != expected_path:
+        raise ValidationError(
+            "registered reusable artifact path does not match its request identity"
+        )
     artifact_path = _runtime_relative_file_path(runtime_root, candidate.path)
-    outputs_root = (runtime_root / "outputs").resolve()
+    outputs_root = (runtime_root / CANONICAL_OUTPUT_ROOT).resolve()
     if not _path_contains_or_same(outputs_root, artifact_path):
         raise ValidationError(
-            "registered reusable artifact path must stay inside outputs/"
+            "registered reusable artifact path must stay inside outputs/v1/"
         )
     if not artifact_path.is_file():
         return "registered reusable artifact file is missing"
@@ -2453,13 +2521,19 @@ def read_context_runtime_path(path: Path, *, context: str) -> str:
         with _connect_readonly(path) as conn:
             _validate_schema_version(conn)
             row = conn.execute(
-                "SELECT runtime_path FROM contexts WHERE context = ?",
+                """
+                SELECT runtime_path, storage_layout_version
+                FROM contexts
+                WHERE context = ?
+                """,
                 (context,),
             ).fetchone()
     except sqlite3.Error as exc:
         raise ValidationError(f"registry.db is malformed: {exc}") from exc
     if row is None:
         raise ValidationError(f"unknown context: {context}")
+    if row[1] != STORAGE_LAYOUT_VERSION:
+        raise ValidationError("registry.db storage layout version is incompatible")
     return str(row[0])
 
 
@@ -3514,6 +3588,8 @@ def _validate_published_output_rows(
             artifact_published_path,
             artifact_content_digest,
             artifact_output_hash,
+            request_bundle_digest,
+            artifact_extension,
         ) = row
         if not all(
             isinstance(value, str) and value
@@ -3537,6 +3613,11 @@ def _validate_published_output_rows(
         step = loaded_workflow_project.steps.get(step_name)
         if step is None or output_name not in step.outputs:
             raise ValidationError("registry.db published output references unknown step output")
+        declared_extension = step.outputs[output_name].extension
+        if artifact_extension != declared_extension:
+            raise ValidationError("registry.db published output extension is invalid")
+        if not is_valid_digest(request_bundle_digest):
+            raise ValidationError("registry.db published output request digest is invalid")
         if not is_valid_digest(output_digest):
             raise ValidationError("registry.db published output digest is invalid")
         try:
@@ -3545,13 +3626,19 @@ def _validate_published_output_rows(
             raise ValidationError("registry.db published output hash is invalid") from exc
         if output_hash != short_hash(output_digest):
             raise ValidationError("registry.db published output hash does not match digest")
-        expected_directory = (
-            f"outputs/{context}/{generating_workflow_name}/{step_name}/{output_name}"
+        expected_path = canonical_output_path(
+            context=context,
+            step_name=step_name,
+            address=address,
+            request_bundle_digest=request_bundle_digest,
+            output_name=output_name,
+            output_hash=output_hash,
+            declared_extension=declared_extension,
         )
         _resolve_published_output_path(
             runtime_root,
             output_artifact_path,
-            expected_directory=expected_directory,
+            expected_path=expected_path,
         )
         if (
             artifact_context != context
@@ -3612,6 +3699,7 @@ def _validate_accepted_workflow_output_row(
         output_hash,
         file_size,
         extension,
+        request_bundle_digest,
     ) = row
     if type(artifact_id) is not int or artifact_id <= 0:
         raise ValidationError("registry.db accepted artifact id is invalid")
@@ -3644,27 +3732,27 @@ def _validate_accepted_workflow_output_row(
         raise ValidationError("registry.db accepted artifact hash does not match digest")
     if type(file_size) is not int or file_size < 0:
         raise ValidationError("registry.db accepted artifact file size is invalid")
+    if not is_valid_digest(request_bundle_digest):
+        raise ValidationError("registry.db accepted artifact request digest is invalid")
     declared_extension = step.outputs[output_name].extension
     if extension != declared_extension:
         raise ValidationError("registry.db accepted artifact extension is invalid")
-    expected_directory = (
-        f"outputs/{context}/{generating_workflow_name}/{step_name}/{output_name}"
+    expected_path = canonical_output_path(
+        context=context,
+        step_name=step_name,
+        address=address,
+        request_bundle_digest=request_bundle_digest,
+        output_name=output_name,
+        output_hash=output_hash,
+        declared_extension=declared_extension,
     )
     resolved_path = _resolve_published_output_path(
         runtime_root,
         published_path,
-        expected_directory=expected_directory,
+        expected_path=expected_path,
     )
     if resolved_path.stat().st_size != file_size:
         raise ValidationError("published output artifact file size mismatch")
-    parsed_address, filename_hash = parse_output_filename(
-        resolved_path.name,
-        declared_extension=declared_extension,
-    )
-    if parsed_address != address:
-        raise ValidationError("published output artifact filename address mismatch")
-    if filename_hash != output_hash:
-        raise ValidationError("published output artifact filename hash mismatch")
     occurrence = (resolved_path, content_digest)
     if occurrence in verified_occurrences:
         return
@@ -3677,23 +3765,25 @@ def _resolve_published_output_path(
     runtime_root: Path,
     raw_path: Any,
     *,
-    expected_directory: str,
+    expected_path: str,
 ) -> Path:
     if not isinstance(raw_path, str):
         raise ValidationError("published output artifact path must be a string")
     relative_path = Path(raw_path).expanduser()
     if relative_path.is_absolute():
         raise ValidationError("published output artifact path must be relative to runtime dir")
-    if not raw_path.startswith("outputs/"):
-        raise ValidationError("published output artifact path must be under outputs/")
-    if not raw_path.startswith(f"{expected_directory}/"):
+    if relative_path.parts[: len(CANONICAL_OUTPUT_ROOT.parts)] != (
+        CANONICAL_OUTPUT_ROOT.parts
+    ):
+        raise ValidationError("published output artifact path must be under outputs/v1/")
+    if raw_path != expected_path:
         raise ValidationError("published output artifact path does not match registry identity")
     resolved = (runtime_root / relative_path).resolve()
     if not _path_contains_or_same(runtime_root, resolved):
         raise ValidationError("published output artifact path must stay inside runtime dir")
-    outputs_root = (runtime_root / "outputs").resolve()
+    outputs_root = (runtime_root / CANONICAL_OUTPUT_ROOT).resolve()
     if not _path_contains_or_same(outputs_root, resolved):
-        raise ValidationError("published output artifact path must stay inside outputs/")
+        raise ValidationError("published output artifact path must stay inside outputs/v1/")
     if not resolved.is_file():
         raise ValidationError(f"missing published output artifact: {raw_path}")
     return resolved
@@ -3715,7 +3805,10 @@ def _create_schema(conn: sqlite3.Connection) -> None:
         f"""
         CREATE TABLE IF NOT EXISTS contexts (
             context TEXT PRIMARY KEY,
-            runtime_path TEXT NOT NULL
+            runtime_path TEXT NOT NULL,
+            storage_layout_version INTEGER NOT NULL DEFAULT 1 CHECK(
+                storage_layout_version = {STORAGE_LAYOUT_VERSION}
+            )
         );
 
         CREATE TABLE IF NOT EXISTS manifest_values (
