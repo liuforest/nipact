@@ -376,7 +376,7 @@ def test_trace_graph_by_workflow_coordinate_accepts_published_intermediate(
         artifact for artifact in graph["artifacts"] if artifact["is_selected"]
     )
     assert selected_node["is_published"] is True
-    assert selected_node["path"].startswith("outputs/colors/base/")
+    assert selected_node["path"].startswith("outputs/v1/colors/")
     assert selected_node["workflow_artifact_ref"] == (
         "artifact:color_sector_analysis:sector_counts"
     )
