@@ -141,6 +141,9 @@ def test_trace_graph_by_artifact_id_includes_sources_and_manifest_bindings(
     ]
     assert len(source_artifacts) == 1
     assert source_artifacts[0]["path"] == "data/color_source.json"
+    assert source_artifacts[0]["source_scope"] == "global"
+    assert source_artifacts[0]["source_name"] == "colors_source"
+    assert source_artifacts[0]["source_entity_id"] is None
     assert source_artifacts[0]["workflow_artifact_ref"] is None
     assert len(artifacts) == len(run_plan.jobs) + 1
     assert len(dependencies) == sum(len(job.input_records) for job in run_plan.jobs)
@@ -213,6 +216,9 @@ def test_trace_graph_payload_shape_is_stable_for_gui_contract(
         "run_label",
         "datatype",
         "suffix",
+        "source_scope",
+        "source_name",
+        "source_entity_id",
         "source_metadata",
         "workflow_artifact_ref",
         "callable_ref",
@@ -229,6 +235,10 @@ def test_trace_graph_payload_shape_is_stable_for_gui_contract(
         "source_content_digest",
         "source_file_size",
         "source_extension",
+        "source_scope",
+        "source_name",
+        "source_entity_id",
+        "source_occurrence_path",
         "dependency_set_id",
         "manifest_value_schema",
         "manifest_digest",

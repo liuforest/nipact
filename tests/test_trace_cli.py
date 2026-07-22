@@ -125,9 +125,12 @@ def _insert_foreign_source_dependency(
             """
             INSERT INTO artifacts (
                 origin, context, path, content_digest, output_hash, file_size,
-                extension, created_at
+                extension, source_scope, source_name, source_st_dev,
+                source_st_ino, source_st_size, source_st_mtime_ns,
+                source_st_ctime_ns, created_at
             )
-            VALUES ('source', ?, ?, ?, ?, ?, ?, ?)
+            VALUES ('source', ?, ?, ?, ?, ?, ?, 'global', 'foreign_source',
+                    1, 2, 1, 3, 4, ?)
             """,
             (
                 "other",
@@ -145,9 +148,10 @@ def _insert_foreign_source_dependency(
             INSERT INTO artifact_dependencies (
                 dependent_artifact_id, source_artifact_id,
                 source_content_digest, source_file_size, source_extension,
-                input_path, binding_name, dependency_role
+                input_path, binding_name, dependency_role,
+                source_scope, source_name, source_occurrence_path
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'global', 'foreign_source', ?)
             """,
             (
                 selected.artifact_id,
@@ -158,6 +162,7 @@ def _insert_foreign_source_dependency(
                 "data/other/source.json",
                 "foreign_source",
                 "source_input",
+                "data/other/source.json",
             ),
         )
     return foreign_artifact_id

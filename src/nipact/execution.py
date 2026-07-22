@@ -19,19 +19,20 @@ from .artifacts import output_filename
 from .errors import ValidationError
 from .hashing import sha256_file_digest, short_hash
 from .identity import validate_path_token
+from .manifest import Manifest
 from .projection import (
     IDENTITY_CONTRACT_VERSION,
     OUTPUT_CONTRACT_VERSION,
     RUNNER_CONTRACT_VERSION,
     CollectionBindingPlan,
     OutputContract,
-    RequestBundleProjectionPlanV2,
+    RegisteredSourceSnapshot,
+    RequestBundleProjectionPlanV3,
     RequestBundleProjectionState,
-    ResolvedRequestBundleProjectionV2,
+    ResolvedRequestBundleProjectionV3,
     RequestedOutputCoordinate,
     SiblingOutput,
     SourceBindingPlan,
-    SourceCoordinate,
     StepContract,
     UpstreamRequestedOutputBindingPlan,
     resolve_request_bundle_projection_plan,
@@ -51,14 +52,28 @@ from .registry import (
     RunManifestBindingRow,
     SelectedOutputResolutionIntent,
     WorkflowOutputArtifactRow,
+    RegisteredSourceAuthority,
+    reconcile_manifest_and_source_authorities,
     record_workflow_run,
     read_context_runtime_path,
-    read_registered_source_snapshots,
+    read_registered_source_authorities,
     resolve_reusable_artifact_bundle,
+)
+from .runtime_lock import acquire_mutating_runtime_lock
+from .source_authority import (
+    LogicalSourceCoordinate,
+    ObservedSourceAuthority,
+    SourceDeclaration,
+    observe_source_authority,
+    read_source_occurrence_guard,
+)
+from .source_closure import (
+    selected_job_coordinates,
+    selected_source_declarations,
+    source_declaration_for_binding,
 )
 from .workflow import (
     LoadedWorkflowProject,
-    SourceIndex,
     WorkflowPlan,
     WorkflowPlanExecutionPopulation,
     WorkflowPlanManifestBinding,
@@ -107,7 +122,7 @@ class RunJob:
     inputs: dict[str, tuple[str, ...]]
     input_records: tuple[ArtifactInputRow, ...]
     params: dict[str, object]
-    projection_plan: RequestBundleProjectionPlanV2
+    projection_plan: RequestBundleProjectionPlanV3
     projection_state: RequestBundleProjectionState
 
     @property
@@ -199,7 +214,7 @@ class RunJobOutputRef:
         return self.job.params
 
     @property
-    def projection_plan(self) -> RequestBundleProjectionPlanV2:
+    def projection_plan(self) -> RequestBundleProjectionPlanV3:
         return self.job.projection_plan
 
     @property
@@ -227,8 +242,10 @@ class ReusedRunJobOutputRef:
     content_digest: str
     file_size: int
     reuse_request: ReusableArtifactBundleRequest
-    projection_plan: RequestBundleProjectionPlanV2
+    projection_plan: RequestBundleProjectionPlanV3
     projection_state: RequestBundleProjectionState
+    candidate: ReusableArtifactCandidate
+    bundle: ReusableArtifactBundleCandidate
 
 
 @dataclass(frozen=True)
@@ -275,7 +292,7 @@ class SelectedReusedBundleRef:
 
 
 @dataclass(frozen=True)
-class RunPlan:
+class ExecutableRunPlan:
     project_root: Path
     runtime_root: Path
     context: str
@@ -294,13 +311,28 @@ class RunPlan:
     selected_reused_output_refs: tuple[SelectedReusedBundleRef, ...]
     reused_outputs: tuple[ReusedRunJobOutputRef, ...]
     reused_validation_outputs: tuple[ReusedRunJobOutputRef, ...]
-    # Reporting statistic: fresh jobs in the selected targets' reachable
-    # closure. jobs stays population-wide; this is the executed forecast.
+    # Reporting statistic: fresh jobs in the selected semantic closure.
     reachable_job_count: int
 
     @property
     def selected_fresh_jobs(self) -> tuple[RunJob, ...]:
         return tuple(output_ref.job for output_ref in self.selected_fresh_output_refs)
+
+
+@dataclass(frozen=True)
+class StructuralRunPlan:
+    """Frozen declarations plus a non-authoritative metadata forecast."""
+
+    loaded_project: LoadedWorkflowProject
+    workflow_plan: WorkflowPlan
+    source_declarations: tuple[SourceDeclaration, ...]
+    forecast: ExecutableRunPlan
+
+    def __getattr__(self, name: str) -> Any:
+        # Preserve the existing read-only planning/reporting surface while
+        # making it impossible for real execution to confuse the forecast
+        # with the under-lock executable plan.
+        return getattr(self.forecast, name)
 
 
 @dataclass(frozen=True)
@@ -322,8 +354,8 @@ def build_run_plan(
     step_name: str,
     address: str | None = None,
     dry_run: bool = False,
-) -> RunPlan:
-    """Build the internal execution plan without running anything."""
+) -> StructuralRunPlan:
+    """Build frozen structural declarations and a metadata-only forecast."""
     loaded = load_workflow_project(project_dir=project_dir, context=context)
     registered_runtime_path = read_context_runtime_path(
         loaded.runtime_root / REGISTRY_DB_PATH,
@@ -336,10 +368,65 @@ def build_run_plan(
         workflow_name=workflow_name,
         step_name=step_name,
     )
+    declarations = selected_source_declarations(
+        loaded=loaded,
+        plan=plan,
+        requested_address=address,
+    )
+    forecast_authorities = read_registered_source_authorities(
+        loaded.runtime_root / REGISTRY_DB_PATH,
+        coordinates=(declaration.coordinate for declaration in declarations),
+    )
+    forecast_authorities = {
+        declaration.coordinate: registered
+        for declaration in declarations
+        if (registered := forecast_authorities.get(declaration.coordinate))
+        is not None
+        and registered.authority.declaration.declared_path
+        == declaration.declared_path
+        and registered.authority.guard
+        == read_source_occurrence_guard(
+            runtime_root=loaded.runtime_root,
+            declaration=declaration,
+        )
+    }
+    forecast = _build_executable_run_plan(
+        loaded=loaded,
+        plan=plan,
+        address=address,
+        dry_run=dry_run,
+        source_authorities=forecast_authorities,
+    )
+    return StructuralRunPlan(
+        loaded_project=loaded,
+        workflow_plan=plan,
+        source_declarations=declarations,
+        forecast=forecast,
+    )
+
+
+def _build_executable_run_plan(
+    *,
+    loaded: LoadedWorkflowProject,
+    plan: WorkflowPlan,
+    address: str | None,
+    dry_run: bool,
+    source_authorities: dict[
+        LogicalSourceCoordinate,
+        RegisteredSourceAuthority,
+    ],
+) -> ExecutableRunPlan:
+    """Finalize one exact job/reuse graph from prepared source authority."""
     selected_step = _plan_step(plan, plan.selected_step_name)
     _validated_step_outputs(selected_step)
     selected_output = selected_step.outputs[plan.selected_output_name]
-    run_workspace = loaded.runtime_root / "runs" / context / plan.workflow_name / plan.selected_step_name
+    run_workspace = (
+        loaded.runtime_root
+        / "runs"
+        / loaded.context
+        / plan.workflow_name
+        / plan.selected_step_name
+    )
     if len(selected_step.outputs) > 1:
         run_workspace = run_workspace / selected_output.name
     addresses = _selected_addresses(plan, selected_step, requested_address=address)
@@ -360,6 +447,8 @@ def build_run_plan(
         loaded=loaded,
         plan=plan,
         run_workspace=run_workspace,
+        requested_address=address,
+        source_authorities=source_authorities,
     )
     output_refs_by_key = _output_refs_by_key(jobs)
     selected_fresh_output_refs: list[RunJobOutputRef] = []
@@ -430,10 +519,10 @@ def build_run_plan(
         jobs=jobs,
         reachable_job_ids=reachable_job_ids,
     )
-    return RunPlan(
+    return ExecutableRunPlan(
         project_root=loaded.project_root,
         runtime_root=loaded.runtime_root,
-        context=context,
+        context=loaded.context,
         workflow_name=plan.workflow_name,
         base_workflow_name=loaded.workflows[plan.workflow_name].base_workflow,
         selected_step_name=selected_step.step_name,
@@ -484,10 +573,112 @@ def _validate_selected_output_partition(
 
 
 def execute_run_plan(
-    run_plan: RunPlan,
+    run_plan: StructuralRunPlan,
     *,
     cores: int = 1,
     status_callback: RunStatusCallback | None = None,
+) -> RunOutcome:
+    """Finalize source authority once, then execute one frozen exact plan."""
+    if not isinstance(run_plan, StructuralRunPlan):
+        raise ValidationError("run plan must be a StructuralRunPlan")
+    if run_plan.forecast.dry_run:
+        return _execute_executable_run_plan(
+            run_plan.forecast,
+            cores=cores,
+            status_callback=status_callback,
+        )
+    with acquire_mutating_runtime_lock(run_plan.forecast.runtime_root):
+        registry_path = run_plan.forecast.runtime_root / REGISTRY_DB_PATH
+        coordinates = tuple(
+            declaration.coordinate for declaration in run_plan.source_declarations
+        )
+        registered = read_registered_source_authorities(
+            registry_path,
+            coordinates=coordinates,
+        )
+        observations = tuple(
+            observe_source_authority(
+                runtime_root=run_plan.forecast.runtime_root,
+                declaration=declaration,
+                registered=(
+                    registered[declaration.coordinate].authority
+                    if declaration.coordinate in registered
+                    else None
+                ),
+            )
+            for declaration in run_plan.source_declarations
+        )
+        relevant_manifests, relevant_manifest_paths = (
+            _relevant_manifest_authority_inputs(
+                loaded=run_plan.loaded_project,
+                plan=run_plan.workflow_plan,
+            )
+        )
+        source_authorities = reconcile_manifest_and_source_authorities(
+            registry_path,
+            context=run_plan.loaded_project.context,
+            manifests=relevant_manifests,
+            manifest_paths=relevant_manifest_paths,
+            observations=observations,
+        )
+        for status in ("new", "changed", "unchanged"):
+            count = sum(observation.status == status for observation in observations)
+            _emit_status(status_callback, f"sources_{status}:{count}")
+        executable = _build_executable_run_plan(
+            loaded=run_plan.loaded_project,
+            plan=run_plan.workflow_plan,
+            address=run_plan.forecast.requested_address,
+            dry_run=False,
+            source_authorities=source_authorities,
+        )
+        return _execute_executable_run_plan(
+            executable,
+            cores=cores,
+            status_callback=status_callback,
+        )
+
+
+def _relevant_manifest_authority_inputs(
+    *,
+    loaded: LoadedWorkflowProject,
+    plan: WorkflowPlan,
+) -> tuple[dict[str, Manifest], dict[str, str]]:
+    references = tuple(
+        reference
+        for reference in (plan.execution_population, *plan.manifest_bindings)
+        if reference is not None
+    )
+    manifests: dict[str, Manifest] = {}
+    manifest_paths: dict[str, str] = {}
+    for reference in references:
+        name = reference.manifest_name
+        if name not in loaded.manifests or name not in loaded.manifest_paths:
+            raise ValidationError(f"workflow plan manifest is not configured: {name}")
+        manifest = loaded.manifests[name]
+        if (
+            manifest.manifest_value_schema != reference.manifest_value_schema
+            or manifest.manifest_digest != reference.manifest_digest
+            or manifest.entity_ids != reference.entity_ids
+        ):
+            raise ValidationError(f"workflow plan manifest value is inconsistent: {name}")
+        try:
+            declared_path = loaded.manifest_paths[name].relative_to(
+                loaded.project_root
+            )
+        except ValueError as exc:
+            raise ValidationError(
+                f"manifest declaration is outside the project root: {name}"
+            ) from exc
+        manifests[name] = manifest
+        manifest_paths[name] = declared_path.as_posix()
+    return manifests, manifest_paths
+
+
+def _execute_executable_run_plan(
+    run_plan: ExecutableRunPlan,
+    *,
+    cores: int,
+    status_callback: RunStatusCallback | None,
 ) -> RunOutcome:
     """Resolve a workflow plan, executing fresh selected work best-effort.
 
@@ -638,14 +829,14 @@ def _emit_status(callback: RunStatusCallback | None, event: str) -> None:
         callback(event)
 
 
-def publish_run_outputs(run_plan: RunPlan) -> tuple[PublishedOutputRow, ...]:
+def publish_run_outputs(run_plan: ExecutableRunPlan) -> tuple[PublishedOutputRow, ...]:
     """Publish planned outputs and return registry row facts."""
     results, _failed = _publish_run_outputs(run_plan)
     return tuple(result.row for result in results)
 
 
 def _publish_run_outputs(
-    run_plan: RunPlan,
+    run_plan: ExecutableRunPlan,
 ) -> tuple[tuple[_PublishedOutputResult, ...], tuple[tuple[str, str, str], ...]]:
     """Publish declared outputs from reachable non-reused jobs, best-effort per job.
 
@@ -671,7 +862,7 @@ def _publish_run_outputs(
 
 
 def _publish_one_job(
-    run_plan: RunPlan,
+    run_plan: ExecutableRunPlan,
     specs: list[PublishedOutputSpec],
     publishable_outputs: dict[tuple[str, str, str], RunJobOutputRef],
 ) -> tuple[list[_PublishedOutputResult], str | None]:
@@ -758,7 +949,7 @@ def _publish_one_job(
 
 
 def _prune_orphan_published_jobs(
-    run_plan: RunPlan,
+    run_plan: ExecutableRunPlan,
     published_results: tuple[_PublishedOutputResult, ...],
 ) -> tuple[tuple[_PublishedOutputResult, ...], tuple[tuple[str, str, str], ...]]:
     """Drop published jobs whose fresh workflow-output parents were not published.
@@ -829,7 +1020,7 @@ def _validate_existing_published_file(path: Path, *, expected_digest: str) -> No
         raise ValidationError("published output artifact digest mismatch")
 
 
-def _remove_expected_staged_outputs(run_plan: RunPlan) -> None:
+def _remove_expected_staged_outputs(run_plan: ExecutableRunPlan) -> None:
     publishable_outputs = _output_refs_by_key(run_plan.jobs)
     for spec in run_plan.published_outputs:
         key = (spec.step_name, spec.output_name, spec.address)
@@ -866,7 +1057,7 @@ def _remove_published_output_files(
 
 
 def _write_run_workspace(
-    run_plan: RunPlan,
+    run_plan: ExecutableRunPlan,
     *,
     reused_input_paths: dict[str, str] | None = None,
 ) -> None:
@@ -887,13 +1078,13 @@ def _write_run_workspace(
     )
 
 
-def _write_reuse_only_workspace(run_plan: RunPlan) -> None:
+def _write_reuse_only_workspace(run_plan: ExecutableRunPlan) -> None:
     _remove_stale_executor_file(run_plan.run_workspace / "Snakefile")
     _remove_stale_executor_file(run_plan.run_workspace / "selected_outputs.txt")
     _write_json_file(run_plan.run_workspace / "run_plan.json", _run_plan_payload(run_plan))
 
 
-def _prepare_run_workspace(run_plan: RunPlan) -> None:
+def _prepare_run_workspace(run_plan: ExecutableRunPlan) -> None:
     run_plan.run_workspace.mkdir(parents=True, exist_ok=True)
     _remove_stale_executor_file(run_plan.run_workspace / "logs" / "snakemake.log")
 
@@ -905,7 +1096,7 @@ def _remove_stale_executor_file(path: Path) -> None:
         path.unlink()
 
 
-def _dry_run_reused_input_paths(run_plan: RunPlan) -> dict[str, str]:
+def _dry_run_reused_input_paths(run_plan: ExecutableRunPlan) -> dict[str, str]:
     """Map reachable reused staging inputs to validated registered source paths.
 
     Keys derive from the in-memory validated ``ReusedRunJobOutputRef``s, never
@@ -915,7 +1106,7 @@ def _dry_run_reused_input_paths(run_plan: RunPlan) -> dict[str, str]:
     Resolution re-checks identity, dependencies, outputs/ containment,
     existence, and size without hashing bytes.
     """
-    candidates = _reresolve_reused_bundles(run_plan)
+    candidates = _forecast_reresolve_reused_bundles(run_plan)
     mapping: dict[str, str] = {}
     for output_ref in run_plan.reused_outputs:
         candidate = candidates[output_ref.source_artifact_id]
@@ -927,9 +1118,9 @@ def _dry_run_reused_input_paths(run_plan: RunPlan) -> dict[str, str]:
 
 
 def _hydrate_reused_outputs(
-    run_plan: RunPlan,
+    run_plan: ExecutableRunPlan,
 ) -> dict[int, ReusableArtifactCandidate]:
-    candidates = _reresolve_reused_bundles(run_plan)
+    candidates = _exact_reused_candidates(run_plan)
     verified_artifact_ids = _verify_selected_reused_outputs(
         run_plan,
         candidates=candidates,
@@ -958,7 +1149,7 @@ def _hydrate_reused_outputs(
 
 
 def _verify_selected_reused_outputs(
-    run_plan: RunPlan,
+    run_plan: ExecutableRunPlan,
     *,
     candidates: dict[int, ReusableArtifactCandidate],
 ) -> set[int]:
@@ -992,8 +1183,8 @@ def _verify_selected_reused_outputs(
     return verified_artifact_ids
 
 
-def _reresolve_reused_bundles(
-    run_plan: RunPlan,
+def _forecast_reresolve_reused_bundles(
+    run_plan: ExecutableRunPlan,
 ) -> dict[int, ReusableArtifactCandidate]:
     refs_by_request: dict[
         ReusableArtifactBundleRequest,
@@ -1046,7 +1237,23 @@ def _reresolve_reused_bundles(
     return resolved
 
 
-def _run_snakemake(run_plan: RunPlan, *, cores: int, dry_run: bool) -> int:
+def _exact_reused_candidates(
+    run_plan: ExecutableRunPlan,
+) -> dict[int, ReusableArtifactCandidate]:
+    """Return the sole under-lock resolved occurrences without querying again."""
+    candidates: dict[int, ReusableArtifactCandidate] = {}
+    for output_ref in run_plan.reused_validation_outputs:
+        if output_ref.candidate.artifact_id != output_ref.source_artifact_id:
+            raise ValidationError("frozen reused occurrence identity is inconsistent")
+        for candidate in output_ref.bundle.outputs:
+            prior = candidates.get(candidate.artifact_id)
+            if prior is not None and prior != candidate:
+                raise ValidationError("frozen reused occurrence is inconsistent")
+            candidates[candidate.artifact_id] = candidate
+    return candidates
+
+
+def _run_snakemake(run_plan: ExecutableRunPlan, *, cores: int, dry_run: bool) -> int:
     command = [
         sys.executable,
         "-m",
@@ -1105,7 +1312,7 @@ def _run_snakemake(run_plan: RunPlan, *, cores: int, dry_run: bool) -> int:
 
 
 def _snakefile_text(
-    run_plan: RunPlan,
+    run_plan: ExecutableRunPlan,
     *,
     reused_input_paths: dict[str, str] | None = None,
 ) -> str:
@@ -1160,7 +1367,7 @@ def _snakefile_output_lines(outputs: list[str]) -> list[str]:
     return [f"        {json.dumps(path)}," for path in outputs]
 
 
-def _run_plan_payload(run_plan: RunPlan) -> dict[str, Any]:
+def _run_plan_payload(run_plan: ExecutableRunPlan) -> dict[str, Any]:
     return {
         "context": run_plan.context,
         "workflow": run_plan.workflow_name,
@@ -1302,6 +1509,11 @@ def _input_record_payload(record: ArtifactInputRow) -> dict[str, Any]:
         "source_execution_role": record.source_execution_role,
         "source_is_reused": record.source_is_reused,
         "source_artifact_path": record.source_artifact_path,
+        "source_scope": record.source_scope,
+        "source_name": record.source_name,
+        "source_entity_id": record.source_entity_id,
+        "source_content_digest": record.source_content_digest,
+        "source_file_size": record.source_file_size,
         "manifest_value_schema": record.manifest_value_schema,
         "manifest_digest": record.manifest_digest,
         "edge_cardinality": record.edge_cardinality,
@@ -1314,7 +1526,7 @@ def _input_record_payload(record: ArtifactInputRow) -> dict[str, Any]:
 
 
 def _workflow_output_artifact_rows(
-    run_plan: RunPlan,
+    run_plan: ExecutableRunPlan,
     *,
     published_rows: tuple[PublishedOutputRow, ...],
     actual_reused_artifacts: dict[int, ReusableArtifactCandidate],
@@ -1384,12 +1596,12 @@ def _actual_input_record(
         for source_record in record.source_input_records
     )
     artifact_id = record.registry_source_artifact_id
-    if artifact_id is None:
+    if artifact_id is None or record.origin == "source":
         return replace(record, source_input_records=nested)
     candidate = actual_reused_artifacts.get(artifact_id)
     if candidate is None:
         raise ValidationError(
-            "executed run is missing a re-resolved reused artifact dependency"
+            "executed run is missing a frozen reused artifact dependency"
         )
     return replace(
         record,
@@ -1400,7 +1612,7 @@ def _actual_input_record(
 
 
 def _retained_projection_recipes(
-    run_plan: RunPlan,
+    run_plan: ExecutableRunPlan,
     *,
     published_rows: tuple[PublishedOutputRow, ...],
 ) -> tuple[RetainedJobProjectionRecipe, ...]:
@@ -1420,7 +1632,7 @@ def _retained_projection_recipes(
 
 
 def _reused_projection_seeds(
-    run_plan: RunPlan,
+    run_plan: ExecutableRunPlan,
     *,
     artifact_rows: tuple[WorkflowOutputArtifactRow, ...],
     actual_reused_artifacts: dict[int, ReusableArtifactCandidate],
@@ -1450,7 +1662,7 @@ def _reused_projection_seeds(
         )
         if requested_output not in required_coordinates:
             continue
-        if not isinstance(output_ref.projection_state, ResolvedRequestBundleProjectionV2):
+        if not isinstance(output_ref.projection_state, ResolvedRequestBundleProjectionV3):
             raise ValidationError("reused output has an unresolved request projection")
         try:
             actual_candidate = actual_reused_artifacts[output_ref.source_artifact_id]
@@ -1471,7 +1683,7 @@ def _reused_projection_seeds(
 
 
 def _reused_membership_intents(
-    run_plan: RunPlan,
+    run_plan: ExecutableRunPlan,
     *,
     published_rows: tuple[PublishedOutputRow, ...],
     actual_reused_artifacts: dict[int, ReusableArtifactCandidate],
@@ -1539,7 +1751,7 @@ def _reused_membership_intents(
                 or candidate.address != request.address
             ):
                 raise ValidationError(
-                    "re-resolved reusable artifact has the wrong requested coordinate"
+                    "frozen reusable artifact has the wrong requested coordinate"
                 )
             coordinate = (
                 candidate.step_name,
@@ -1583,7 +1795,7 @@ def _reused_membership_intents(
 
 
 def _selected_resolution_intents(
-    run_plan: RunPlan,
+    run_plan: ExecutableRunPlan,
     *,
     published_rows: tuple[PublishedOutputRow, ...],
     actual_reused_artifacts: dict[int, ReusableArtifactCandidate],
@@ -1659,7 +1871,7 @@ def _environment_observation() -> EnvironmentObservationV1:
     )
 
 
-def _reachable_job_ids(run_plan: RunPlan) -> set[str]:
+def _reachable_job_ids(run_plan: ExecutableRunPlan) -> set[str]:
     return _reachable_job_ids_for_outputs(
         jobs=run_plan.jobs,
         selected_output_refs=run_plan.selected_fresh_output_refs,
@@ -1741,7 +1953,7 @@ def _published_output_specs(
     return tuple(specs)
 
 
-def _run_manifest_binding_rows(run_plan: RunPlan) -> tuple[RunManifestBindingRow, ...]:
+def _run_manifest_binding_rows(run_plan: ExecutableRunPlan) -> tuple[RunManifestBindingRow, ...]:
     return tuple(
         RunManifestBindingRow(
             step_name=binding.step_name,
@@ -1755,7 +1967,7 @@ def _run_manifest_binding_rows(run_plan: RunPlan) -> tuple[RunManifestBindingRow
 
 
 def _run_execution_population_row(
-    run_plan: RunPlan,
+    run_plan: ExecutableRunPlan,
 ) -> RunExecutionPopulationRow | None:
     population = run_plan.execution_population
     if population is None:
@@ -1812,11 +2024,26 @@ def _build_jobs(
     loaded: LoadedWorkflowProject,
     plan: WorkflowPlan,
     run_workspace: Path,
+    requested_address: str | None,
+    source_authorities: dict[
+        LogicalSourceCoordinate,
+        RegisteredSourceAuthority,
+    ],
 ) -> tuple[tuple[RunJob, ...], dict[tuple[str, str, str], ReusedRunJobOutputRef]]:
     jobs: list[RunJob] = []
-    source_snapshots = read_registered_source_snapshots(
-        loaded.runtime_root / REGISTRY_DB_PATH,
-        context=loaded.context,
+    source_snapshots = {
+        coordinate: RegisteredSourceSnapshot(
+            content_digest=record.authority.content_digest,
+            file_size=record.authority.file_size,
+            declared_extension=record.authority.declaration.declared_extension,
+        )
+        for coordinate, record in source_authorities.items()
+    }
+    selected_coordinates = set(
+        selected_job_coordinates(
+            plan=plan,
+            requested_address=requested_address,
+        )
     )
     projection_states_by_output: dict[
         RequestedOutputCoordinate,
@@ -1827,16 +2054,24 @@ def _build_jobs(
         RunJobOutputRef | ReusedRunJobOutputRef,
     ] = {}
     reused_outputs_by_artifact: dict[tuple[str, str, str], ReusedRunJobOutputRef] = {}
+    resolver_cache: dict[
+        ReusableArtifactBundleRequest,
+        ReusableArtifactBundleCandidate | None,
+    ] = {}
+    fresh_requests: dict[str, tuple[str, str]] = {}
     for step in plan.steps:
         outputs = _validated_step_outputs(step)
         addresses = _step_addresses(plan, step)
         for address in addresses:
+            if (step.step_name, address) not in selected_coordinates:
+                continue
             input_paths, input_records = _job_inputs(
                 loaded,
                 step,
                 run_workspace=run_workspace,
                 address=address,
                 outputs_by_artifact=outputs_by_artifact,
+                source_authorities=source_authorities,
             )
             job_outputs = _run_job_outputs(
                 run_workspace=run_workspace,
@@ -1879,10 +2114,11 @@ def _build_jobs(
                     )
                 ] = projection_state
             reused_refs: dict[str, ReusedRunJobOutputRef] | None = None
-            if isinstance(projection_state, ResolvedRequestBundleProjectionV2):
+            if isinstance(projection_state, ResolvedRequestBundleProjectionV3):
                 reused_refs = _reusable_output_refs_for_job(
                     loaded=loaded,
                     job=job,
+                    resolver_cache=resolver_cache,
                 )
             if reused_refs is not None:
                 for output_name, output_ref in reused_refs.items():
@@ -1890,6 +2126,16 @@ def _build_jobs(
                     outputs_by_artifact[key] = output_ref
                     reused_outputs_by_artifact[key] = output_ref
                 continue
+            if isinstance(projection_state, ResolvedRequestBundleProjectionV3):
+                digest = projection_state.request_bundle_digest
+                previous = fresh_requests.get(digest)
+                if previous is not None:
+                    raise ValidationError(
+                        "selected plan contains duplicate equal fresh requests: "
+                        f"{previous[0]}[{previous[1]}] and "
+                        f"{step.step_name}[{address}]"
+                    )
+                fresh_requests[digest] = (step.step_name, address)
             jobs.append(job)
             for output_name in outputs:
                 outputs_by_artifact[(step.step_name, output_name, address)] = job.output_ref(
@@ -1906,8 +2152,8 @@ def _request_projection_plan(
     address: str,
     outputs: dict[str, Any],
     input_records: tuple[ArtifactInputRow, ...],
-) -> RequestBundleProjectionPlanV2:
-    return RequestBundleProjectionPlanV2(
+) -> RequestBundleProjectionPlanV3:
+    return RequestBundleProjectionPlanV3(
         identity_contract_version=IDENTITY_CONTRACT_VERSION,
         namespace=context,
         step_contract=StepContract(
@@ -1966,16 +2212,23 @@ def _projection_binding_plans(
         origin = next(iter(origins))
         dependency_role = next(iter(dependency_roles))
         if origin == "source":
-            if len(records) != 1 or records[0].source_artifact_path is None:
+            if (
+                len(records) != 1
+                or records[0].source_scope is None
+                or records[0].source_name is None
+            ):
                 raise ValidationError(
                     f"source input binding {binding_name!r} is malformed"
                 )
+            record = records[0]
             binding_plans.append(
                 SourceBindingPlan(
                     role=binding_name,
-                    source_coordinate=SourceCoordinate(
-                        namespace=context,
-                        path=records[0].source_artifact_path,
+                    source_coordinate=LogicalSourceCoordinate(
+                        context=context,
+                        scope=record.source_scope,
+                        source_name=record.source_name,
+                        entity_id=record.source_entity_id,
                     ),
                 )
             )
@@ -2082,8 +2335,12 @@ def _reusable_output_refs_for_job(
     *,
     loaded: LoadedWorkflowProject,
     job: RunJob,
+    resolver_cache: dict[
+        ReusableArtifactBundleRequest,
+        ReusableArtifactBundleCandidate | None,
+    ],
 ) -> dict[str, ReusedRunJobOutputRef] | None:
-    if not isinstance(job.projection_state, ResolvedRequestBundleProjectionV2):
+    if not isinstance(job.projection_state, ResolvedRequestBundleProjectionV3):
         return None
     registry_path = loaded.runtime_root / REGISTRY_DB_PATH
     request = ReusableArtifactBundleRequest(
@@ -2099,11 +2356,15 @@ def _reusable_output_refs_for_job(
         ),
         input_records=job.input_records,
     )
-    bundle = resolve_reusable_artifact_bundle(
-        registry_path,
-        runtime_root=loaded.runtime_root,
-        request=request,
-    )
+    if request in resolver_cache:
+        bundle = resolver_cache[request]
+    else:
+        bundle = resolve_reusable_artifact_bundle(
+            registry_path,
+            runtime_root=loaded.runtime_root,
+            request=request,
+        )
+        resolver_cache[request] = bundle
     if bundle is None:
         return None
     return {
@@ -2152,6 +2413,8 @@ def _reused_output_ref(
         reuse_request=request,
         projection_plan=job.projection_plan,
         projection_state=job.projection_state,
+        candidate=candidate,
+        bundle=bundle,
     )
 
 
@@ -2164,7 +2427,8 @@ def _used_reused_outputs(
         record.registry_source_artifact_id
         for job in jobs
         for record in job.input_records
-        if record.registry_source_artifact_id is not None
+        if record.origin == "workflow_output"
+        and record.registry_source_artifact_id is not None
     }
     return tuple(
         output_ref
@@ -2187,7 +2451,8 @@ def _reused_validation_outputs(
         record.registry_source_artifact_id
         for job in jobs
         for record in job.input_records
-        if record.registry_source_artifact_id is not None
+        if record.origin == "workflow_output"
+        and record.registry_source_artifact_id is not None
     ]
     pending.extend(
         artifact_id
@@ -2211,7 +2476,8 @@ def _reused_validation_outputs(
         pending.extend(
             record.registry_source_artifact_id
             for record in output_ref.reuse_request.input_records
-            if record.registry_source_artifact_id is not None
+            if record.origin == "workflow_output"
+            and record.registry_source_artifact_id is not None
         )
     return tuple(validation_refs)
 
@@ -2236,22 +2502,32 @@ def _job_inputs(
         tuple[str, str, str],
         RunJobOutputRef | ReusedRunJobOutputRef,
     ],
+    source_authorities: dict[
+        LogicalSourceCoordinate,
+        RegisteredSourceAuthority,
+    ],
 ) -> tuple[dict[str, tuple[str, ...]], tuple[ArtifactInputRow, ...]]:
     inputs: dict[str, tuple[str, ...]] = {}
     input_records: list[ArtifactInputRow] = []
     if step.execution_role == "source_import":
         for binding_name in step.source_inputs:
-            source_artifact_path = _source_artifact_path_for_binding(
-                loaded.source_index,
-                binding_name=binding_name,
+            declaration = source_declaration_for_binding(
+                context=loaded.context,
+                source_index=loaded.source_index,
+                source_name=binding_name,
                 address=address,
             )
+            source_artifact_path = declaration.declared_path
             source_input_path = _source_input_path_for_workspace(
                 runtime_root=loaded.runtime_root,
                 run_workspace=run_workspace,
                 source_artifact_path=source_artifact_path,
             )
             inputs[binding_name] = (source_input_path,)
+            authority_record = source_authorities.get(declaration.coordinate)
+            authority = (
+                authority_record.authority if authority_record is not None else None
+            )
             input_records.append(
                 ArtifactInputRow(
                     binding_name=binding_name,
@@ -2259,6 +2535,21 @@ def _job_inputs(
                     dependency_role="source_input",
                     origin="source",
                     source_artifact_path=source_artifact_path,
+                    source_scope=declaration.coordinate.scope,
+                    source_name=declaration.coordinate.source_name,
+                    source_entity_id=declaration.coordinate.entity_id,
+                    source_content_digest=(
+                        authority.content_digest if authority is not None else None
+                    ),
+                    source_file_size=(
+                        authority.file_size if authority is not None else None
+                    ),
+                    source_extension=declaration.declared_extension,
+                    registry_source_artifact_id=(
+                        authority_record.artifact_id
+                        if authority_record is not None
+                        else None
+                    ),
                     edge_cardinality=1,
                 )
             )
@@ -2399,27 +2690,6 @@ def _validate_exact_scientific_fan_in(
             f"scientific fan-in {step_name}.{input_name} contains a wrongly "
             "addressed upstream output"
         )
-
-
-def _source_artifact_path_for_binding(
-    source_index: SourceIndex,
-    *,
-    binding_name: str,
-    address: str,
-) -> str:
-    global_path = source_index.global_bindings.get(binding_name)
-    entity_path = source_index.entity_bindings.get(address, {}).get(binding_name)
-    if global_path is not None and entity_path is not None:
-        raise ValidationError(
-            f"ambiguous source binding {binding_name!r} for address {address!r}"
-        )
-    if entity_path is not None:
-        return entity_path
-    if global_path is not None:
-        return global_path
-    raise ValidationError(
-        f"missing source binding {binding_name!r} for address {address!r}"
-    )
 
 
 def _source_input_path_for_workspace(

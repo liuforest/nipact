@@ -153,6 +153,7 @@ class LoadedWorkflowProject:
     runtime_root: Path
     source_index: SourceIndex
     manifests: dict[str, Manifest]
+    manifest_paths: dict[str, Path]
     steps: dict[str, StepDefinition]
     workflows: dict[str, WorkflowDefinition]
 
@@ -254,6 +255,7 @@ def load_workflow_project(*, project_dir: Path, context: str) -> LoadedWorkflowP
         runtime_root=runtime_root,
         source_index=source_index,
         manifests=manifests,
+        manifest_paths=manifest_paths,
         steps=steps,
         workflows=workflows,
     )
