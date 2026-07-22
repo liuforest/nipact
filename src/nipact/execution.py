@@ -708,13 +708,13 @@ def _execute_executable_run_plan(
     cores: int,
     status_callback: RunStatusCallback | None,
 ) -> RunOutcome:
-    """Resolve a workflow plan, executing fresh selected work best-effort.
+    """Execute one finalized plan and record dependency-consistent survivors.
 
-    Snakemake runs with ``--keep-going``, so a single failed job no longer aborts
-    the run: every job whose declared outputs all landed in staging is published
-    and recorded, the failures are skipped, and the survivors stay reusable. The
-    hard errors are a real fresh-only run that published nothing while Snakemake
-    exited non-zero, and a dry run whose Snakemake invocation exited non-zero.
+    Snakemake runs with ``--keep-going``. Current completion receipts, complete
+    sibling staging, preparation checks, dependency pruning, materialization, and
+    registry acceptance determine which independent jobs become reusable. A real
+    fresh-only run with no survivors and a nonzero Snakemake result is a hard
+    error, as is a nonzero dry-run result.
     """
     if cores <= 0:
         raise ValidationError("cores must be a positive integer")
@@ -875,19 +875,6 @@ def _execute_executable_run_plan(
 def _emit_status(callback: RunStatusCallback | None, event: str) -> None:
     if callback is not None:
         callback(event)
-
-
-def publish_run_outputs(
-    run_plan: ExecutableRunPlan,
-    *,
-    invocation_token: str,
-) -> tuple[PublishedOutputRow, ...]:
-    """Publish planned outputs and return registry row facts."""
-    results, _failed = _publish_run_outputs(
-        run_plan,
-        invocation_token=invocation_token,
-    )
-    return tuple(result.row for result in results)
 
 
 def _publish_run_outputs(
