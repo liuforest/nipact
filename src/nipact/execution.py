@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import errno
+import hashlib
 import json
 from importlib import metadata
 import os
@@ -14,7 +15,7 @@ import subprocess
 import sys
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, BinaryIO, Callable
 
 from ._version import __version__
 from .artifacts import (
@@ -272,6 +273,20 @@ class ReusedRunJobOutputRef:
     projection_state: RequestBundleProjectionState
     candidate: ReusableArtifactCandidate
     bundle: ReusableArtifactBundleCandidate
+
+
+@dataclass(frozen=True)
+class _PreparedReusedInput:
+    output_ref: ReusedRunJobOutputRef
+    candidate: ReusableArtifactCandidate
+    bound_occurrence_path: Path
+    supplied_path: Path
+
+
+@dataclass(frozen=True)
+class _PreparedReusedInputs:
+    candidates: dict[int, ReusableArtifactCandidate]
+    inputs: tuple[_PreparedReusedInput, ...]
 
 
 @dataclass(frozen=True)
@@ -743,7 +758,8 @@ def _execute_executable_run_plan(
     else:
         if has_selected_reuse:
             _emit_status(status_callback, "validating_selected_reuse")
-        actual_reused_artifacts = _hydrate_reused_outputs(run_plan)
+        prepared_reused_inputs = _prepare_reused_inputs(run_plan)
+        actual_reused_artifacts = prepared_reused_inputs.candidates
         if has_fresh_selection:
             _write_run_workspace(
                 run_plan,
@@ -1423,43 +1439,45 @@ def _dry_run_forecast_input_paths(run_plan: ExecutableRunPlan) -> dict[str, str]
     return mapping
 
 
-def _hydrate_reused_outputs(
+def _prepare_reused_inputs(
     run_plan: ExecutableRunPlan,
-) -> dict[int, ReusableArtifactCandidate]:
+) -> _PreparedReusedInputs:
     candidates = _exact_reused_candidates(run_plan)
-    verified_artifact_ids = _verify_selected_reused_outputs(
-        run_plan,
-        candidates=candidates,
+    verified_occurrences: dict[tuple[Path, str, int], Path] = {}
+    _verify_selected_reused_outputs(
+        run_plan, candidates=candidates, verified_occurrences=verified_occurrences
     )
+    prepared: list[_PreparedReusedInput] = []
     for output_ref in run_plan.reused_outputs:
         candidate = candidates[output_ref.source_artifact_id]
-        source_path = run_plan.runtime_root / candidate.path
-        if not source_path.is_file():
-            raise ValidationError(
-                f"missing reusable artifact file: {candidate.path}"
-            )
-        if source_path.stat().st_size != candidate.file_size:
-            raise ValidationError("reusable artifact file size mismatch during hydration")
-        if (
-            candidate.artifact_id not in verified_artifact_ids
-            and sha256_file_digest(source_path) != candidate.content_digest
-        ):
-            raise ValidationError("reusable artifact digest mismatch during hydration")
+        source_path = _verify_reused_canonical_occurrence(
+            run_plan,
+            candidate,
+            verified_occurrences=verified_occurrences,
+        )
         output_ref.staging_path.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(source_path, output_ref.staging_path)
         if output_ref.staging_path.stat().st_size != candidate.file_size:
             raise ValidationError("hydrated artifact file size mismatch")
         if sha256_file_digest(output_ref.staging_path) != candidate.content_digest:
             raise ValidationError("hydrated artifact digest mismatch")
-    return candidates
+        prepared.append(
+            _PreparedReusedInput(
+                output_ref=output_ref,
+                candidate=candidate,
+                bound_occurrence_path=source_path,
+                supplied_path=output_ref.staging_path,
+            )
+        )
+    return _PreparedReusedInputs(candidates=candidates, inputs=tuple(prepared))
 
 
 def _verify_selected_reused_outputs(
     run_plan: ExecutableRunPlan,
     *,
     candidates: dict[int, ReusableArtifactCandidate],
-) -> set[int]:
-    verified_artifact_ids: set[int] = set()
+    verified_occurrences: dict[tuple[Path, str, int], Path],
+) -> None:
     for selected_ref in run_plan.selected_reused_output_refs:
         for output_name, planned_artifact_id in selected_ref.planned_sibling_artifact_ids:
             try:
@@ -1476,17 +1494,134 @@ def _verify_selected_reused_outputs(
                 raise ValidationError(
                     "selected reused artifact has the wrong requested coordinate"
                 )
-            if candidate.artifact_id in verified_artifact_ids:
-                continue
-            path = run_plan.runtime_root / candidate.path
-            if not path.is_file():
-                raise ValidationError(f"missing reusable artifact file: {candidate.path}")
-            if path.stat().st_size != candidate.file_size:
-                raise ValidationError("selected reused artifact file size mismatch")
-            if sha256_file_digest(path) != candidate.content_digest:
-                raise ValidationError("selected reused artifact digest mismatch")
-            verified_artifact_ids.add(candidate.artifact_id)
-    return verified_artifact_ids
+            _verify_reused_canonical_occurrence(
+                run_plan,
+                candidate,
+                verified_occurrences=verified_occurrences,
+            )
+
+
+def _verify_reused_canonical_occurrence(
+    run_plan: ExecutableRunPlan,
+    candidate: ReusableArtifactCandidate,
+    *,
+    verified_occurrences: dict[tuple[Path, str, int], Path],
+) -> Path:
+    """Verify one exact frozen canonical occurrence and return its lexical path."""
+    if candidate.published_path != candidate.path:
+        raise ValidationError("reused artifact publication path is inconsistent")
+    if not candidate.path.endswith(candidate.extension):
+        raise ValidationError("reused artifact extension is inconsistent")
+    if candidate.output_hash != short_hash(candidate.content_digest):
+        raise ValidationError("reused artifact content hash is inconsistent")
+    expected_path = canonical_output_path(
+        context=run_plan.context,
+        step_name=candidate.step_name,
+        address=candidate.address,
+        request_bundle_digest=candidate.request_bundle_digest,
+        output_name=candidate.output_name,
+        output_hash=candidate.output_hash,
+        declared_extension=candidate.extension,
+    )
+    if candidate.path != expected_path:
+        raise ValidationError(
+            "reused artifact canonical path does not match its request identity"
+        )
+    resolved_path = _contained_canonical_output_path(
+        run_plan.runtime_root,
+        candidate.path,
+    )
+    lexical_path = run_plan.runtime_root / candidate.path
+    try:
+        before = os.lstat(lexical_path)
+    except FileNotFoundError as exc:
+        raise ValidationError(
+            f"reused artifact canonical occurrence is missing: {candidate.path}"
+        ) from exc
+    except OSError as exc:
+        raise ValidationError(
+            f"reused artifact canonical occurrence is unreadable: {candidate.path}"
+        ) from exc
+    if not stat.S_ISREG(before.st_mode):
+        raise ValidationError(
+            "reused artifact canonical occurrence is not a regular file"
+        )
+    if before.st_nlink != 1:
+        raise ValidationError("reused artifact canonical occurrence has multiple links")
+    if before.st_size != candidate.file_size:
+        raise ValidationError("reused artifact canonical occurrence size mismatch")
+    occurrence_key = (
+        resolved_path,
+        candidate.content_digest,
+        candidate.file_size,
+    )
+    prior = verified_occurrences.get(occurrence_key)
+    if prior is not None:
+        return prior
+
+    try:
+        with lexical_path.open("rb") as handle:
+            opened_before = os.fstat(handle.fileno())
+            if (
+                not stat.S_ISREG(opened_before.st_mode)
+                or opened_before.st_nlink != 1
+                or (opened_before.st_dev, opened_before.st_ino, opened_before.st_size)
+                != (before.st_dev, before.st_ino, before.st_size)
+            ):
+                raise ValidationError(
+                    "reused artifact canonical occurrence changed before verification"
+                )
+            observed_digest = _sha256_open_file(handle)
+            opened_after = os.fstat(handle.fileno())
+    except FileNotFoundError as exc:
+        raise ValidationError(
+            f"reused artifact canonical occurrence is missing: {candidate.path}"
+        ) from exc
+    except OSError as exc:
+        raise ValidationError(
+            f"reused artifact canonical occurrence is unreadable: {candidate.path}"
+        ) from exc
+
+    try:
+        after = os.lstat(lexical_path)
+    except FileNotFoundError as exc:
+        raise ValidationError(
+            "reused artifact canonical occurrence changed during verification"
+        ) from exc
+    except OSError as exc:
+        raise ValidationError(
+            f"reused artifact canonical occurrence is unreadable: {candidate.path}"
+        ) from exc
+    expected_stat = (before.st_dev, before.st_ino, before.st_size, before.st_nlink)
+    if (
+        not stat.S_ISREG(opened_after.st_mode)
+        or opened_after.st_nlink != 1
+        or (
+            opened_after.st_dev,
+            opened_after.st_ino,
+            opened_after.st_size,
+            opened_after.st_nlink,
+        )
+        != expected_stat
+        or not stat.S_ISREG(after.st_mode)
+        or after.st_nlink != 1
+        or (after.st_dev, after.st_ino, after.st_size, after.st_nlink)
+        != expected_stat
+    ):
+        raise ValidationError(
+            "reused artifact canonical occurrence changed during verification"
+        )
+    if observed_digest != candidate.content_digest:
+        raise ValidationError("reused artifact canonical occurrence digest mismatch")
+    verified_occurrences[occurrence_key] = lexical_path
+    return lexical_path
+
+
+def _sha256_open_file(handle: BinaryIO) -> str:
+    digest = hashlib.sha256()
+    for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+        digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _resolve_dry_run_forecast_bundles(

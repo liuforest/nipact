@@ -2042,16 +2042,16 @@ def test_real_hydration_reads_final_resolved_canonical_path(
     reused = c_plan.reused_outputs[0]
     canonical_path = reused.source_path
 
-    original_digest = execution_module.sha256_file_digest
+    original_digest = execution_module._sha256_open_file
     hashed_paths: list[Path] = []
 
-    def recording_digest(path: Path) -> str:
-        hashed_paths.append(Path(path))
-        return original_digest(path)
+    def recording_digest(handle: object) -> str:
+        hashed_paths.append(Path(handle.name))  # type: ignore[attr-defined]
+        return original_digest(handle)  # type: ignore[arg-type]
 
-    monkeypatch.setattr(execution_module, "sha256_file_digest", recording_digest)
+    monkeypatch.setattr(execution_module, "_sha256_open_file", recording_digest)
     assert execute_run_plan(c_plan, cores=1).all_selected_resolved
-    assert canonical_path in hashed_paths
+    assert hashed_paths == [canonical_path]
 
 
 def test_dry_run_accepts_same_size_corruption_real_run_rejects_it(
@@ -2094,7 +2094,7 @@ def test_dry_run_accepts_same_size_corruption_real_run_rejects_it(
     )
     with pytest.raises(
         ValidationError,
-        match="reusable artifact digest mismatch during hydration",
+        match="reused artifact canonical occurrence digest mismatch",
     ):
         execute_run_plan(real_plan, cores=1)
 
@@ -3322,7 +3322,7 @@ def test_bundle_resolver_fails_closed_for_malformed_projection_payload(
     ("change", "message"),
         [
             ("delete", "registered reusable artifact file is missing"),
-            ("mutate", "reusable artifact digest mismatch during hydration"),
+            ("mutate", "reused artifact canonical occurrence digest mismatch"),
             (
                 "symlink_escape",
                 "registered reusable artifact path must stay inside outputs/",
@@ -3424,7 +3424,7 @@ def test_plan_construction_rejects_reuse_candidate_resolving_outside_outputs(
     assert _registry_row_counts(runtime_dir) == counts_before
 
 
-def test_symlink_resolving_inside_outputs_remains_reusable(
+def test_reused_canonical_occurrence_rejects_symlink_inside_outputs(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -3446,9 +3446,9 @@ def test_symlink_resolving_inside_outputs_remains_reusable(
     assert len(probe_plan.reused_outputs) == 1
     published_b = probe_plan.reused_outputs[0].source_path
 
-    # The containment check is about where the path resolves, not whether it is
-    # a symlink — mirroring the publication-side rule. A symlink whose resolved
-    # target stays inside outputs/ remains a valid reuse candidate.
+    # Metadata-only resolution still establishes containment, but real input
+    # preparation requires the canonical occurrence itself to be a regular,
+    # single-link file.
     relocated_target = published_b.parent / "relocated" / published_b.name
     relocated_target.parent.mkdir(parents=True, exist_ok=True)
     published_b.rename(relocated_target)
@@ -3461,9 +3461,122 @@ def test_symlink_resolving_inside_outputs_remains_reusable(
         step_name="c_transform",
     )
     assert len(c_plan.reused_outputs) == 1
-    assert execute_run_plan(c_plan, cores=1).published_count == len(
-        c_plan.published_outputs
+    with pytest.raises(
+        ValidationError,
+        match="reused artifact canonical occurrence is not a regular file",
+    ):
+        execute_run_plan(c_plan, cores=1)
+
+
+def test_reused_canonical_occurrence_rejects_hardlink(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project_dir, _runtime_dir, _log_path = _write_cache_project(tmp_path, monkeypatch)
+    b_plan = build_run_plan(
+        project_dir=project_dir,
+        context="cache",
+        workflow_name="main",
+        step_name="b_transform",
     )
+    assert execute_run_plan(b_plan, cores=1).all_selected_resolved
+
+    c_plan = build_run_plan(
+        project_dir=project_dir,
+        context="cache",
+        workflow_name="main",
+        step_name="c_transform",
+    )
+    published_b = c_plan.reused_outputs[0].source_path
+    os.link(published_b, published_b.parent / "unexpected-hardlink.json")
+
+    with pytest.raises(
+        ValidationError,
+        match="reused artifact canonical occurrence has multiple links",
+    ):
+        execute_run_plan(c_plan, cores=1)
+
+
+@pytest.mark.parametrize(
+    ("change", "message"),
+    [
+        ("missing", "canonical occurrence is missing"),
+        ("directory", "canonical occurrence is not a regular file"),
+        ("size", "canonical occurrence size mismatch"),
+    ],
+)
+def test_prepared_reused_input_rejects_invalid_canonical_occurrence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    change: str,
+    message: str,
+) -> None:
+    project_dir, _runtime_dir, _log_path = _write_cache_project(tmp_path, monkeypatch)
+    b_plan = build_run_plan(
+        project_dir=project_dir,
+        context="cache",
+        workflow_name="main",
+        step_name="b_transform",
+    )
+    assert execute_run_plan(b_plan, cores=1).all_selected_resolved
+    c_plan = build_run_plan(
+        project_dir=project_dir,
+        context="cache",
+        workflow_name="main",
+        step_name="c_transform",
+    )
+    canonical_path = c_plan.reused_outputs[0].source_path
+    if change == "missing":
+        canonical_path.unlink()
+    elif change == "directory":
+        canonical_path.unlink()
+        canonical_path.mkdir()
+    else:
+        canonical_path.write_bytes(canonical_path.read_bytes() + b"x")
+
+    with pytest.raises(ValidationError, match=message):
+        execution_module._prepare_reused_inputs(c_plan.forecast)
+
+
+def test_reused_canonical_occurrence_detects_replacement_during_hash(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project_dir, _runtime_dir, _log_path = _write_cache_project(tmp_path, monkeypatch)
+    b_plan = build_run_plan(
+        project_dir=project_dir,
+        context="cache",
+        workflow_name="main",
+        step_name="b_transform",
+    )
+    assert execute_run_plan(b_plan, cores=1).all_selected_resolved
+    c_plan = build_run_plan(
+        project_dir=project_dir,
+        context="cache",
+        workflow_name="main",
+        step_name="c_transform",
+    )
+
+    real_digest = execution_module._sha256_open_file
+    replaced = False
+
+    def replace_after_hash(handle: object) -> str:
+        nonlocal replaced
+        digest = real_digest(handle)  # type: ignore[arg-type]
+        if not replaced:
+            path = Path(handle.name)  # type: ignore[attr-defined]
+            content = path.read_bytes()
+            path.rename(path.with_name(f"{path.name}.replaced"))
+            path.write_bytes(content)
+            replaced = True
+        return digest
+
+    monkeypatch.setattr(execution_module, "_sha256_open_file", replace_after_hash)
+    with pytest.raises(
+        ValidationError,
+        match="reused artifact canonical occurrence changed during verification",
+    ):
+        execute_run_plan(c_plan, cores=1)
 
 
 # ---------------------------------------------------------------------------
@@ -3986,16 +4099,17 @@ def test_selected_multi_output_reuse_hashes_only_root_siblings_once(
     stale_log.write_text("stale\n", encoding="utf-8")
     residual_staging.write_text("leave in place\n", encoding="utf-8")
 
-    real_digest = execution_module.sha256_file_digest
     hashed_output_paths: list[Path] = []
 
-    def record_digest(path: Path) -> str:
-        resolved = Path(path).resolve()
+    real_digest = execution_module._sha256_open_file
+
+    def record_digest(handle: object) -> str:
+        resolved = Path(handle.name).resolve()  # type: ignore[attr-defined]
         if (runtime_dir / "outputs").resolve() in resolved.parents:
             hashed_output_paths.append(resolved)
-        return real_digest(path)
+        return real_digest(handle)  # type: ignore[arg-type]
 
-    monkeypatch.setattr(execution_module, "sha256_file_digest", record_digest)
+    monkeypatch.setattr(execution_module, "_sha256_open_file", record_digest)
     monkeypatch.setattr(
         "nipact.execution._run_snakemake",
         lambda *_args, **_kwargs: pytest.fail("reuse-only run invoked Snakemake"),
@@ -4028,6 +4142,60 @@ def test_selected_multi_output_reuse_hashes_only_root_siblings_once(
     assert not stale_targets.exists()
     assert not stale_log.exists()
     assert residual_staging.is_file()
+
+
+def test_consumed_selected_overlap_verifies_one_canonical_occurrence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project_dir, runtime_dir, _log_path = _write_cache_project(tmp_path, monkeypatch)
+    b_plan = build_run_plan(
+        project_dir=project_dir,
+        context="cache",
+        workflow_name="main",
+        step_name="b_transform",
+    )
+    assert execute_run_plan(b_plan, cores=1).all_selected_resolved
+    c_plan = build_run_plan(
+        project_dir=project_dir,
+        context="cache",
+        workflow_name="main",
+        step_name="c_transform",
+    )
+    output_ref = c_plan.forecast.reused_outputs[0]
+    selected_ref = SelectedReusedBundleRef(
+        step_name=output_ref.step_name,
+        output_name=output_ref.output_name,
+        address=output_ref.address,
+        reuse_request=output_ref.reuse_request,
+        planned_sibling_artifact_ids=tuple(
+            (candidate.output_name, candidate.artifact_id)
+            for candidate in output_ref.bundle.outputs
+        ),
+    )
+    executable = replace(
+        c_plan.forecast,
+        selected_reused_output_refs=(selected_ref,),
+    )
+
+    real_digest = execution_module._sha256_open_file
+    canonical_hashes: list[Path] = []
+
+    def record_digest(handle: object) -> str:
+        canonical_hashes.append(Path(handle.name).resolve())  # type: ignore[attr-defined]
+        return real_digest(handle)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(execution_module, "_sha256_open_file", record_digest)
+    prepared = execution_module._prepare_reused_inputs(executable)
+
+    assert canonical_hashes == [output_ref.source_path.resolve()]
+    assert len(prepared.inputs) == 1
+    assert prepared.inputs[0].candidate.artifact_id == output_ref.source_artifact_id
+    assert prepared.inputs[0].bound_occurrence_path == output_ref.source_path
+    assert prepared.inputs[0].supplied_path == output_ref.staging_path
+    assert prepared.inputs[0].supplied_path.read_bytes() == output_ref.source_path.read_bytes()
+    assert prepared.candidates[output_ref.source_artifact_id] == output_ref.candidate
+    assert prepared.inputs[0].bound_occurrence_path.is_relative_to(runtime_dir)
 
 
 def test_selected_reuse_digest_failure_aborts_before_registry_update(
@@ -4070,7 +4238,7 @@ def test_selected_reuse_digest_failure_aborts_before_registry_update(
 
     with pytest.raises(
         ValidationError,
-        match="selected reused artifact digest mismatch",
+        match="reused artifact canonical occurrence digest mismatch",
     ):
         execute_run_plan(selected_plan, cores=1)
     assert _registry_row_counts(runtime_dir) == counts_before
