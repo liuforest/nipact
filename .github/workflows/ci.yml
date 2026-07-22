@@ -86,4 +86,4 @@ jobs:
           nipact workflow graph --context colors --workflow base --step color_sector_analysis
           nipact workflow run --context colors --workflow base --step color_sector_analysis --dry-run
           nipact workflow run --context colors --workflow base --step color_sector_analysis --cores 1
-          nipact trace --context colors --workflow base --step color_sector_analysis --output sector_counts --address init
+          nipact trace --context colors --workflow base --step color_sector_analysis --output sector_counts --address cohort
