@@ -10,6 +10,7 @@ import yaml
 
 import nipact.execution as execution_module
 import nipact.registry as registry_module
+import nipact.source_authority as source_authority_module
 from nipact.cli import main
 from nipact.errors import ValidationError
 from nipact.execution import (
@@ -23,6 +24,10 @@ from nipact.manifest import load_manifest
 from nipact.projection import (
     ResolvedRequestBundleProjectionV3,
     UnresolvedRequestBundleProjection,
+)
+from nipact.runtime_lock import (
+    RuntimeLockUnavailableError,
+    acquire_mutating_runtime_lock,
 )
 from nipact.source_authority import LogicalSourceCoordinate
 from nipact.trace import build_trace_graph_for_workflow_coordinate
@@ -887,6 +892,100 @@ def test_dry_forecast_marks_changed_source_guard_provisional_without_hashing(
     )
 
 
+def test_real_source_reconciliation_hashes_only_new_or_changed_content(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project_dir, runtime_dir, _log_path = _write_cache_project(
+        tmp_path,
+        monkeypatch,
+    )
+    stream_hashes = 0
+    original_stream_hash = source_authority_module._stream_sha256
+
+    def count_stream_hash(*args: object, **kwargs: object) -> str:
+        nonlocal stream_hashes
+        stream_hashes += 1
+        return original_stream_hash(*args, **kwargs)
+
+    monkeypatch.setattr(
+        "nipact.source_authority._stream_sha256",
+        count_stream_hash,
+    )
+
+    first = build_run_plan(
+        project_dir=project_dir,
+        context="cache",
+        workflow_name="main",
+        step_name="a_source",
+        address="sub_001",
+    )
+    assert execute_run_plan(first, cores=1).all_selected_resolved
+    assert stream_hashes == 1
+
+    unchanged = build_run_plan(
+        project_dir=project_dir,
+        context="cache",
+        workflow_name="main",
+        step_name="a_source",
+        address="sub_001",
+    )
+    assert execute_run_plan(unchanged, cores=1).all_selected_resolved
+    assert stream_hashes == 1
+
+    (runtime_dir / "data/source/sub_001.txt").write_text(
+        "omega\n",
+        encoding="utf-8",
+    )
+    changed = build_run_plan(
+        project_dir=project_dir,
+        context="cache",
+        workflow_name="main",
+        step_name="a_source",
+        address="sub_001",
+    )
+    assert execute_run_plan(changed, cores=1).all_selected_resolved
+    assert stream_hashes == 2
+
+
+def test_real_execution_lock_blocks_before_authority_or_workspace_mutation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project_dir, runtime_dir, _log_path = _write_cache_project(
+        tmp_path,
+        monkeypatch,
+    )
+    plan = build_run_plan(
+        project_dir=project_dir,
+        context="cache",
+        workflow_name="main",
+        step_name="a_source",
+        address="sub_001",
+    )
+    assert not plan.run_workspace.exists()
+
+    snakemake_started = False
+
+    def reject_snakemake(*_args: object, **_kwargs: object) -> int:
+        nonlocal snakemake_started
+        snakemake_started = True
+        raise AssertionError("Snakemake started while the runtime lock was held")
+
+    monkeypatch.setattr(execution_module, "_run_snakemake", reject_snakemake)
+    with acquire_mutating_runtime_lock(runtime_dir):
+        with pytest.raises(RuntimeLockUnavailableError, match="already in use"):
+            execute_run_plan(plan, cores=1)
+
+    with sqlite3.connect(runtime_dir / "database/registry.db") as conn:
+        source_count = conn.execute(
+            "SELECT COUNT(*) FROM artifacts WHERE origin = 'source'"
+        ).fetchone()[0]
+    assert source_count == 0
+    assert not plan.run_workspace.exists()
+    assert not snakemake_started
+
+
 def test_projection_planning_uses_prospective_upstream_request_identity(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1658,7 +1757,7 @@ def test_real_run_cli_reports_planned_hydration_bytes_fanout_once(
     assert "missing work executes through Snakemake" in summary["note"]
 
 
-def test_dry_run_maps_fresh_candidate_path_when_registered_path_moves(
+def test_dry_run_forecast_refreshes_candidate_path_when_registry_path_moves(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1683,10 +1782,9 @@ def test_dry_run_maps_fresh_candidate_path_when_registered_path_moves(
     old_rel = c_plan.reused_outputs[0].source_path_relative
     artifact_id = c_plan.reused_outputs[0].source_artifact_id
 
-    # Re-register the artifact at a new path under outputs/ while leaving the
-    # old file present with a valid size: an implementation that confirmed only
-    # the artifact_id and then mapped the stale planned path would still pass
-    # every validation check, so only genuine re-resolution finds the move.
+    # Move the registered occurrence under outputs/ while leaving the old file
+    # present with a valid size. The dry-run metadata forecast refreshes the
+    # candidate path; it does not establish authority for real execution.
     new_rel = "/".join([*old_rel.split("/")[:-1], "moved", old_rel.split("/")[-1]])
     new_path = runtime_dir / new_rel
     new_path.parent.mkdir(parents=True, exist_ok=True)
@@ -5418,7 +5516,7 @@ def test_bundle_resolver_reports_recorded_divergence_before_missing_files(
         )
 
 
-def test_real_hydration_does_not_query_resolver_after_finalization(
+def test_real_execution_resolves_once_per_request_before_exact_hydration(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -5448,27 +5546,36 @@ def test_real_hydration_does_not_query_resolver_after_finalization(
         "b_transform",
     }
 
-    # Finalization resolves the complete reused closure once. Hydration must
-    # verify and copy those frozen occurrences without another resolver query.
-    resolver_calls = 0
+    # Public real execution resolves each distinct request once under the lock.
+    # Hydration then verifies and copies those frozen occurrences without
+    # issuing another resolver query.
+    expected_reused_requests = {
+        output_ref.reuse_request
+        for output_ref in c_plan.reused_validation_outputs
+    }
+    resolver_calls: list[object] = []
+    original_resolver = execution_module.resolve_reusable_artifact_bundle
 
-    def reject_second_resolution(*_args: object, **_kwargs: object) -> object:
-        nonlocal resolver_calls
-        resolver_calls += 1
-        raise AssertionError("real hydration queried the resolver")
+    def count_resolution(*args: object, **kwargs: object) -> object:
+        resolver_calls.append(kwargs["request"])
+        return original_resolver(*args, **kwargs)
 
     monkeypatch.setattr(
-        "nipact.execution.resolve_reusable_artifact_bundle",
-        reject_second_resolution,
+        execution_module,
+        "resolve_reusable_artifact_bundle",
+        count_resolution,
     )
-    # The public entry point performs final resolution after this monkeypatch,
-    # so execute the already finalized forecast to isolate hydration itself.
-    assert execution_module._execute_executable_run_plan(
-        c_plan.forecast,
-        cores=1,
-        status_callback=None,
-    ).all_selected_resolved
-    assert resolver_calls == 0
+    assert execute_run_plan(c_plan, cores=1).all_selected_resolved
+    assert expected_reused_requests <= set(resolver_calls)
+    assert len(resolver_calls) == len(set(resolver_calls))
+    assert {
+        (getattr(request, "step_name"), getattr(request, "address"))
+        for request in resolver_calls
+    } == {
+        ("a_source", "sub_001"),
+        ("b_transform", "sub_001"),
+        ("c_transform", "sub_001"),
+    }
 
 
 def test_targeted_rerun_rejects_divergent_deterministic_output_and_rolls_back(
