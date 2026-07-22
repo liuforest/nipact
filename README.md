@@ -21,11 +21,11 @@ Work in Progress:
 
 ## Installation
 
-Current pre-release is `0.0.1a11`. Install it from PyPI in a clean
+Current pre-release is `0.0.1a12`. Install it from PyPI in a clean
 environment:
 
 ```bash
-python -m pip install nipact==0.0.1a11
+python -m pip install nipact==0.0.1a12
 nipact --version
 ```
 
