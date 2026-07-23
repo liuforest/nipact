@@ -103,7 +103,13 @@ RunStatusCallback = Callable[[str], None]
 
 # Private rollout boundary for representation-transparent consumers. Unknown
 # callables retain copied delivery until they have been audited explicitly.
-_DIRECT_REUSED_INPUT_CALLABLE_REFS: frozenset[str] = frozenset()
+_DIRECT_REUSED_INPUT_CALLABLE_REFS: frozenset[str] = frozenset(
+    {
+        "src.clms_nipact.steps:denoise_timeseries",
+        "src.clms_nipact.steps:extract_timeseries",
+        "src.clms_nipact.steps:t1_brain_extraction",
+    }
+)
 
 
 @dataclass(frozen=True)

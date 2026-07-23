@@ -430,6 +430,7 @@ def _assert_generic_validate_passes(
     *,
     context: str = "mini",
     published_outputs: int = 0,
+    source_entities: int = 1,
 ) -> None:
     assert (
         main(
@@ -447,7 +448,7 @@ def _assert_generic_validate_passes(
     assert "validated_manifests=1" in output
     assert "parsed_workflow_files=1" in output
     assert "parsed_step_files=1" in output
-    assert "source_entities=0" in output
+    assert f"source_entities={source_entities}" in output
     assert f"published_outputs={published_outputs}" in output
     assert "PASS: validate" in output
 
@@ -729,7 +730,13 @@ def test_init_creates_prepared_neuro_demo_project_and_registry(
     assert "validated_manifests=1" in validate_output
     assert "parsed_workflow_files=1" in validate_output
     assert f"parsed_step_files={step_count}" in validate_output
-    assert "source_entities=0" in validate_output
+    expected_source_entities = len(
+        template.source_index_payload().get("entities", {})
+    )
+    assert (
+        f"source_entities={expected_source_entities}"
+        in validate_output
+    )
     assert "published_outputs=0" in validate_output
     assert "PASS: validate" in validate_output
 
