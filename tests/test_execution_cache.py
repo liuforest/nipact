@@ -1596,6 +1596,17 @@ def test_allowlisted_consumer_uses_direct_canonical_reused_input(
         ).fetchone() == (reused_b.source_artifact_id, supplied_path)
 
 
+def test_external_direct_rollout_is_limited_to_audited_clms_callables() -> None:
+    expected = frozenset(
+        {
+            "src.clms_nipact.steps:denoise_timeseries",
+            "src.clms_nipact.steps:extract_timeseries",
+            "src.clms_nipact.steps:t1_brain_extraction",
+        }
+    )
+    assert expected == execution_module._DIRECT_REUSED_INPUT_CALLABLE_REFS
+
+
 def test_direct_delivery_requires_exact_callable_reference(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

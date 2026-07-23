@@ -329,7 +329,9 @@ def _validate_generic_prepared_project(
         manifest_count=len(loaded_workflow_project.manifests),
         workflow_count=len(loaded_workflow_project.workflows),
         step_count=len(loaded_workflow_project.steps),
-        source_entities=0,
+        source_entities=len(
+            loaded_workflow_project.source_index.entity_bindings
+        ),
         published_outputs=published_outputs,
     )
 
