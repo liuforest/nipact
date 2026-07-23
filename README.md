@@ -21,11 +21,13 @@ Work in Progress:
 
 ## Installation
 
-Current pre-release is `0.0.1a13`. Install it from PyPI in a clean
-environment:
+The current source-checkout pre-release is `0.0.1a13`. It is locally tagged
+for the CLMS2 code freeze but has not been published to PyPI. The latest
+published pre-release remains `0.0.1a12`; install that release in a clean
+environment with:
 
 ```bash
-python -m pip install nipact==0.0.1a13
+python -m pip install nipact==0.0.1a12
 nipact --version
 ```
 
