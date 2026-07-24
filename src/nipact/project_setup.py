@@ -271,7 +271,6 @@ def _validate_colors_project(
     except ValidationError as exc:
         raise ProjectSetupError(str(exc)) from exc
     source_digest = _json_digest(source_payload)
-    source_hash = short_hash(source_digest)
     if source_digest != _json_digest(colors_template.source_payload()):
         raise ProjectSetupError("source data content does not match colors demo")
 
