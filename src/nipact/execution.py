@@ -78,7 +78,6 @@ from .registry import (
 from .runtime_lock import acquire_mutating_runtime_lock
 from .source_authority import (
     LogicalSourceCoordinate,
-    ObservedSourceAuthority,
     SourceDeclaration,
     observe_source_authority,
     read_source_occurrence_guard,
