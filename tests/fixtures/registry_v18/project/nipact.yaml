@@ -1,0 +1,12 @@
+context: v18_fixture
+paths:
+  runtime: ../runtime
+sources:
+  index: sources.yaml
+manifests:
+  cohort: manifests/cohort.yaml
+steps:
+  directory: steps
+workflows:
+  base: workflows/base.yaml
+  parameter-variant: workflows/parameter-variant.yaml

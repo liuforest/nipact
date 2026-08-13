@@ -1,0 +1,9 @@
+workflow_name: base
+execution_population: cohort
+steps:
+  - step_name: fixture_source
+    output_name: source_value
+  - step_name: fixture_transform
+    output_name: left
+  - step_name: fixture_analysis
+    output_name: summary
