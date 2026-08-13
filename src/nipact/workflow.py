@@ -14,6 +14,7 @@ from .errors import ValidationError
 from .hashing import SHORT_HASH_LENGTH, is_valid_digest
 from .identity import validate_path_token
 from .manifest import MANIFEST_VALUE_SCHEMA, Manifest, load_manifest
+from .specification_config import parse_specification_registrations
 
 STEP_FIELDS = frozenset(
     {
@@ -214,6 +215,7 @@ def load_workflow_project(*, project_dir: Path, context: str) -> LoadedWorkflowP
         raise ValidationError(f"project dir does not exist: {project_dir}")
 
     config = _load_yaml_mapping(project_root / "nipact.yaml", label="nipact.yaml")
+    parse_specification_registrations(config)
     if _required_string(config, "context", "nipact.yaml context") != context:
         raise ValidationError(f"context mismatch in nipact.yaml: expected {context!r}")
     runtime_root = _runtime_root(project_root, config)

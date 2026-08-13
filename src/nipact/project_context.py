@@ -11,6 +11,7 @@ import yaml
 from .errors import ValidationError
 from .identity import validate_path_token
 from .registry import REGISTRY_DB_PATH, read_context_runtime_path
+from .specification_config import parse_specification_registrations
 
 
 @dataclass(frozen=True)
@@ -30,6 +31,7 @@ def resolve_project_context(*, project_dir: Path, context: str) -> ResolvedProje
 
     config_path = project_root / "nipact.yaml"
     config = _read_project_config(config_path)
+    parse_specification_registrations(config)
     if config.get("context") != context:
         raise ValidationError(f"context mismatch in nipact.yaml: expected {context!r}")
 
