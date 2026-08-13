@@ -594,6 +594,103 @@ def test_canonical_output_path_rejects_invalid_request_digest(
         )
 
 
+def test_build_run_plan_loads_once_and_delegates_arguments(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project_dir = tmp_path / "project"
+    loaded = object()
+    expected = object()
+    load_calls: list[tuple[Path, str]] = []
+    delegate_calls: list[tuple[object, str, str, str | None, bool]] = []
+
+    def fake_load_workflow_project(*, project_dir: Path, context: str) -> object:
+        load_calls.append((project_dir, context))
+        return loaded
+
+    def fake_build_from_loaded(
+        *,
+        loaded: object,
+        workflow_name: str,
+        step_name: str,
+        address: str | None,
+        dry_run: bool,
+    ) -> object:
+        delegate_calls.append(
+            (loaded, workflow_name, step_name, address, dry_run)
+        )
+        return expected
+
+    monkeypatch.setattr(
+        execution_module,
+        "load_workflow_project",
+        fake_load_workflow_project,
+    )
+    monkeypatch.setattr(
+        execution_module,
+        "_build_run_plan_from_loaded_project",
+        fake_build_from_loaded,
+    )
+
+    actual = build_run_plan(
+        project_dir=project_dir,
+        context="mini",
+        workflow_name="main",
+        step_name="uppercase_text",
+        address="sub_001",
+        dry_run=True,
+    )
+
+    assert actual is expected
+    assert load_calls == [(project_dir, "mini")]
+    assert delegate_calls == [
+        (loaded, "main", "uppercase_text", "sub_001", True)
+    ]
+
+
+def test_loaded_project_planning_matches_public_compact_plan_without_reload(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project_dir, runtime_dir = _write_tiny_non_colors_project(tmp_path, monkeypatch)
+    loaded = execution_module.load_workflow_project(
+        project_dir=project_dir,
+        context="mini",
+    )
+    public_plan = build_run_plan(
+        project_dir=project_dir,
+        context="mini",
+        workflow_name="main",
+        step_name="uppercase_text",
+        address="sub_001",
+        dry_run=True,
+    )
+
+    def unexpected_reload(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("loaded-project planning reloaded project files")
+
+    monkeypatch.setattr(
+        execution_module,
+        "load_workflow_project",
+        unexpected_reload,
+    )
+    private_plan = execution_module._build_run_plan_from_loaded_project(
+        loaded=loaded,
+        workflow_name="main",
+        step_name="uppercase_text",
+        address="sub_001",
+        dry_run=True,
+    )
+
+    assert private_plan == public_plan
+    assert private_plan.loaded_project is loaded
+    assert private_plan.run_workspace == (
+        runtime_dir
+        / "runs/mini/main/uppercase_text/addresses/sub_001/dry-run"
+    )
+    assert not private_plan.run_workspace.exists()
+
+
 def test_build_run_plan_for_base_entity_step(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
