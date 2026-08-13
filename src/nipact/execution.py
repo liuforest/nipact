@@ -410,6 +410,24 @@ def build_run_plan(
 ) -> StructuralRunPlan:
     """Build frozen structural declarations and a metadata-only forecast."""
     loaded = load_workflow_project(project_dir=project_dir, context=context)
+    return _build_run_plan_from_loaded_project(
+        loaded=loaded,
+        workflow_name=workflow_name,
+        step_name=step_name,
+        address=address,
+        dry_run=dry_run,
+    )
+
+
+def _build_run_plan_from_loaded_project(
+    *,
+    loaded: LoadedWorkflowProject,
+    workflow_name: str,
+    step_name: str,
+    address: str | None = None,
+    dry_run: bool = False,
+) -> StructuralRunPlan:
+    """Build a structural plan from an already validated project."""
     registered_runtime_path = read_context_runtime_path(
         loaded.runtime_root / REGISTRY_DB_PATH,
         context=loaded.context,
