@@ -1,0 +1,2065 @@
+{
+  "objects": [
+    {
+      "name": "artifacts_path_idx",
+      "tbl_name": "artifacts",
+      "type": "index"
+    },
+    {
+      "name": "artifacts_reuse_lookup_idx",
+      "tbl_name": "artifacts",
+      "type": "index"
+    },
+    {
+      "name": "artifacts_selected_lookup_idx",
+      "tbl_name": "artifacts",
+      "type": "index"
+    },
+    {
+      "name": "artifacts_source_entity_coordinate_uq",
+      "tbl_name": "artifacts",
+      "type": "index"
+    },
+    {
+      "name": "artifacts_source_global_coordinate_uq",
+      "tbl_name": "artifacts",
+      "type": "index"
+    },
+    {
+      "name": "artifacts_workflow_output_uq",
+      "tbl_name": "artifacts",
+      "type": "index"
+    },
+    {
+      "name": "published_outputs_artifact_id_idx",
+      "tbl_name": "published_outputs",
+      "type": "index"
+    },
+    {
+      "name": "workflow_runs_current_scope_uq",
+      "tbl_name": "workflow_runs",
+      "type": "index"
+    },
+    {
+      "name": "artifact_dependencies",
+      "tbl_name": "artifact_dependencies",
+      "type": "table"
+    },
+    {
+      "name": "artifacts",
+      "tbl_name": "artifacts",
+      "type": "table"
+    },
+    {
+      "name": "contexts",
+      "tbl_name": "contexts",
+      "type": "table"
+    },
+    {
+      "name": "manifest_declarations",
+      "tbl_name": "manifest_declarations",
+      "type": "table"
+    },
+    {
+      "name": "manifest_values",
+      "tbl_name": "manifest_values",
+      "type": "table"
+    },
+    {
+      "name": "parameters",
+      "tbl_name": "parameters",
+      "type": "table"
+    },
+    {
+      "name": "published_outputs",
+      "tbl_name": "published_outputs",
+      "type": "table"
+    },
+    {
+      "name": "request_bundle_projections",
+      "tbl_name": "request_bundle_projections",
+      "type": "table"
+    },
+    {
+      "name": "run_execution_population",
+      "tbl_name": "run_execution_population",
+      "type": "table"
+    },
+    {
+      "name": "run_manifest_bindings",
+      "tbl_name": "run_manifest_bindings",
+      "type": "table"
+    },
+    {
+      "name": "workflow_runs",
+      "tbl_name": "workflow_runs",
+      "type": "table"
+    }
+  ],
+  "sql": {
+    "artifact_dependencies": "CREATE TABLE artifact_dependencies ( dependent_artifact_id INTEGER NOT NULL REFERENCES artifacts(artifact_id) ON DELETE CASCADE, source_artifact_id INTEGER NOT NULL REFERENCES artifacts(artifact_id) ON DELETE RESTRICT, source_content_digest TEXT NOT NULL, source_file_size INTEGER NOT NULL CHECK(source_file_size >= 0), source_extension TEXT NOT NULL, input_path TEXT NOT NULL, binding_name TEXT NOT NULL, dependency_role TEXT NOT NULL, source_step_name TEXT, source_output_name TEXT, source_address TEXT, source_scope TEXT CHECK( source_scope IS NULL OR source_scope IN ('global', 'entity') ), source_name TEXT, source_entity_id TEXT, source_occurrence_path TEXT, dependency_set_id TEXT, manifest_value_schema TEXT, manifest_digest TEXT, edge_cardinality INTEGER CHECK( edge_cardinality IS NULL OR edge_cardinality >= 0 ), CHECK ( (manifest_value_schema IS NULL) = (manifest_digest IS NULL) ), CHECK ( ( source_scope IS NULL AND source_name IS NULL AND source_entity_id IS NULL AND source_occurrence_path IS NULL ) OR ( source_scope = 'global' AND source_name IS NOT NULL AND source_entity_id IS NULL AND source_occurrence_path IS NOT NULL ) OR ( source_scope = 'entity' AND source_name IS NOT NULL AND source_entity_id IS NOT NULL AND source_occurrence_path IS NOT NULL ) ), FOREIGN KEY (manifest_value_schema, manifest_digest) REFERENCES manifest_values(value_schema, manifest_digest) ON DELETE RESTRICT, PRIMARY KEY ( dependent_artifact_id, source_artifact_id, input_path, binding_name ) )",
+    "artifacts": "CREATE TABLE artifacts ( artifact_id INTEGER PRIMARY KEY AUTOINCREMENT, origin TEXT NOT NULL CHECK(origin IN ('source', 'workflow_output')), run_id INTEGER REFERENCES workflow_runs(run_id) ON DELETE CASCADE, context TEXT NOT NULL REFERENCES contexts(context) ON DELETE CASCADE, workflow_name TEXT, step_name TEXT, output_name TEXT, address TEXT, job_id TEXT, artifact_set_id TEXT, parameter_id INTEGER REFERENCES parameters(parameter_id), path TEXT NOT NULL, is_selected_output INTEGER NOT NULL DEFAULT 0 CHECK(is_selected_output IN (0, 1)), is_published INTEGER NOT NULL DEFAULT 0 CHECK(is_published IN (0, 1)), published_path TEXT, staging_path TEXT, content_digest TEXT NOT NULL, output_hash TEXT, file_size INTEGER NOT NULL CHECK(file_size >= 0), extension TEXT NOT NULL, subject_id TEXT, session_id TEXT, task_name TEXT, run_label TEXT, datatype TEXT, suffix TEXT, source_metadata_json TEXT, callable_ref TEXT, software_ref TEXT, source_scope TEXT CHECK( source_scope IS NULL OR source_scope IN ('global', 'entity') ), source_name TEXT, source_entity_id TEXT, source_st_dev INTEGER CHECK(source_st_dev IS NULL OR source_st_dev >= 0), source_st_ino INTEGER CHECK(source_st_ino IS NULL OR source_st_ino >= 0), source_st_size INTEGER CHECK(source_st_size IS NULL OR source_st_size >= 0), source_st_mtime_ns INTEGER CHECK( source_st_mtime_ns IS NULL OR source_st_mtime_ns >= 0 ), source_st_ctime_ns INTEGER CHECK( source_st_ctime_ns IS NULL OR source_st_ctime_ns >= 0 ), request_bundle_digest TEXT REFERENCES request_bundle_projections(request_bundle_digest) ON DELETE RESTRICT, created_at TEXT NOT NULL, CHECK ( ( origin = 'workflow_output' AND request_bundle_digest IS NOT NULL ) OR ( origin = 'source' AND request_bundle_digest IS NULL ) ), CHECK ( origin != 'source' OR ( run_id IS NULL AND workflow_name IS NULL AND step_name IS NULL AND output_name IS NULL AND address IS NULL AND parameter_id IS NULL AND is_selected_output = 0 AND is_published = 0 AND published_path IS NULL AND staging_path IS NULL AND source_scope IS NOT NULL AND source_name IS NOT NULL AND ( (source_scope = 'global' AND source_entity_id IS NULL) OR (source_scope = 'entity' AND source_entity_id IS NOT NULL) ) AND source_st_dev IS NOT NULL AND source_st_ino IS NOT NULL AND source_st_size IS NOT NULL AND source_st_mtime_ns IS NOT NULL AND source_st_ctime_ns IS NOT NULL ) ), CHECK ( origin = 'source' OR ( source_scope IS NULL AND source_name IS NULL AND source_entity_id IS NULL AND source_st_dev IS NULL AND source_st_ino IS NULL AND source_st_size IS NULL AND source_st_mtime_ns IS NULL AND source_st_ctime_ns IS NULL ) ) )",
+    "artifacts_path_idx": "CREATE INDEX artifacts_path_idx ON artifacts(context, path)",
+    "artifacts_reuse_lookup_idx": "CREATE INDEX artifacts_reuse_lookup_idx ON artifacts( context, step_name, address, request_bundle_digest, run_id ) WHERE origin = 'workflow_output' AND is_published = 1",
+    "artifacts_selected_lookup_idx": "CREATE INDEX artifacts_selected_lookup_idx ON artifacts(context, workflow_name, step_name, output_name, address) WHERE is_selected_output = 1",
+    "artifacts_source_entity_coordinate_uq": "CREATE UNIQUE INDEX artifacts_source_entity_coordinate_uq ON artifacts(context, source_name, source_entity_id) WHERE origin = 'source' AND source_scope = 'entity'",
+    "artifacts_source_global_coordinate_uq": "CREATE UNIQUE INDEX artifacts_source_global_coordinate_uq ON artifacts(context, source_name) WHERE origin = 'source' AND source_scope = 'global'",
+    "artifacts_workflow_output_uq": "CREATE UNIQUE INDEX artifacts_workflow_output_uq ON artifacts(run_id, step_name, output_name, address) WHERE origin = 'workflow_output'",
+    "contexts": "CREATE TABLE contexts ( context TEXT PRIMARY KEY, runtime_path TEXT NOT NULL, storage_layout_version INTEGER NOT NULL DEFAULT 1 CHECK( storage_layout_version = 1 ) )",
+    "manifest_declarations": "CREATE TABLE manifest_declarations ( context TEXT NOT NULL REFERENCES contexts(context) ON DELETE CASCADE, manifest_name TEXT NOT NULL, declared_path TEXT NOT NULL, last_validated_manifest_value_schema TEXT NOT NULL, last_validated_manifest_digest TEXT NOT NULL, PRIMARY KEY (context, manifest_name), FOREIGN KEY ( last_validated_manifest_value_schema, last_validated_manifest_digest ) REFERENCES manifest_values(value_schema, manifest_digest) ON DELETE RESTRICT )",
+    "manifest_values": "CREATE TABLE manifest_values ( value_schema TEXT NOT NULL, manifest_digest TEXT NOT NULL CHECK( length(manifest_digest) = 64 AND manifest_digest NOT GLOB '*[^0-9a-f]*' ), canonical_body TEXT NOT NULL CHECK(length(canonical_body) > 0), entity_count INTEGER NOT NULL CHECK(entity_count > 0), PRIMARY KEY (value_schema, manifest_digest) )",
+    "parameters": "CREATE TABLE parameters ( parameter_id INTEGER PRIMARY KEY AUTOINCREMENT, hash_version INTEGER NOT NULL, parameter_hash TEXT NOT NULL, parameter_digest TEXT NOT NULL, step_name TEXT NOT NULL, parameters_json TEXT NOT NULL, created_at TEXT NOT NULL, UNIQUE (hash_version, step_name, parameter_hash) )",
+    "published_outputs": "CREATE TABLE published_outputs ( context TEXT NOT NULL REFERENCES contexts(context) ON DELETE CASCADE, workflow_name TEXT NOT NULL, step_name TEXT NOT NULL, output_name TEXT NOT NULL, address TEXT NOT NULL, path TEXT NOT NULL, output_digest TEXT NOT NULL, output_hash TEXT NOT NULL, artifact_id INTEGER NOT NULL REFERENCES artifacts(artifact_id) ON DELETE RESTRICT, PRIMARY KEY (context, workflow_name, step_name, output_name, address) )",
+    "published_outputs_artifact_id_idx": "CREATE INDEX published_outputs_artifact_id_idx ON published_outputs(artifact_id)",
+    "request_bundle_projections": "CREATE TABLE request_bundle_projections ( request_bundle_digest TEXT PRIMARY KEY CHECK( length(request_bundle_digest) = 64 AND request_bundle_digest NOT GLOB '*[^0-9a-f]*' ), projection_json TEXT NOT NULL )",
+    "run_execution_population": "CREATE TABLE run_execution_population ( run_id INTEGER PRIMARY KEY REFERENCES workflow_runs(run_id) ON DELETE CASCADE, manifest_name TEXT NOT NULL, manifest_value_schema TEXT NOT NULL, manifest_digest TEXT NOT NULL, FOREIGN KEY (manifest_value_schema, manifest_digest) REFERENCES manifest_values(value_schema, manifest_digest) ON DELETE RESTRICT )",
+    "run_manifest_bindings": "CREATE TABLE run_manifest_bindings ( run_id INTEGER NOT NULL REFERENCES workflow_runs(run_id) ON DELETE CASCADE, step_name TEXT NOT NULL, manifest_usage_role TEXT NOT NULL, manifest_name TEXT NOT NULL, manifest_value_schema TEXT NOT NULL, manifest_digest TEXT NOT NULL, PRIMARY KEY (run_id, step_name, manifest_usage_role), FOREIGN KEY (manifest_value_schema, manifest_digest) REFERENCES manifest_values(value_schema, manifest_digest) ON DELETE RESTRICT )",
+    "workflow_runs": "CREATE TABLE workflow_runs ( run_id INTEGER PRIMARY KEY AUTOINCREMENT, context TEXT NOT NULL REFERENCES contexts(context) ON DELETE CASCADE, workflow_name TEXT NOT NULL, selected_step_name TEXT NOT NULL, selected_output_name TEXT NOT NULL, run_workspace TEXT NOT NULL, run_plan_path TEXT NOT NULL, run_plan_digest TEXT NOT NULL, base_workflow_name TEXT, resolution_summary_json TEXT NOT NULL, environment_observation_json TEXT NOT NULL, is_current INTEGER NOT NULL DEFAULT 1 CHECK(is_current IN (0, 1)), created_at TEXT NOT NULL )",
+    "workflow_runs_current_scope_uq": "CREATE UNIQUE INDEX workflow_runs_current_scope_uq ON workflow_runs ( context, workflow_name, selected_step_name, selected_output_name ) WHERE is_current = 1"
+  },
+  "tables": {
+    "artifact_dependencies": {
+      "columns": [
+        {
+          "cid": 0,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "dependent_artifact_id",
+          "notnull": 1,
+          "pk": 1,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 1,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "source_artifact_id",
+          "notnull": 1,
+          "pk": 2,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 2,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "source_content_digest",
+          "notnull": 1,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 3,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "source_file_size",
+          "notnull": 1,
+          "pk": 0,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 4,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "source_extension",
+          "notnull": 1,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 5,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "input_path",
+          "notnull": 1,
+          "pk": 3,
+          "type": "TEXT"
+        },
+        {
+          "cid": 6,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "binding_name",
+          "notnull": 1,
+          "pk": 4,
+          "type": "TEXT"
+        },
+        {
+          "cid": 7,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "dependency_role",
+          "notnull": 1,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 8,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "source_step_name",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 9,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "source_output_name",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 10,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "source_address",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 11,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "source_scope",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 12,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "source_name",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 13,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "source_entity_id",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 14,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "source_occurrence_path",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 15,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "dependency_set_id",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 16,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "manifest_value_schema",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 17,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "manifest_digest",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 18,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "edge_cardinality",
+          "notnull": 0,
+          "pk": 0,
+          "type": "INTEGER"
+        }
+      ],
+      "foreign_keys": [
+        {
+          "columns": [
+            {
+              "from": "dependent_artifact_id",
+              "sequence": 0,
+              "to": "artifact_id"
+            }
+          ],
+          "match": "NONE",
+          "on_delete": "CASCADE",
+          "on_update": "NO ACTION",
+          "table": "artifacts"
+        },
+        {
+          "columns": [
+            {
+              "from": "manifest_value_schema",
+              "sequence": 0,
+              "to": "value_schema"
+            },
+            {
+              "from": "manifest_digest",
+              "sequence": 1,
+              "to": "manifest_digest"
+            }
+          ],
+          "match": "NONE",
+          "on_delete": "RESTRICT",
+          "on_update": "NO ACTION",
+          "table": "manifest_values"
+        },
+        {
+          "columns": [
+            {
+              "from": "source_artifact_id",
+              "sequence": 0,
+              "to": "artifact_id"
+            }
+          ],
+          "match": "NONE",
+          "on_delete": "RESTRICT",
+          "on_update": "NO ACTION",
+          "table": "artifacts"
+        }
+      ],
+      "indexes": [
+        {
+          "name": "sqlite_autoindex_artifact_dependencies_1",
+          "origin": "pk",
+          "partial": 0,
+          "unique": 1,
+          "xinfo": [
+            {
+              "cid": 0,
+              "coll": "BINARY",
+              "desc": 0,
+              "key": 1,
+              "name": "dependent_artifact_id",
+              "seqno": 0
+            },
+            {
+              "cid": 1,
+              "coll": "BINARY",
+              "desc": 0,
+              "key": 1,
+              "name": "source_artifact_id",
+              "seqno": 1
+            },
+            {
+              "cid": 5,
+              "coll": "BINARY",
+              "desc": 0,
+              "key": 1,
+              "name": "input_path",
+              "seqno": 2
+            },
+            {
+              "cid": 6,
+              "coll": "BINARY",
+              "desc": 0,
+              "key": 1,
+              "name": "binding_name",
+              "seqno": 3
+            },
+            {
+              "cid": -1,
+              "coll": "BINARY",
+              "desc": 0,
+              "key": 0,
+              "name": null,
+              "seqno": 4
+            }
+          ]
+        }
+      ]
+    },
+    "artifacts": {
+      "columns": [
+        {
+          "cid": 0,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "artifact_id",
+          "notnull": 0,
+          "pk": 1,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 1,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "origin",
+          "notnull": 1,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 2,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "run_id",
+          "notnull": 0,
+          "pk": 0,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 3,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "context",
+          "notnull": 1,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 4,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "workflow_name",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 5,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "step_name",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 6,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "output_name",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 7,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "address",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 8,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "job_id",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 9,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "artifact_set_id",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 10,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "parameter_id",
+          "notnull": 0,
+          "pk": 0,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 11,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "path",
+          "notnull": 1,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 12,
+          "dflt_value": "0",
+          "hidden": 0,
+          "name": "is_selected_output",
+          "notnull": 1,
+          "pk": 0,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 13,
+          "dflt_value": "0",
+          "hidden": 0,
+          "name": "is_published",
+          "notnull": 1,
+          "pk": 0,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 14,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "published_path",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 15,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "staging_path",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 16,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "content_digest",
+          "notnull": 1,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 17,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "output_hash",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 18,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "file_size",
+          "notnull": 1,
+          "pk": 0,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 19,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "extension",
+          "notnull": 1,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 20,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "subject_id",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 21,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "session_id",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 22,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "task_name",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 23,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "run_label",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 24,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "datatype",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 25,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "suffix",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 26,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "source_metadata_json",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 27,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "callable_ref",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 28,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "software_ref",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 29,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "source_scope",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 30,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "source_name",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 31,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "source_entity_id",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 32,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "source_st_dev",
+          "notnull": 0,
+          "pk": 0,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 33,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "source_st_ino",
+          "notnull": 0,
+          "pk": 0,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 34,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "source_st_size",
+          "notnull": 0,
+          "pk": 0,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 35,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "source_st_mtime_ns",
+          "notnull": 0,
+          "pk": 0,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 36,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "source_st_ctime_ns",
+          "notnull": 0,
+          "pk": 0,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 37,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "request_bundle_digest",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 38,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "created_at",
+          "notnull": 1,
+          "pk": 0,
+          "type": "TEXT"
+        }
+      ],
+      "foreign_keys": [
+        {
+          "columns": [
+            {
+              "from": "context",
+              "sequence": 0,
+              "to": "context"
+            }
+          ],
+          "match": "NONE",
+          "on_delete": "CASCADE",
+          "on_update": "NO ACTION",
+          "table": "contexts"
+        },
+        {
+          "columns": [
+            {
+              "from": "parameter_id",
+              "sequence": 0,
+              "to": "parameter_id"
+            }
+          ],
+          "match": "NONE",
+          "on_delete": "NO ACTION",
+          "on_update": "NO ACTION",
+          "table": "parameters"
+        },
+        {
+          "columns": [
+            {
+              "from": "request_bundle_digest",
+              "sequence": 0,
+              "to": "request_bundle_digest"
+            }
+          ],
+          "match": "NONE",
+          "on_delete": "RESTRICT",
+          "on_update": "NO ACTION",
+          "table": "request_bundle_projections"
+        },
+        {
+          "columns": [
+            {
+              "from": "run_id",
+              "sequence": 0,
+              "to": "run_id"
+            }
+          ],
+          "match": "NONE",
+          "on_delete": "CASCADE",
+          "on_update": "NO ACTION",
+          "table": "workflow_runs"
+        }
+      ],
+      "indexes": [
+        {
+          "name": "artifacts_path_idx",
+          "origin": "c",
+          "partial": 0,
+          "unique": 0,
+          "xinfo": [
+            {
+              "cid": 3,
+              "coll": "BINARY",
+              "desc": 0,
+              "key": 1,
+              "name": "context",
+              "seqno": 0
+            },
+            {
+              "cid": 11,
+              "coll": "BINARY",
+              "desc": 0,
+              "key": 1,
+              "name": "path",
+              "seqno": 1
+            },
+            {
+              "cid": -1,
+              "coll": "BINARY",
+              "desc": 0,
+              "key": 0,
+              "name": null,
+              "seqno": 2
+            }
+          ]
+        },
+        {
+          "name": "artifacts_reuse_lookup_idx",
+          "origin": "c",
+          "partial": 1,
+          "unique": 0,
+          "xinfo": [
+            {
+              "cid": 3,
+              "coll": "BINARY",
+              "desc": 0,
+              "key": 1,
+              "name": "context",
+              "seqno": 0
+            },
+            {
+              "cid": 5,
+              "coll": "BINARY",
+              "desc": 0,
+              "key": 1,
+              "name": "step_name",
+              "seqno": 1
+            },
+            {
+              "cid": 7,
+              "coll": "BINARY",
+              "desc": 0,
+              "key": 1,
+              "name": "address",
+              "seqno": 2
+            },
+            {
+              "cid": 37,
+              "coll": "BINARY",
+              "desc": 0,
+              "key": 1,
+              "name": "request_bundle_digest",
+              "seqno": 3
+            },
+            {
+              "cid": 2,
+              "coll": "BINARY",
+              "desc": 0,
+              "key": 1,
+              "name": "run_id",
+              "seqno": 4
+            },
+            {
+              "cid": -1,
+              "coll": "BINARY",
+              "desc": 0,
+              "key": 0,
+              "name": null,
+              "seqno": 5
+            }
+          ]
+        },
+        {
+          "name": "artifacts_selected_lookup_idx",
+          "origin": "c",
+          "partial": 1,
+          "unique": 0,
+          "xinfo": [
+            {
+              "cid": 3,
+              "coll": "BINARY",
+              "desc": 0,
+              "key": 1,
+              "name": "context",
+              "seqno": 0
+            },
+            {
+              "cid": 4,
+              "coll": "BINARY",
+              "desc": 0,
+              "key": 1,
+              "name": "workflow_name",
+              "seqno": 1
+            },
+            {
+              "cid": 5,
+              "coll": "BINARY",
+              "desc": 0,
+              "key": 1,
+              "name": "step_name",
+              "seqno": 2
+            },
+            {
+              "cid": 6,
+              "coll": "BINARY",
+              "desc": 0,
+              "key": 1,
+              "name": "output_name",
+              "seqno": 3
+            },
+            {
+              "cid": 7,
+              "coll": "BINARY",
+              "desc": 0,
+              "key": 1,
+              "name": "address",
+              "seqno": 4
+            },
+            {
+              "cid": -1,
+              "coll": "BINARY",
+              "desc": 0,
+              "key": 0,
+              "name": null,
+              "seqno": 5
+            }
+          ]
+        },
+        {
+          "name": "artifacts_source_entity_coordinate_uq",
+          "origin": "c",
+          "partial": 1,
+          "unique": 1,
+          "xinfo": [
+            {
+              "cid": 3,
+              "coll": "BINARY",
+              "desc": 0,
+              "key": 1,
+              "name": "context",
+              "seqno": 0
+            },
+            {
+              "cid": 30,
+              "coll": "BINARY",
+              "desc": 0,
+              "key": 1,
+              "name": "source_name",
+              "seqno": 1
+            },
+            {
+              "cid": 31,
+              "coll": "BINARY",
+              "desc": 0,
+              "key": 1,
+              "name": "source_entity_id",
+              "seqno": 2
+            },
+            {
+              "cid": -1,
+              "coll": "BINARY",
+              "desc": 0,
+              "key": 0,
+              "name": null,
+              "seqno": 3
+            }
+          ]
+        },
+        {
+          "name": "artifacts_source_global_coordinate_uq",
+          "origin": "c",
+          "partial": 1,
+          "unique": 1,
+          "xinfo": [
+            {
+              "cid": 3,
+              "coll": "BINARY",
+              "desc": 0,
+              "key": 1,
+              "name": "context",
+              "seqno": 0
+            },
+            {
+              "cid": 30,
+              "coll": "BINARY",
+              "desc": 0,
+              "key": 1,
+              "name": "source_name",
+              "seqno": 1
+            },
+            {
+              "cid": -1,
+              "coll": "BINARY",
+              "desc": 0,
+              "key": 0,
+              "name": null,
+              "seqno": 2
+            }
+          ]
+        },
+        {
+          "name": "artifacts_workflow_output_uq",
+          "origin": "c",
+          "partial": 1,
+          "unique": 1,
+          "xinfo": [
+            {
+              "cid": 2,
+              "coll": "BINARY",
+              "desc": 0,
+              "key": 1,
+              "name": "run_id",
+              "seqno": 0
+            },
+            {
+              "cid": 5,
+              "coll": "BINARY",
+              "desc": 0,
+              "key": 1,
+              "name": "step_name",
+              "seqno": 1
+            },
+            {
+              "cid": 6,
+              "coll": "BINARY",
+              "desc": 0,
+              "key": 1,
+              "name": "output_name",
+              "seqno": 2
+            },
+            {
+              "cid": 7,
+              "coll": "BINARY",
+              "desc": 0,
+              "key": 1,
+              "name": "address",
+              "seqno": 3
+            },
+            {
+              "cid": -1,
+              "coll": "BINARY",
+              "desc": 0,
+              "key": 0,
+              "name": null,
+              "seqno": 4
+            }
+          ]
+        }
+      ]
+    },
+    "contexts": {
+      "columns": [
+        {
+          "cid": 0,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "context",
+          "notnull": 0,
+          "pk": 1,
+          "type": "TEXT"
+        },
+        {
+          "cid": 1,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "runtime_path",
+          "notnull": 1,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 2,
+          "dflt_value": "1",
+          "hidden": 0,
+          "name": "storage_layout_version",
+          "notnull": 1,
+          "pk": 0,
+          "type": "INTEGER"
+        }
+      ],
+      "foreign_keys": [],
+      "indexes": [
+        {
+          "name": "sqlite_autoindex_contexts_1",
+          "origin": "pk",
+          "partial": 0,
+          "unique": 1,
+          "xinfo": [
+            {
+              "cid": 0,
+              "coll": "BINARY",
+              "desc": 0,
+              "key": 1,
+              "name": "context",
+              "seqno": 0
+            },
+            {
+              "cid": -1,
+              "coll": "BINARY",
+              "desc": 0,
+              "key": 0,
+              "name": null,
+              "seqno": 1
+            }
+          ]
+        }
+      ]
+    },
+    "manifest_declarations": {
+      "columns": [
+        {
+          "cid": 0,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "context",
+          "notnull": 1,
+          "pk": 1,
+          "type": "TEXT"
+        },
+        {
+          "cid": 1,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "manifest_name",
+          "notnull": 1,
+          "pk": 2,
+          "type": "TEXT"
+        },
+        {
+          "cid": 2,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "declared_path",
+          "notnull": 1,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 3,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "last_validated_manifest_value_schema",
+          "notnull": 1,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 4,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "last_validated_manifest_digest",
+          "notnull": 1,
+          "pk": 0,
+          "type": "TEXT"
+        }
+      ],
+      "foreign_keys": [
+        {
+          "columns": [
+            {
+              "from": "context",
+              "sequence": 0,
+              "to": "context"
+            }
+          ],
+          "match": "NONE",
+          "on_delete": "CASCADE",
+          "on_update": "NO ACTION",
+          "table": "contexts"
+        },
+        {
+          "columns": [
+            {
+              "from": "last_validated_manifest_value_schema",
+              "sequence": 0,
+              "to": "value_schema"
+            },
+            {
+              "from": "last_validated_manifest_digest",
+              "sequence": 1,
+              "to": "manifest_digest"
+            }
+          ],
+          "match": "NONE",
+          "on_delete": "RESTRICT",
+          "on_update": "NO ACTION",
+          "table": "manifest_values"
+        }
+      ],
+      "indexes": [
+        {
+          "name": "sqlite_autoindex_manifest_declarations_1",
+          "origin": "pk",
+          "partial": 0,
+          "unique": 1,
+          "xinfo": [
+            {
+              "cid": 0,
+              "coll": "BINARY",
+              "desc": 0,
+              "key": 1,
+              "name": "context",
+              "seqno": 0
+            },
+            {
+              "cid": 1,
+              "coll": "BINARY",
+              "desc": 0,
+              "key": 1,
+              "name": "manifest_name",
+              "seqno": 1
+            },
+            {
+              "cid": -1,
+              "coll": "BINARY",
+              "desc": 0,
+              "key": 0,
+              "name": null,
+              "seqno": 2
+            }
+          ]
+        }
+      ]
+    },
+    "manifest_values": {
+      "columns": [
+        {
+          "cid": 0,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "value_schema",
+          "notnull": 1,
+          "pk": 1,
+          "type": "TEXT"
+        },
+        {
+          "cid": 1,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "manifest_digest",
+          "notnull": 1,
+          "pk": 2,
+          "type": "TEXT"
+        },
+        {
+          "cid": 2,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "canonical_body",
+          "notnull": 1,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 3,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "entity_count",
+          "notnull": 1,
+          "pk": 0,
+          "type": "INTEGER"
+        }
+      ],
+      "foreign_keys": [],
+      "indexes": [
+        {
+          "name": "sqlite_autoindex_manifest_values_1",
+          "origin": "pk",
+          "partial": 0,
+          "unique": 1,
+          "xinfo": [
+            {
+              "cid": 0,
+              "coll": "BINARY",
+              "desc": 0,
+              "key": 1,
+              "name": "value_schema",
+              "seqno": 0
+            },
+            {
+              "cid": 1,
+              "coll": "BINARY",
+              "desc": 0,
+              "key": 1,
+              "name": "manifest_digest",
+              "seqno": 1
+            },
+            {
+              "cid": -1,
+              "coll": "BINARY",
+              "desc": 0,
+              "key": 0,
+              "name": null,
+              "seqno": 2
+            }
+          ]
+        }
+      ]
+    },
+    "parameters": {
+      "columns": [
+        {
+          "cid": 0,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "parameter_id",
+          "notnull": 0,
+          "pk": 1,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 1,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "hash_version",
+          "notnull": 1,
+          "pk": 0,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 2,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "parameter_hash",
+          "notnull": 1,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 3,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "parameter_digest",
+          "notnull": 1,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 4,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "step_name",
+          "notnull": 1,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 5,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "parameters_json",
+          "notnull": 1,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 6,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "created_at",
+          "notnull": 1,
+          "pk": 0,
+          "type": "TEXT"
+        }
+      ],
+      "foreign_keys": [],
+      "indexes": [
+        {
+          "name": "sqlite_autoindex_parameters_1",
+          "origin": "u",
+          "partial": 0,
+          "unique": 1,
+          "xinfo": [
+            {
+              "cid": 1,
+              "coll": "BINARY",
+              "desc": 0,
+              "key": 1,
+              "name": "hash_version",
+              "seqno": 0
+            },
+            {
+              "cid": 4,
+              "coll": "BINARY",
+              "desc": 0,
+              "key": 1,
+              "name": "step_name",
+              "seqno": 1
+            },
+            {
+              "cid": 2,
+              "coll": "BINARY",
+              "desc": 0,
+              "key": 1,
+              "name": "parameter_hash",
+              "seqno": 2
+            },
+            {
+              "cid": -1,
+              "coll": "BINARY",
+              "desc": 0,
+              "key": 0,
+              "name": null,
+              "seqno": 3
+            }
+          ]
+        }
+      ]
+    },
+    "published_outputs": {
+      "columns": [
+        {
+          "cid": 0,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "context",
+          "notnull": 1,
+          "pk": 1,
+          "type": "TEXT"
+        },
+        {
+          "cid": 1,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "workflow_name",
+          "notnull": 1,
+          "pk": 2,
+          "type": "TEXT"
+        },
+        {
+          "cid": 2,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "step_name",
+          "notnull": 1,
+          "pk": 3,
+          "type": "TEXT"
+        },
+        {
+          "cid": 3,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "output_name",
+          "notnull": 1,
+          "pk": 4,
+          "type": "TEXT"
+        },
+        {
+          "cid": 4,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "address",
+          "notnull": 1,
+          "pk": 5,
+          "type": "TEXT"
+        },
+        {
+          "cid": 5,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "path",
+          "notnull": 1,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 6,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "output_digest",
+          "notnull": 1,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 7,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "output_hash",
+          "notnull": 1,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 8,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "artifact_id",
+          "notnull": 1,
+          "pk": 0,
+          "type": "INTEGER"
+        }
+      ],
+      "foreign_keys": [
+        {
+          "columns": [
+            {
+              "from": "artifact_id",
+              "sequence": 0,
+              "to": "artifact_id"
+            }
+          ],
+          "match": "NONE",
+          "on_delete": "RESTRICT",
+          "on_update": "NO ACTION",
+          "table": "artifacts"
+        },
+        {
+          "columns": [
+            {
+              "from": "context",
+              "sequence": 0,
+              "to": "context"
+            }
+          ],
+          "match": "NONE",
+          "on_delete": "CASCADE",
+          "on_update": "NO ACTION",
+          "table": "contexts"
+        }
+      ],
+      "indexes": [
+        {
+          "name": "published_outputs_artifact_id_idx",
+          "origin": "c",
+          "partial": 0,
+          "unique": 0,
+          "xinfo": [
+            {
+              "cid": 8,
+              "coll": "BINARY",
+              "desc": 0,
+              "key": 1,
+              "name": "artifact_id",
+              "seqno": 0
+            },
+            {
+              "cid": -1,
+              "coll": "BINARY",
+              "desc": 0,
+              "key": 0,
+              "name": null,
+              "seqno": 1
+            }
+          ]
+        },
+        {
+          "name": "sqlite_autoindex_published_outputs_1",
+          "origin": "pk",
+          "partial": 0,
+          "unique": 1,
+          "xinfo": [
+            {
+              "cid": 0,
+              "coll": "BINARY",
+              "desc": 0,
+              "key": 1,
+              "name": "context",
+              "seqno": 0
+            },
+            {
+              "cid": 1,
+              "coll": "BINARY",
+              "desc": 0,
+              "key": 1,
+              "name": "workflow_name",
+              "seqno": 1
+            },
+            {
+              "cid": 2,
+              "coll": "BINARY",
+              "desc": 0,
+              "key": 1,
+              "name": "step_name",
+              "seqno": 2
+            },
+            {
+              "cid": 3,
+              "coll": "BINARY",
+              "desc": 0,
+              "key": 1,
+              "name": "output_name",
+              "seqno": 3
+            },
+            {
+              "cid": 4,
+              "coll": "BINARY",
+              "desc": 0,
+              "key": 1,
+              "name": "address",
+              "seqno": 4
+            },
+            {
+              "cid": -1,
+              "coll": "BINARY",
+              "desc": 0,
+              "key": 0,
+              "name": null,
+              "seqno": 5
+            }
+          ]
+        }
+      ]
+    },
+    "request_bundle_projections": {
+      "columns": [
+        {
+          "cid": 0,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "request_bundle_digest",
+          "notnull": 0,
+          "pk": 1,
+          "type": "TEXT"
+        },
+        {
+          "cid": 1,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "projection_json",
+          "notnull": 1,
+          "pk": 0,
+          "type": "TEXT"
+        }
+      ],
+      "foreign_keys": [],
+      "indexes": [
+        {
+          "name": "sqlite_autoindex_request_bundle_projections_1",
+          "origin": "pk",
+          "partial": 0,
+          "unique": 1,
+          "xinfo": [
+            {
+              "cid": 0,
+              "coll": "BINARY",
+              "desc": 0,
+              "key": 1,
+              "name": "request_bundle_digest",
+              "seqno": 0
+            },
+            {
+              "cid": -1,
+              "coll": "BINARY",
+              "desc": 0,
+              "key": 0,
+              "name": null,
+              "seqno": 1
+            }
+          ]
+        }
+      ]
+    },
+    "run_execution_population": {
+      "columns": [
+        {
+          "cid": 0,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "run_id",
+          "notnull": 0,
+          "pk": 1,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 1,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "manifest_name",
+          "notnull": 1,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 2,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "manifest_value_schema",
+          "notnull": 1,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 3,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "manifest_digest",
+          "notnull": 1,
+          "pk": 0,
+          "type": "TEXT"
+        }
+      ],
+      "foreign_keys": [
+        {
+          "columns": [
+            {
+              "from": "manifest_value_schema",
+              "sequence": 0,
+              "to": "value_schema"
+            },
+            {
+              "from": "manifest_digest",
+              "sequence": 1,
+              "to": "manifest_digest"
+            }
+          ],
+          "match": "NONE",
+          "on_delete": "RESTRICT",
+          "on_update": "NO ACTION",
+          "table": "manifest_values"
+        },
+        {
+          "columns": [
+            {
+              "from": "run_id",
+              "sequence": 0,
+              "to": "run_id"
+            }
+          ],
+          "match": "NONE",
+          "on_delete": "CASCADE",
+          "on_update": "NO ACTION",
+          "table": "workflow_runs"
+        }
+      ],
+      "indexes": []
+    },
+    "run_manifest_bindings": {
+      "columns": [
+        {
+          "cid": 0,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "run_id",
+          "notnull": 1,
+          "pk": 1,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 1,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "step_name",
+          "notnull": 1,
+          "pk": 2,
+          "type": "TEXT"
+        },
+        {
+          "cid": 2,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "manifest_usage_role",
+          "notnull": 1,
+          "pk": 3,
+          "type": "TEXT"
+        },
+        {
+          "cid": 3,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "manifest_name",
+          "notnull": 1,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 4,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "manifest_value_schema",
+          "notnull": 1,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 5,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "manifest_digest",
+          "notnull": 1,
+          "pk": 0,
+          "type": "TEXT"
+        }
+      ],
+      "foreign_keys": [
+        {
+          "columns": [
+            {
+              "from": "manifest_value_schema",
+              "sequence": 0,
+              "to": "value_schema"
+            },
+            {
+              "from": "manifest_digest",
+              "sequence": 1,
+              "to": "manifest_digest"
+            }
+          ],
+          "match": "NONE",
+          "on_delete": "RESTRICT",
+          "on_update": "NO ACTION",
+          "table": "manifest_values"
+        },
+        {
+          "columns": [
+            {
+              "from": "run_id",
+              "sequence": 0,
+              "to": "run_id"
+            }
+          ],
+          "match": "NONE",
+          "on_delete": "CASCADE",
+          "on_update": "NO ACTION",
+          "table": "workflow_runs"
+        }
+      ],
+      "indexes": [
+        {
+          "name": "sqlite_autoindex_run_manifest_bindings_1",
+          "origin": "pk",
+          "partial": 0,
+          "unique": 1,
+          "xinfo": [
+            {
+              "cid": 0,
+              "coll": "BINARY",
+              "desc": 0,
+              "key": 1,
+              "name": "run_id",
+              "seqno": 0
+            },
+            {
+              "cid": 1,
+              "coll": "BINARY",
+              "desc": 0,
+              "key": 1,
+              "name": "step_name",
+              "seqno": 1
+            },
+            {
+              "cid": 2,
+              "coll": "BINARY",
+              "desc": 0,
+              "key": 1,
+              "name": "manifest_usage_role",
+              "seqno": 2
+            },
+            {
+              "cid": -1,
+              "coll": "BINARY",
+              "desc": 0,
+              "key": 0,
+              "name": null,
+              "seqno": 3
+            }
+          ]
+        }
+      ]
+    },
+    "workflow_runs": {
+      "columns": [
+        {
+          "cid": 0,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "run_id",
+          "notnull": 0,
+          "pk": 1,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 1,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "context",
+          "notnull": 1,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 2,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "workflow_name",
+          "notnull": 1,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 3,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "selected_step_name",
+          "notnull": 1,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 4,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "selected_output_name",
+          "notnull": 1,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 5,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "run_workspace",
+          "notnull": 1,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 6,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "run_plan_path",
+          "notnull": 1,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 7,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "run_plan_digest",
+          "notnull": 1,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 8,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "base_workflow_name",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 9,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "resolution_summary_json",
+          "notnull": 1,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 10,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "environment_observation_json",
+          "notnull": 1,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 11,
+          "dflt_value": "1",
+          "hidden": 0,
+          "name": "is_current",
+          "notnull": 1,
+          "pk": 0,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 12,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "created_at",
+          "notnull": 1,
+          "pk": 0,
+          "type": "TEXT"
+        }
+      ],
+      "foreign_keys": [
+        {
+          "columns": [
+            {
+              "from": "context",
+              "sequence": 0,
+              "to": "context"
+            }
+          ],
+          "match": "NONE",
+          "on_delete": "CASCADE",
+          "on_update": "NO ACTION",
+          "table": "contexts"
+        }
+      ],
+      "indexes": [
+        {
+          "name": "workflow_runs_current_scope_uq",
+          "origin": "c",
+          "partial": 1,
+          "unique": 1,
+          "xinfo": [
+            {
+              "cid": 1,
+              "coll": "BINARY",
+              "desc": 0,
+              "key": 1,
+              "name": "context",
+              "seqno": 0
+            },
+            {
+              "cid": 2,
+              "coll": "BINARY",
+              "desc": 0,
+              "key": 1,
+              "name": "workflow_name",
+              "seqno": 1
+            },
+            {
+              "cid": 3,
+              "coll": "BINARY",
+              "desc": 0,
+              "key": 1,
+              "name": "selected_step_name",
+              "seqno": 2
+            },
+            {
+              "cid": 4,
+              "coll": "BINARY",
+              "desc": 0,
+              "key": 1,
+              "name": "selected_output_name",
+              "seqno": 3
+            },
+            {
+              "cid": -1,
+              "coll": "BINARY",
+              "desc": 0,
+              "key": 0,
+              "name": null,
+              "seqno": 4
+            }
+          ]
+        }
+      ]
+    }
+  },
+  "user_version": 18
+}

@@ -1,0 +1,20 @@
+step_name: fixture_analysis
+step_contract_version: "1"
+pattern_kind: pattern_a
+execution_role: analysis
+address_scope: cohort
+callable: registry_v18_fixture_runtime:fixture_analysis_file
+manifest_binding:
+  role: analysis_population
+  manifest: cohort
+inputs:
+  left_values:
+    artifact: fixture_transform.left
+    dependency_role: analysis_input
+  right_values:
+    artifact: fixture_transform.right
+    dependency_role: analysis_input
+outputs:
+  summary:
+    extension: .json
+    address_scope: cohort

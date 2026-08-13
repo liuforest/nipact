@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
+import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -28,6 +30,70 @@ class ColorsRegistry:
     registry_path: Path
     context: str
     root_artifact_id: int
+
+
+@dataclass(frozen=True)
+class RegistryV18Fixture:
+    project_dir: Path
+    runtime_dir: Path
+    registry_path: Path
+    context: str
+    selected_artifact_id: int
+
+
+@pytest.fixture
+def registry_v18_fixture(tmp_path: Path) -> RegistryV18Fixture:
+    """Install the static V18 compatibility fixture without production creators."""
+    fixture_root = Path(__file__).parent / "fixtures/registry_v18"
+    project_dir = tmp_path / "project"
+    runtime_dir = tmp_path / "runtime"
+    shutil.copytree(fixture_root / "project", project_dir)
+    shutil.copytree(fixture_root / "runtime", runtime_dir)
+    registry_path = runtime_dir / REGISTRY_DB_PATH
+    registry_path.parent.mkdir(parents=True)
+
+    with sqlite3.connect(registry_path) as connection:
+        connection.executescript(
+            (fixture_root / "populated-registry.sql").read_text(encoding="utf-8")
+        )
+
+    source_path = runtime_dir / "data/source/entity_001.txt"
+    source_stat = source_path.stat()
+    with sqlite3.connect(registry_path) as connection:
+        runtime_update = connection.execute(
+            "UPDATE contexts SET runtime_path = ? WHERE context = ?",
+            (str(runtime_dir.resolve()), "v18_fixture"),
+        )
+        source_update = connection.execute(
+            """
+            UPDATE artifacts
+            SET source_st_dev = ?, source_st_ino = ?, source_st_size = ?,
+                source_st_mtime_ns = ?, source_st_ctime_ns = ?
+            WHERE context = ?
+              AND origin = 'source'
+              AND source_scope = 'entity'
+              AND source_name = 'source_value'
+              AND source_entity_id = 'entity_001'
+            """,
+            (
+                source_stat.st_dev,
+                source_stat.st_ino,
+                source_stat.st_size,
+                source_stat.st_mtime_ns,
+                source_stat.st_ctime_ns,
+                "v18_fixture",
+            ),
+        )
+        assert runtime_update.rowcount == 1
+        assert source_update.rowcount == 1
+
+    return RegistryV18Fixture(
+        project_dir=project_dir,
+        runtime_dir=runtime_dir,
+        registry_path=registry_path,
+        context="v18_fixture",
+        selected_artifact_id=5,
+    )
 
 
 def _run_main_from(cwd: Path, argv: list[str]) -> int:

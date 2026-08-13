@@ -1,0 +1,19 @@
+step_name: fixture_transform
+step_contract_version: "1"
+pattern_kind: pattern_a
+execution_role: transform
+address_scope: entity
+callable: registry_v18_fixture_runtime:fixture_transform_file
+inputs:
+  source_value:
+    artifact: fixture_source.source_value
+    dependency_role: source_input
+params:
+  variant: base
+outputs:
+  left:
+    extension: .json
+    address_scope: entity
+  right:
+    extension: .json
+    address_scope: entity

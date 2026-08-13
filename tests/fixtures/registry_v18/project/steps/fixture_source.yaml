@@ -1,0 +1,12 @@
+step_name: fixture_source
+step_contract_version: "1"
+pattern_kind: pattern_a
+execution_role: source_import
+address_scope: entity
+callable: registry_v18_fixture_runtime:fixture_source_file
+source_inputs:
+  - source_value
+outputs:
+  source_value:
+    extension: .json
+    address_scope: entity

@@ -992,7 +992,7 @@ def test_validate_rejects_missing_upstream_request_projection(
     _assert_validate_fails(project_dir, capsys, "missing upstream projection")
 
 
-def test_registry_v18_projection_observation_and_membership_constraints(
+def test_registry_projection_observation_and_membership_constraints(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
@@ -1016,77 +1016,6 @@ def test_registry_v18_projection_observation_and_membership_constraints(
         manifest_paths={},
         observations=(observation,),
     )
-    with sqlite3.connect(registry_path) as conn:
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 18
-        artifact_columns = {
-            row[1]: row for row in conn.execute("PRAGMA table_info(artifacts)")
-        }
-        run_columns = {
-            row[1]: row for row in conn.execute("PRAGMA table_info(workflow_runs)")
-        }
-        membership_columns = {
-            row[1]: row for row in conn.execute("PRAGMA table_info(published_outputs)")
-        }
-        membership_foreign_keys = conn.execute(
-            "PRAGMA foreign_key_list(published_outputs)"
-        ).fetchall()
-        membership_indexes = {
-            row[1]: row for row in conn.execute("PRAGMA index_list(published_outputs)")
-        }
-        artifact_sql = conn.execute(
-            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'artifacts'"
-        ).fetchone()[0]
-        projection_columns = {
-            row[1]: row
-            for row in conn.execute("PRAGMA table_info(request_bundle_projections)")
-        }
-        artifact_foreign_keys = conn.execute(
-            "PRAGMA foreign_key_list(artifacts)"
-        ).fetchall()
-        dependency_columns = {
-            row[1]: row
-            for row in conn.execute("PRAGMA table_info(artifact_dependencies)")
-        }
-        dependency_sql = conn.execute(
-            """
-            SELECT sql
-            FROM sqlite_master
-            WHERE type = 'table' AND name = 'artifact_dependencies'
-            """
-        ).fetchone()[0]
-        manifest_value_count = conn.execute(
-            "SELECT COUNT(*) FROM manifest_values"
-        ).fetchone()[0]
-        manifest_declaration_count = conn.execute(
-            "SELECT COUNT(*) FROM manifest_declarations"
-        ).fetchone()[0]
-
-    assert "request_bundle_digest" in artifact_columns
-    assert "identity_contract_version" not in artifact_columns
-    assert "request_bundle_projection_json" not in artifact_columns
-    assert set(projection_columns) == {"request_bundle_digest", "projection_json"}
-    assert run_columns["resolution_summary_json"][3] == 1
-    assert run_columns["environment_observation_json"][3] == 1
-    assert membership_columns["artifact_id"][3] == 1
-    artifact_fk = next(row for row in membership_foreign_keys if row[3] == "artifact_id")
-    assert artifact_fk[2] == "artifacts"
-    assert artifact_fk[6] == "RESTRICT"
-    assert membership_indexes["published_outputs_artifact_id_idx"][2] == 0
-    assert "origin = 'workflow_output'" in artifact_sql
-    projection_fk = next(
-        row for row in artifact_foreign_keys if row[3] == "request_bundle_digest"
-    )
-    assert projection_fk[2] == "request_bundle_projections"
-    assert projection_fk[6] == "RESTRICT"
-    assert "request_bundle_digest IS NOT NULL" in artifact_sql
-    assert "origin = 'source'" in artifact_sql
-    assert "request_bundle_digest IS NULL" in artifact_sql
-    assert "manifest_value_schema" in dependency_columns
-    assert "manifest_value_schema IS NULL" in dependency_sql
-    assert "manifest_digest IS NULL" in dependency_sql
-    assert manifest_value_count == 2
-    assert manifest_declaration_count == 2
-
     with sqlite3.connect(registry_path) as conn:
         conn.execute("PRAGMA foreign_keys = ON")
         source_artifact_id = conn.execute(

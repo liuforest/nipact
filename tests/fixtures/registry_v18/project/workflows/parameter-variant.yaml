@@ -1,0 +1,6 @@
+workflow_name: parameter-variant
+base_workflow: base
+step_overrides:
+  fixture_transform:
+    params:
+      variant: changed
