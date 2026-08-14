@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from itertools import product
 import math
@@ -22,6 +22,13 @@ type JsonValue = (
     | dict[str, "JsonValue"]
 )
 type Disposition = Literal["included", "excluded"]
+
+
+class _CanonicalJsonSequence(Sequence[Any]):
+    """Internal base for immutable JSON array views."""
+
+    __slots__ = ()
+
 
 _SPECIFICATION_SCHEMA = "nipact/specification-set/v1"
 _LIBRARY_SCHEMA = "nipact/specification-library/v1"
@@ -1014,7 +1021,7 @@ def _typed_key(value: object) -> tuple[Any, ...]:
         return (3, value, is_negative_zero)
     if type(value) is str:
         return (4, value)
-    if type(value) is list:
+    if type(value) is list or isinstance(value, _CanonicalJsonSequence):
         return (5, tuple(_typed_key(item) for item in value))
     if isinstance(value, Mapping):
         if any(type(key) is not str for key in value):

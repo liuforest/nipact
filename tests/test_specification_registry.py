@@ -48,8 +48,9 @@ from nipact.specification_canonical import (
     CanonicalSpecificationMember,
     CanonicalSpecificationSnapshot,
     canonicalize_specification_snapshot,
+    decode_specification_snapshot,
 )
-from nipact.specification_compiler import compile_specification
+from nipact.specification_compiler import ParameterWrite, compile_specification
 from nipact.workflow import load_workflow_project
 
 
@@ -722,6 +723,53 @@ def test_primary_persistence_is_exact_and_changes_only_manifest_value_authority(
             snapshot=third,
         )
     assert _freeze_state(fixture.registry_path) == corrupted
+
+
+def test_nested_json_values_decode_and_round_trip_through_snapshot_registry(
+    registry_v18_fixture: RegistryV18Fixture,
+) -> None:
+    fixture = registry_v18_fixture
+    prepare_v19(fixture, route="fresh")
+    nested_value = {
+        "labels": ["baseline", {"thresholds": [0.1, 0.2]}],
+    }
+    payload = _specification_payload()
+    dimensions = payload["dimensions"]
+    assert isinstance(dimensions, dict)
+    variant = dimensions["variant"]
+    assert isinstance(variant, dict)
+    variant["values"] = [nested_value]
+    payload["exclude"] = []
+    payload["expected_counts"] = {
+        "candidates": 1,
+        "included": 1,
+        "excluded": 0,
+    }
+
+    snapshot = build_snapshot(fixture, payload=payload)
+    decoded = decode_specification_snapshot(snapshot.canonical_bytes)
+    member = decoded.members[0]
+    parameter_writes = tuple(
+        write for write in member.row.writes if isinstance(write, ParameterWrite)
+    )
+
+    assert member.row.decision_coordinates[0].name == "variant"
+    assert member.row.decision_coordinates[0].value == nested_value
+    assert len(parameter_writes) == 1
+    assert parameter_writes[0].value == nested_value
+    assert decoded == snapshot
+    assert insert_or_verify_specification_snapshot(
+        fixture.registry_path,
+        runtime_root=fixture.runtime_dir,
+        snapshot=snapshot,
+    )
+    stored = read_specification_snapshot(
+        fixture.registry_path,
+        context=fixture.context,
+        snapshot_digest=snapshot.snapshot_digest,
+    )
+    assert stored == snapshot
+    assert stored.canonical_bytes == snapshot.canonical_bytes
 
 
 @pytest.mark.parametrize(

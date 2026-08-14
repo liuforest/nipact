@@ -364,7 +364,7 @@ def _add_specification_source_args(parser: argparse.ArgumentParser) -> None:
         type=Path,
         dest="specification_file",
         metavar="PATH",
-        help="Path to an explicit strict specification member file.",
+        help="Path to an explicit strict specification-set file.",
     )
 
 

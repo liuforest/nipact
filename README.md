@@ -51,6 +51,32 @@ Run the Python tests:
 python -m pytest
 ```
 
+## Specification sets
+
+The current source checkout includes specification sets as an optional finite overlay on ordinary workflows. A project can continue to define and run only steps and workflows; specification declarations are loaded only when a `specifications` command selects a registered key or an explicit file.
+
+For a project that registers a specification as `analysis-curve`, preview and freeze use:
+
+```bash
+nipact specifications preview analysis-curve --context analysis
+nipact specifications freeze analysis-curve --context analysis
+```
+
+Run either one member or all included members, then read the snapshot results:
+
+```bash
+nipact specifications run FULL_SNAPSHOT_DIGEST \
+  --member member-000001 --context analysis --cores 1
+# or
+nipact specifications run FULL_SNAPSHOT_DIGEST \
+  --all --context analysis --cores 1
+
+nipact specifications results FULL_SNAPSHOT_DIGEST --context analysis
+```
+
+`preview` compiles declaration files without reading or mutating the registry. `freeze` persists the immutable denominator and returns its full digest. A run checks each frozen member against current workflow declarations before attempt insertion, then delegates one ordinary workflow invocation per selected member; exact upstream and final artifacts remain reuse-eligible. `results` returns JSON arrays for members, attempts, exact results, and historical source basis. It distinguishes the selecting run from the earlier producing run when an artifact is reused; a current publication path is only an optional view of that historical record.
+
+`freeze`, `run`, and `results` require registry V19. Migration from an exact V18 runtime is explicit: `nipact registry migrate --context analysis`. V1 supports finite static members, reconciles the selected source scope before each ordinary member execution, executes members sequentially, requires every declared result role for completeness, and treats a rerun as a new attempt. It provides JSON records, not statistical interpretation, campaign scheduling, or campaign management.
 
 ## Colors Demo via CLI
 

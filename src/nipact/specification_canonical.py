@@ -20,6 +20,7 @@ from .specification_adapter import (
     apply_provisional_member,
 )
 from .specification_compiler import (
+    _CanonicalJsonSequence,
     DecisionCoordinate,
     ExecutionPopulationWrite,
     ManifestBindingWrite,
@@ -82,7 +83,7 @@ class _FrozenDict(Mapping[str, Any]):
         return self
 
 
-class _FrozenList(Sequence[Any]):
+class _FrozenList(_CanonicalJsonSequence):
     __slots__ = ("_values",)
 
     def __init__(self, values: Sequence[Any]) -> None:
