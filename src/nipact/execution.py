@@ -659,54 +659,68 @@ def execute_run_plan(
             status_callback=status_callback,
         )
     with acquire_mutating_runtime_lock(run_plan.forecast.runtime_root):
-        registry_path = run_plan.forecast.runtime_root / REGISTRY_DB_PATH
-        coordinates = tuple(
-            declaration.coordinate for declaration in run_plan.source_declarations
-        )
-        registered = read_registered_source_authorities(
-            registry_path,
-            coordinates=coordinates,
-        )
-        observations = tuple(
-            observe_source_authority(
-                runtime_root=run_plan.forecast.runtime_root,
-                declaration=declaration,
-                registered=(
-                    registered[declaration.coordinate].authority
-                    if declaration.coordinate in registered
-                    else None
-                ),
-            )
-            for declaration in run_plan.source_declarations
-        )
-        relevant_manifests, relevant_manifest_paths = (
-            _relevant_manifest_authority_inputs(
-                loaded=run_plan.loaded_project,
-                plan=run_plan.workflow_plan,
-            )
-        )
-        source_authorities = reconcile_manifest_and_source_authorities(
-            registry_path,
-            context=run_plan.loaded_project.context,
-            manifests=relevant_manifests,
-            manifest_paths=relevant_manifest_paths,
-            observations=observations,
-        )
-        for status in ("new", "changed", "unchanged"):
-            count = sum(observation.status == status for observation in observations)
-            _emit_status(status_callback, f"sources_{status}:{count}")
-        executable = _build_executable_run_plan(
-            loaded=run_plan.loaded_project,
-            plan=run_plan.workflow_plan,
-            address=run_plan.forecast.requested_address,
-            dry_run=False,
-            source_authorities=source_authorities,
-        )
-        return _execute_executable_run_plan(
-            executable,
+        return _execute_run_plan_already_locked(
+            run_plan,
             cores=cores,
             status_callback=status_callback,
         )
+
+
+def _execute_run_plan_already_locked(
+    run_plan: StructuralRunPlan,
+    *,
+    cores: int,
+    status_callback: RunStatusCallback | None,
+) -> RunOutcome:
+    """Execute one real structural plan while its caller holds the runtime lock."""
+    registry_path = run_plan.forecast.runtime_root / REGISTRY_DB_PATH
+    coordinates = tuple(
+        declaration.coordinate for declaration in run_plan.source_declarations
+    )
+    registered = read_registered_source_authorities(
+        registry_path,
+        coordinates=coordinates,
+    )
+    observations = tuple(
+        observe_source_authority(
+            runtime_root=run_plan.forecast.runtime_root,
+            declaration=declaration,
+            registered=(
+                registered[declaration.coordinate].authority
+                if declaration.coordinate in registered
+                else None
+            ),
+        )
+        for declaration in run_plan.source_declarations
+    )
+    relevant_manifests, relevant_manifest_paths = (
+        _relevant_manifest_authority_inputs(
+            loaded=run_plan.loaded_project,
+            plan=run_plan.workflow_plan,
+        )
+    )
+    source_authorities = reconcile_manifest_and_source_authorities(
+        registry_path,
+        context=run_plan.loaded_project.context,
+        manifests=relevant_manifests,
+        manifest_paths=relevant_manifest_paths,
+        observations=observations,
+    )
+    for status in ("new", "changed", "unchanged"):
+        count = sum(observation.status == status for observation in observations)
+        _emit_status(status_callback, f"sources_{status}:{count}")
+    executable = _build_executable_run_plan(
+        loaded=run_plan.loaded_project,
+        plan=run_plan.workflow_plan,
+        address=run_plan.forecast.requested_address,
+        dry_run=False,
+        source_authorities=source_authorities,
+    )
+    return _execute_executable_run_plan(
+        executable,
+        cores=cores,
+        status_callback=status_callback,
+    )
 
 
 def _relevant_manifest_authority_inputs(
