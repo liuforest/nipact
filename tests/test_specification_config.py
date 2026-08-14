@@ -9,7 +9,7 @@ from typing import Any, Callable
 import pytest
 import yaml
 
-from conftest import RegistryV18Fixture
+from conftest import RegistryV18Fixture, RegistryV19Fixture
 from nipact.errors import ValidationError
 from nipact.project_context import ResolvedProjectContext, resolve_project_context
 from nipact.specification_config import parse_specification_registrations
@@ -218,7 +218,7 @@ def test_invalid_registration_fails_in_both_ordinary_readers_without_target_acce
 
 
 @pytest.mark.parametrize("sections", [{}, {"specification_libraries": {}, "specifications": {}}])
-def test_absent_and_empty_registrations_are_valid_for_both_ordinary_readers(
+def test_absent_and_empty_registrations_are_valid_for_workflow_reader_on_v18(
     registry_v18_fixture: RegistryV18Fixture,
     sections: dict[str, object],
 ) -> None:
@@ -232,6 +232,19 @@ def test_absent_and_empty_registrations_are_valid_for_both_ordinary_readers(
         project_dir=fixture.project_dir,
         context=fixture.context,
     ).context == fixture.context
+
+
+@pytest.mark.parametrize("sections", [{}, {"specification_libraries": {}, "specifications": {}}])
+def test_absent_and_empty_registrations_are_valid_for_context_reader_on_v19(
+    registry_v19_fixture: RegistryV19Fixture,
+    sections: dict[str, object],
+) -> None:
+    fixture = registry_v19_fixture
+    config_path = fixture.project_dir / "nipact.yaml"
+    config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    config.update(sections)
+    _write_config(fixture.project_dir, config)
+
     assert resolve_project_context(
         project_dir=fixture.project_dir,
         context=fixture.context,

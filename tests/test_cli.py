@@ -4,9 +4,15 @@ from pathlib import Path
 
 import pytest
 
+import nipact.context_index as context_index_module
+import nipact.project_context as project_context_module
+import nipact.registry as registry_module
 from nipact._version import __version__
 from nipact.cli import main
+from nipact.errors import ValidationError
 from nipact.execution import RunOutcome
+from nipact.project_context import ResolvedProjectContext
+from nipact.registry import RegistryMigrationResult
 
 
 def _run_main_from(cwd: Path, argv: list[str]) -> int:
@@ -65,6 +71,177 @@ def test_cli_version_prints_package_version(capsys: pytest.CaptureFixture[str]) 
 
     assert exc_info.value.code == 0
     assert capsys.readouterr().out.strip() == f"nipact {__version__}"
+
+
+def test_registry_migrate_parser_requires_context_and_has_help(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    with pytest.raises(SystemExit) as exc_info:
+        main(["registry", "migrate"])
+    assert exc_info.value.code == 2
+    assert "--context" in capsys.readouterr().err
+
+    with pytest.raises(SystemExit) as exc_info:
+        main(["registry", "migrate", "--help"])
+    assert exc_info.value.code == 0
+    help_text = " ".join(capsys.readouterr().out.split())
+    assert "migrate an exact schema-18 registry to schema 19" in help_text
+
+
+def _patch_registry_migration_route(
+    *,
+    monkeypatch: pytest.MonkeyPatch,
+    project_dir: Path,
+    runtime_dir: Path,
+    result: RegistryMigrationResult | Exception,
+) -> list[tuple[Path, str]]:
+    resolved = ResolvedProjectContext(
+        project_root=project_dir.resolve(),
+        runtime_root=runtime_dir.resolve(),
+        registry_path=(runtime_dir / "database/registry.db").resolve(),
+        context="fixture",
+    )
+    routed: list[tuple[Path, str]] = []
+
+    def resolve_project_dir(*, project_dir: Path | None, context: str) -> Path:
+        assert project_dir == Path("project")
+        assert context == "fixture"
+        return resolved.project_root
+
+    def resolve_for_migration(*, project_dir: Path, context: str) -> object:
+        routed.append((project_dir, context))
+        return resolved
+
+    def migrate(path: Path, *, context: str, runtime_root: Path) -> object:
+        assert path == resolved.registry_path
+        assert context == resolved.context
+        assert runtime_root == resolved.runtime_root
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+    monkeypatch.setattr(context_index_module, "resolve_project_dir", resolve_project_dir)
+    monkeypatch.setattr(
+        project_context_module,
+        "resolve_project_context_for_migration",
+        resolve_for_migration,
+    )
+    monkeypatch.setattr(registry_module, "migrate_registry_db", migrate)
+    return routed
+
+
+def test_registry_migrate_prints_migrated_result_and_routes_exactly(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    project_dir = tmp_path / "project"
+    runtime_dir = tmp_path / "runtime"
+    registry_path = (runtime_dir / "database/registry.db").resolve()
+    backup_path = registry_path.with_name("registry.v18-before-v19.db")
+    routed = _patch_registry_migration_route(
+        monkeypatch=monkeypatch,
+        project_dir=project_dir,
+        runtime_dir=runtime_dir,
+        result=RegistryMigrationResult(
+            context="fixture",
+            registry_path=registry_path,
+            status="migrated",
+            from_schema=18,
+            to_schema=19,
+            backup_path=backup_path,
+        ),
+    )
+    monkeypatch.chdir(tmp_path)
+
+    assert main(
+        [
+            "registry",
+            "migrate",
+            "--context",
+            "fixture",
+            "--project-dir",
+            "project",
+        ]
+    ) == 0
+
+    assert routed == [(project_dir.resolve(), "fixture")]
+    assert capsys.readouterr().out.splitlines() == [
+        "context=fixture",
+        "registry=runtime/database/registry.db",
+        "status=migrated",
+        "from_schema=18",
+        "to_schema=19",
+        "backup=runtime/database/registry.v18-before-v19.db",
+        "recovery=restore the backup manually before using schema-18 software",
+        "PASS: registry migrate",
+    ]
+
+
+def test_registry_migrate_prints_already_current_without_backup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    project_dir = tmp_path / "project"
+    runtime_dir = tmp_path / "runtime"
+    registry_path = (runtime_dir / "database/registry.db").resolve()
+    _patch_registry_migration_route(
+        monkeypatch=monkeypatch,
+        project_dir=project_dir,
+        runtime_dir=runtime_dir,
+        result=RegistryMigrationResult(
+            context="fixture",
+            registry_path=registry_path,
+            status="already-current",
+        ),
+    )
+    monkeypatch.chdir(tmp_path)
+
+    assert main(
+        [
+            "registry",
+            "migrate",
+            "--context",
+            "fixture",
+            "--project-dir",
+            "project",
+        ]
+    ) == 0
+    assert capsys.readouterr().out.splitlines() == [
+        "context=fixture",
+        "registry=runtime/database/registry.db",
+        "status=already-current",
+        "schema=19",
+        "PASS: registry migrate",
+    ]
+
+
+def test_registry_migrate_failure_has_no_partial_stdout(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _patch_registry_migration_route(
+        monkeypatch=monkeypatch,
+        project_dir=tmp_path / "project",
+        runtime_dir=tmp_path / "runtime",
+        result=ValidationError("migration failed"),
+    )
+
+    assert main(
+        [
+            "registry",
+            "migrate",
+            "--context",
+            "fixture",
+            "--project-dir",
+            "project",
+        ]
+    ) == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == "error: migration failed\n"
 
 
 def test_cli_init_requires_demo_flag() -> None:

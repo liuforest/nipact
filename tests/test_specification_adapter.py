@@ -685,7 +685,9 @@ def test_member_and_direct_workflows_reuse_exact_ordinary_sibling_bundles(
     ) == _selected_sibling_ids(direct_b_plan)
 
     with sqlite3.connect(registry_path) as conn:
-        assert conn.execute("PRAGMA user_version").fetchone() == (18,)
+        assert conn.execute("PRAGMA user_version").fetchone() == (
+            registry_module.REGISTRY_SCHEMA_VERSION,
+        )
         model_artifacts = conn.execute(
             "SELECT COUNT(*) FROM artifacts WHERE origin = 'workflow_output' "
             "AND step_name = 'model'"
