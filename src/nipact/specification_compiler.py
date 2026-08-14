@@ -1010,7 +1010,8 @@ def _typed_key(value: object) -> tuple[Any, ...]:
     if type(value) is float:
         if not math.isfinite(value):
             raise ValidationError("non-finite numbers are not supported")
-        return (3, value)
+        is_negative_zero = value == 0.0 and math.copysign(1.0, value) < 0.0
+        return (3, value, is_negative_zero)
     if type(value) is str:
         return (4, value)
     if type(value) is list:
