@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 import json
 from pathlib import Path
 import sqlite3
-from typing import Any, Iterable, Iterator
+from typing import Any, Callable, Iterable, Iterator
 from urllib.parse import quote
 
 from .artifacts import (
@@ -38,8 +38,23 @@ from .source_authority import (
 )
 
 REGISTRY_DB_PATH = "database/registry.db"
-REGISTRY_SCHEMA_VERSION = 18
+REGISTRY_SCHEMA_VERSION = 19
+REGISTRY_MIGRATION_SOURCE_VERSION = 18
+REGISTRY_V18_BACKUP_FILENAME = "registry.v18-before-v19.db"
+REGISTRY_V18_SCHEMA_SIGNATURE_SHA256 = (
+    "a9f4e68f21602814326580dab4f5efa3d0bf053feb9d5e7eb50436516a9c0069"
+)
 PARAMETER_HASH_VERSION = 1
+
+
+@dataclass(frozen=True)
+class RegistryMigrationResult:
+    context: str
+    registry_path: Path
+    status: str
+    from_schema: int | None = None
+    to_schema: int | None = None
+    backup_path: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -3789,20 +3804,7 @@ def _resolve_published_output_path(
     return resolved
 
 
-def _create_schema(conn: sqlite3.Connection) -> None:
-    version = _schema_version(conn)
-    if version not in (0, REGISTRY_SCHEMA_VERSION):
-        raise ValidationError(
-            "registry.db schema version is incompatible: "
-            f"expected {REGISTRY_SCHEMA_VERSION}, found {version}"
-        )
-    if version == 0 and _has_user_tables(conn):
-        raise ValidationError(
-            "registry.db schema version is incompatible: "
-            f"expected empty or {REGISTRY_SCHEMA_VERSION}, found 0"
-        )
-    conn.executescript(
-        f"""
+_V18_CORE_SCHEMA_SQL = f"""
         CREATE TABLE IF NOT EXISTS contexts (
             context TEXT PRIMARY KEY,
             runtime_path TEXT NOT NULL,
@@ -4099,9 +4101,787 @@ def _create_schema(conn: sqlite3.Connection) -> None:
 
         CREATE INDEX IF NOT EXISTS published_outputs_artifact_id_idx
             ON published_outputs(artifact_id);
+"""
 
-        PRAGMA user_version = {REGISTRY_SCHEMA_VERSION};
+
+_V19_ADDITIVE_SCHEMA_STATEMENTS = (
+    """
+    CREATE TABLE specification_snapshots (
+        snapshot_digest TEXT PRIMARY KEY CHECK(
+            length(snapshot_digest) = 64
+            AND snapshot_digest NOT GLOB '*[^0-9a-f]*'
+        ),
+        context TEXT NOT NULL
+            REFERENCES contexts(context) ON DELETE RESTRICT,
+        canonical_bytes BLOB NOT NULL CHECK(
+            typeof(canonical_bytes) = 'blob'
+            AND length(canonical_bytes) > 0
+        )
+    )
+    """,
+    """
+    CREATE TABLE specification_members (
+        snapshot_digest TEXT NOT NULL
+            REFERENCES specification_snapshots(snapshot_digest) ON DELETE RESTRICT,
+        member_key TEXT NOT NULL CHECK(length(trim(member_key)) > 0),
+        row_digest TEXT NOT NULL CHECK(
+            length(row_digest) = 64
+            AND row_digest NOT GLOB '*[^0-9a-f]*'
+        ),
+        disposition TEXT NOT NULL CHECK(
+            disposition IN ('included', 'excluded')
+        ),
+        exclusion_reason TEXT,
+        PRIMARY KEY (snapshot_digest, member_key),
+        UNIQUE (snapshot_digest, row_digest),
+        CHECK (
+            (disposition = 'included' AND exclusion_reason IS NULL)
+            OR
+            (
+                disposition = 'excluded'
+                AND exclusion_reason IS NOT NULL
+                AND length(trim(exclusion_reason)) > 0
+            )
+        )
+    )
+    """,
+    """
+    CREATE TABLE specification_snapshot_manifest_values (
+        snapshot_digest TEXT NOT NULL
+            REFERENCES specification_snapshots(snapshot_digest) ON DELETE RESTRICT,
+        value_schema TEXT NOT NULL CHECK(length(trim(value_schema)) > 0),
+        manifest_digest TEXT NOT NULL,
+        PRIMARY KEY (snapshot_digest, value_schema, manifest_digest),
+        FOREIGN KEY (value_schema, manifest_digest)
+            REFERENCES manifest_values(value_schema, manifest_digest)
+            ON DELETE RESTRICT
+    )
+    """,
+    """
+    CREATE INDEX specification_snapshot_manifest_values_value_idx
+        ON specification_snapshot_manifest_values (
+            value_schema, manifest_digest, snapshot_digest
+        )
+    """,
+    """
+    CREATE TABLE specification_expected_results (
+        snapshot_digest TEXT NOT NULL,
+        member_key TEXT NOT NULL,
+        role TEXT NOT NULL CHECK(length(trim(role)) > 0),
+        step_name TEXT NOT NULL CHECK(length(trim(step_name)) > 0),
+        output_name TEXT NOT NULL CHECK(length(trim(output_name)) > 0),
+        address TEXT NOT NULL CHECK(length(trim(address)) > 0),
+        PRIMARY KEY (snapshot_digest, member_key, role, address),
+        UNIQUE (
+            snapshot_digest, member_key, step_name, output_name, address
+        ),
+        FOREIGN KEY (snapshot_digest, member_key)
+            REFERENCES specification_members(snapshot_digest, member_key)
+            ON DELETE RESTRICT
+    )
+    """,
+    """
+    CREATE TABLE specification_member_attempts (
+        attempt_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        snapshot_digest TEXT NOT NULL,
+        member_key TEXT NOT NULL,
+        started_at TEXT NOT NULL CHECK(length(trim(started_at)) > 0),
+        finished_at TEXT CHECK(
+            finished_at IS NULL OR length(trim(finished_at)) > 0
+        ),
+        outcome TEXT CHECK(
+            outcome IS NULL OR outcome IN ('failed', 'partial', 'complete')
+        ),
+        selecting_run_id INTEGER UNIQUE
+            REFERENCES workflow_runs(run_id) ON DELETE RESTRICT,
+        failure_stage TEXT CHECK(
+            failure_stage IS NULL
+            OR (
+                length(trim(failure_stage)) > 0
+                AND length(failure_stage) <= 64
+            )
+        ),
+        failure_summary TEXT CHECK(
+            failure_summary IS NULL
+            OR (
+                length(trim(failure_summary)) > 0
+                AND length(failure_summary) <= 4096
+            )
+        ),
+        UNIQUE (attempt_id, snapshot_digest, member_key),
+        FOREIGN KEY (snapshot_digest, member_key)
+            REFERENCES specification_members(snapshot_digest, member_key)
+            ON DELETE RESTRICT,
+        CHECK (
+            (
+                outcome IS NULL
+                AND finished_at IS NULL
+                AND selecting_run_id IS NULL
+                AND failure_stage IS NULL
+                AND failure_summary IS NULL
+            )
+            OR
+            (
+                outcome IN ('partial', 'complete')
+                AND finished_at IS NOT NULL
+                AND selecting_run_id IS NOT NULL
+                AND failure_stage IS NULL
+                AND failure_summary IS NULL
+            )
+            OR
+            (
+                outcome = 'failed'
+                AND finished_at IS NOT NULL
+                AND failure_stage IS NOT NULL
+                AND failure_summary IS NOT NULL
+            )
+        )
+    )
+    """,
+    """
+    CREATE INDEX specification_member_attempts_member_idx
+        ON specification_member_attempts (
+            snapshot_digest, member_key, attempt_id
+        )
+    """,
+    """
+    CREATE TABLE specification_attempt_results (
+        attempt_id INTEGER NOT NULL,
+        snapshot_digest TEXT NOT NULL,
+        member_key TEXT NOT NULL,
+        role TEXT NOT NULL,
+        address TEXT NOT NULL,
+        artifact_id INTEGER NOT NULL
+            REFERENCES artifacts(artifact_id) ON DELETE RESTRICT,
+        PRIMARY KEY (attempt_id, role, address),
+        FOREIGN KEY (attempt_id, snapshot_digest, member_key)
+            REFERENCES specification_member_attempts(
+                attempt_id, snapshot_digest, member_key
+            ) ON DELETE RESTRICT,
+        FOREIGN KEY (snapshot_digest, member_key, role, address)
+            REFERENCES specification_expected_results(
+                snapshot_digest, member_key, role, address
+            ) ON DELETE RESTRICT
+    )
+    """,
+    """
+    CREATE INDEX specification_attempt_results_artifact_idx
+        ON specification_attempt_results (artifact_id, attempt_id)
+    """,
+)
+
+
+def _create_schema(conn: sqlite3.Connection) -> None:
+    version = _schema_version(conn)
+    if version == REGISTRY_SCHEMA_VERSION:
+        _validate_exact_registry_structure(
+            conn,
+            expected_version=REGISTRY_SCHEMA_VERSION,
+        )
+        return
+    if version != 0:
+        _validate_schema_version(conn)
+    if _has_user_tables(conn):
+        raise ValidationError(
+            "registry.db schema version is incompatible: "
+            f"expected empty or {REGISTRY_SCHEMA_VERSION}, found 0"
+        )
+
+    additive_sql = "\n".join(
+        f"{statement.strip()};" for statement in _V19_ADDITIVE_SCHEMA_STATEMENTS
+    )
+    creation_sql = (
+        "BEGIN IMMEDIATE;\n"
+        f"{_V18_CORE_SCHEMA_SQL}\n"
+        f"{additive_sql}\n"
+        f"PRAGMA user_version = {REGISTRY_SCHEMA_VERSION};\n"
+        "COMMIT;"
+    )
+    try:
+        conn.executescript(creation_sql)
+    except Exception:
+        if conn.in_transaction:
+            conn.rollback()
+        raise
+    _validate_exact_registry_structure(
+        conn,
+        expected_version=REGISTRY_SCHEMA_VERSION,
+    )
+
+
+def registry_schema_signature(conn: sqlite3.Connection) -> dict[str, object]:
+    """Return the normalized physical registry schema used by migration checks."""
+    objects = _query_dict_rows(
+        conn,
         """
+        SELECT type, name, tbl_name
+        FROM sqlite_master
+        WHERE name NOT LIKE 'sqlite_%'
+        ORDER BY type, name
+        """,
+    )
+    tables: dict[str, object] = {}
+    table_names = sorted(
+        str(item["name"]) for item in objects if item["type"] == "table"
+    )
+    for table_name in table_names:
+        quoted_table = _quote_sql_identifier(table_name)
+        tables[table_name] = {
+            "columns": _query_dict_rows(
+                conn,
+                f"PRAGMA table_xinfo({quoted_table})",
+            ),
+            "foreign_keys": _foreign_key_signatures(
+                conn,
+                table_name=table_name,
+            ),
+            "indexes": _index_signatures(conn, table_name=table_name),
+        }
+    sql = {
+        str(row["name"]): _normalize_schema_sql(str(row["sql"]))
+        for row in _query_dict_rows(
+            conn,
+            """
+            SELECT name, sql
+            FROM sqlite_master
+            WHERE name NOT LIKE 'sqlite_%'
+              AND type IN ('table', 'index')
+              AND sql IS NOT NULL
+            ORDER BY name
+            """,
+        )
+    }
+    return {
+        "objects": objects,
+        "sql": sql,
+        "tables": tables,
+        "user_version": _schema_version(conn),
+    }
+
+
+def registry_schema_signature_digest(signature: dict[str, object]) -> str:
+    """Return the canonical digest for a normalized registry schema signature."""
+    canonical_bytes = json.dumps(
+        signature,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    ).encode("utf-8")
+    return sha256_digest(canonical_bytes)
+
+
+def migrate_registry_db(
+    path: Path,
+    *,
+    context: str,
+    runtime_root: Path,
+    fault_hook: Callable[[str], None] | None = None,
+) -> RegistryMigrationResult:
+    """Explicitly migrate one exact schema-18 registry to schema 19."""
+    context = validate_path_token(context, label="context")
+    runtime_root = runtime_root.expanduser().resolve()
+    if not runtime_root.is_dir():
+        raise ValidationError("runtime_root must be an existing directory")
+    registry_relative_path = Path(REGISTRY_DB_PATH)
+    database_dir = runtime_root / registry_relative_path.parent
+    if database_dir.is_symlink() or not database_dir.is_dir():
+        raise ValidationError(
+            "registry migration database directory must be a real directory"
+        )
+    resolved_database_dir = database_dir.resolve()
+    if not _path_contains_or_same(runtime_root, resolved_database_dir):
+        raise ValidationError(
+            "registry migration database directory must stay inside runtime_root"
+        )
+    requested_path = path.expanduser()
+    if not requested_path.is_absolute():
+        requested_path = Path.cwd() / requested_path
+    registry_path = requested_path.parent.resolve() / requested_path.name
+    expected_path = resolved_database_dir / registry_relative_path.name
+    if registry_path != expected_path:
+        raise ValidationError("registry migration registry path is incompatible")
+    if registry_path.is_symlink() or not registry_path.is_file():
+        raise ValidationError("registry migration registry path must be a real file")
+
+    version = _read_registry_schema_version(registry_path)
+    if version == REGISTRY_SCHEMA_VERSION:
+        _validate_migration_registry_file(
+            registry_path,
+            expected_version=REGISTRY_SCHEMA_VERSION,
+            context=context,
+            runtime_root=runtime_root,
+        )
+        return RegistryMigrationResult(
+            context=context,
+            registry_path=registry_path,
+            status="already-current",
+        )
+    _require_supported_migration_version(version)
+
+    from .runtime_lock import acquire_mutating_runtime_lock
+
+    with acquire_mutating_runtime_lock(runtime_root):
+        version = _read_registry_schema_version(registry_path)
+        if version == REGISTRY_SCHEMA_VERSION:
+            _validate_migration_registry_file(
+                registry_path,
+                expected_version=REGISTRY_SCHEMA_VERSION,
+                context=context,
+                runtime_root=runtime_root,
+            )
+            return RegistryMigrationResult(
+                context=context,
+                registry_path=registry_path,
+                status="already-current",
+            )
+        _require_supported_migration_version(version)
+        return _migrate_registry_v18_locked(
+            registry_path,
+            context=context,
+            runtime_root=runtime_root,
+            fault_hook=fault_hook,
+        )
+
+
+def _migrate_registry_v18_locked(
+    registry_path: Path,
+    *,
+    context: str,
+    runtime_root: Path,
+    fault_hook: Callable[[str], None] | None,
+) -> RegistryMigrationResult:
+    backup_path = registry_path.with_name(REGISTRY_V18_BACKUP_FILENAME)
+    live_conn = _open_migration_connection(registry_path)
+    backup_validated = False
+    try:
+        _validate_migration_preflight(
+            live_conn,
+            expected_version=REGISTRY_MIGRATION_SOURCE_VERSION,
+            context=context,
+            runtime_root=runtime_root,
+        )
+        if backup_path.exists() or backup_path.is_symlink():
+            raise ValidationError(
+                f"registry migration backup already exists: {backup_path}"
+            )
+        try:
+            _create_registry_migration_backup(live_conn, backup_path)
+        except Exception as exc:
+            if backup_path.exists() or backup_path.is_symlink():
+                _remove_created_backup(backup_path)
+            raise ValidationError(
+                f"registry migration backup creation failed: {exc}"
+            ) from exc
+        try:
+            _validate_migration_registry_file(
+                backup_path,
+                expected_version=REGISTRY_MIGRATION_SOURCE_VERSION,
+                context=context,
+                runtime_root=runtime_root,
+            )
+            backup_validated = True
+        except Exception as exc:
+            if backup_path.exists() or backup_path.is_symlink():
+                _remove_created_backup(backup_path)
+            raise ValidationError(
+                f"registry migration backup validation failed: {exc}"
+            ) from exc
+
+        _invoke_migration_fault(fault_hook, "after_backup")
+        live_conn.execute("BEGIN IMMEDIATE")
+        for position, statement in enumerate(
+            _V19_ADDITIVE_SCHEMA_STATEMENTS,
+            start=1,
+        ):
+            live_conn.execute(statement)
+            _invoke_migration_fault(fault_hook, f"after_ddl_{position:02d}")
+        live_conn.execute(f"PRAGMA user_version = {REGISTRY_SCHEMA_VERSION}")
+        _invoke_migration_fault(fault_hook, "after_user_version")
+        _validate_migration_preflight(
+            live_conn,
+            expected_version=REGISTRY_SCHEMA_VERSION,
+            context=context,
+            runtime_root=runtime_root,
+        )
+        _invoke_migration_fault(fault_hook, "before_commit")
+        live_conn.commit()
+        _invoke_migration_fault(fault_hook, "after_commit")
+    except Exception as exc:
+        if live_conn.in_transaction:
+            live_conn.rollback()
+        live_conn.close()
+        if backup_validated and _is_exact_migration_registry(
+            registry_path,
+            expected_version=REGISTRY_SCHEMA_VERSION,
+            context=context,
+            runtime_root=runtime_root,
+        ):
+            raise ValidationError(
+                "registry migration committed but completion reporting failed; "
+                "inspect the live registry and use the validated backup for "
+                f"manual recovery: {backup_path}"
+            ) from exc
+        if backup_validated:
+            _validate_migration_registry_file(
+                registry_path,
+                expected_version=REGISTRY_MIGRATION_SOURCE_VERSION,
+                context=context,
+                runtime_root=runtime_root,
+            )
+            _require_equal_migration_contents(registry_path, backup_path)
+            raise ValidationError(
+                "registry migration failed before commit; live registry remains "
+                f"schema 18: validated backup={backup_path}"
+            ) from exc
+        raise
+    else:
+        live_conn.close()
+
+    try:
+        _validate_migration_registry_file(
+            registry_path,
+            expected_version=REGISTRY_SCHEMA_VERSION,
+            context=context,
+            runtime_root=runtime_root,
+        )
+    except Exception as exc:
+        raise ValidationError(
+            "registry migration committed but completion reporting failed; "
+            "inspect the live registry and use the validated backup for manual "
+            f"recovery: {backup_path}"
+        ) from exc
+    return RegistryMigrationResult(
+        context=context,
+        registry_path=registry_path,
+        status="migrated",
+        from_schema=REGISTRY_MIGRATION_SOURCE_VERSION,
+        to_schema=REGISTRY_SCHEMA_VERSION,
+        backup_path=backup_path,
+    )
+
+
+def _read_registry_schema_version(path: Path) -> int:
+    try:
+        with _connect_readonly(path) as conn:
+            return _schema_version(conn)
+    except sqlite3.Error as exc:
+        raise ValidationError(
+            f"could not inspect registry schema version: {exc}"
+        ) from exc
+
+
+def _require_supported_migration_version(version: int) -> None:
+    if version != REGISTRY_MIGRATION_SOURCE_VERSION:
+        raise ValidationError(
+            "registry migration supports only schema 18 to 19; "
+            f"found {version}"
+        )
+
+
+def _open_migration_connection(path: Path) -> sqlite3.Connection:
+    try:
+        uri_path = quote(path.resolve().as_posix(), safe="/")
+        conn = sqlite3.connect(f"file:{uri_path}?mode=rw", uri=True)
+    except sqlite3.Error as exc:
+        raise ValidationError(f"could not open database {path}: {exc}") from exc
+    _set_foreign_keys(conn)
+    return conn
+
+
+def _create_registry_migration_backup(
+    source_conn: sqlite3.Connection,
+    backup_path: Path,
+) -> None:
+    try:
+        backup_conn = sqlite3.connect(backup_path)
+    except sqlite3.Error as exc:
+        raise ValidationError(
+            f"could not create registry migration backup: {exc}"
+        ) from exc
+    try:
+        source_conn.backup(backup_conn)
+    except sqlite3.Error as exc:
+        raise ValidationError(
+            f"could not create registry migration backup: {exc}"
+        ) from exc
+    finally:
+        backup_conn.close()
+
+
+def _remove_created_backup(path: Path) -> None:
+    try:
+        if path.is_symlink() or path.is_file():
+            path.unlink()
+        elif path.is_dir():
+            path.rmdir()
+    except OSError as exc:
+        raise ValidationError(
+            f"could not remove invalid registry migration backup: {path}"
+        ) from exc
+
+
+def _validate_migration_registry_file(
+    path: Path,
+    *,
+    expected_version: int,
+    context: str,
+    runtime_root: Path,
+) -> None:
+    try:
+        with _connect_readonly(path) as conn:
+            _validate_migration_preflight(
+                conn,
+                expected_version=expected_version,
+                context=context,
+                runtime_root=runtime_root,
+            )
+    except sqlite3.Error as exc:
+        raise ValidationError(f"registry migration validation failed: {exc}") from exc
+
+
+def _validate_migration_preflight(
+    conn: sqlite3.Connection,
+    *,
+    expected_version: int,
+    context: str,
+    runtime_root: Path,
+) -> None:
+    version = _schema_version(conn)
+    if version != expected_version:
+        if expected_version == REGISTRY_MIGRATION_SOURCE_VERSION:
+            _require_supported_migration_version(version)
+        raise ValidationError(
+            "registry migration requires the exact V19 schema: "
+            f"found schema {version}"
+        )
+    _validate_exact_registry_structure(conn, expected_version=expected_version)
+
+    integrity_rows = [tuple(row) for row in conn.execute("PRAGMA integrity_check")]
+    if integrity_rows != [("ok",)]:
+        raise ValidationError(
+            "registry migration preflight failed integrity_check: "
+            f"{integrity_rows!r}"
+        )
+    foreign_key_rows = [
+        tuple(row) for row in conn.execute("PRAGMA foreign_key_check")
+    ]
+    if foreign_key_rows:
+        raise ValidationError(
+            "registry migration preflight found foreign-key violations: "
+            f"{foreign_key_rows!r}"
+        )
+    row = conn.execute(
+        """
+        SELECT runtime_path, storage_layout_version
+        FROM contexts
+        WHERE context = ?
+        """,
+        (context,),
+    ).fetchone()
+    if (
+        row is None
+        or Path(str(row[0])).expanduser().resolve() != runtime_root
+        or row[1] != STORAGE_LAYOUT_VERSION
+    ):
+        raise ValidationError("registry migration context binding is incompatible")
+
+
+def _validate_exact_registry_structure(
+    conn: sqlite3.Connection,
+    *,
+    expected_version: int,
+) -> None:
+    expected = _expected_registry_schema_signature(expected_version)
+    try:
+        actual = registry_schema_signature(conn)
+    except sqlite3.Error as exc:
+        message = _exact_schema_requirement_message(expected_version)
+        raise ValidationError(f"{message}: {exc}") from exc
+    if actual != expected:
+        raise ValidationError(_exact_schema_requirement_message(expected_version))
+
+
+def _expected_registry_schema_signature(version: int) -> dict[str, object]:
+    if version not in {
+        REGISTRY_MIGRATION_SOURCE_VERSION,
+        REGISTRY_SCHEMA_VERSION,
+    }:
+        raise ValueError(f"unsupported registry schema signature version: {version}")
+    with sqlite3.connect(":memory:") as conn:
+        conn.executescript(_V18_CORE_SCHEMA_SQL)
+        if version == REGISTRY_SCHEMA_VERSION:
+            for statement in _V19_ADDITIVE_SCHEMA_STATEMENTS:
+                conn.execute(statement)
+        conn.execute(f"PRAGMA user_version = {version}")
+        signature = registry_schema_signature(conn)
+    if version == REGISTRY_MIGRATION_SOURCE_VERSION:
+        digest = registry_schema_signature_digest(signature)
+        if digest != REGISTRY_V18_SCHEMA_SIGNATURE_SHA256:
+            raise ValidationError(
+                "registry migration requires the exact V18 schema: retained "
+                "production schema does not match its frozen signature"
+            )
+    return signature
+
+
+def _exact_schema_requirement_message(version: int) -> str:
+    if version == REGISTRY_MIGRATION_SOURCE_VERSION:
+        return "registry migration requires the exact V18 schema"
+    return "registry migration requires the exact V19 schema"
+
+
+def _is_exact_migration_registry(
+    path: Path,
+    *,
+    expected_version: int,
+    context: str,
+    runtime_root: Path,
+) -> bool:
+    try:
+        _validate_migration_registry_file(
+            path,
+            expected_version=expected_version,
+            context=context,
+            runtime_root=runtime_root,
+        )
+    except Exception:
+        return False
+    return True
+
+
+def _require_equal_migration_contents(live_path: Path, backup_path: Path) -> None:
+    if _migration_content_snapshot(live_path) != _migration_content_snapshot(
+        backup_path
+    ):
+        raise ValidationError(
+            "registry migration rollback did not preserve application rows"
+        )
+
+
+def _migration_content_snapshot(
+    path: Path,
+) -> tuple[
+    dict[str, tuple[tuple[object, ...], ...]],
+    tuple[tuple[object, ...], ...],
+]:
+    with _connect_readonly(path) as conn:
+        table_names = tuple(
+            str(row[0])
+            for row in conn.execute(
+                """
+                SELECT name
+                FROM sqlite_master
+                WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
+                ORDER BY name
+                """
+            )
+        )
+        rows = {
+            table_name: tuple(
+                sorted(
+                    (
+                        tuple(row)
+                        for row in conn.execute(
+                            f"SELECT * FROM {_quote_sql_identifier(table_name)}"
+                        )
+                    ),
+                    key=repr,
+                )
+            )
+            for table_name in table_names
+        }
+        sequences = tuple(
+            conn.execute("SELECT name, seq FROM sqlite_sequence ORDER BY name")
+        )
+    return rows, sequences
+
+
+def _invoke_migration_fault(
+    fault_hook: Callable[[str], None] | None,
+    checkpoint: str,
+) -> None:
+    if fault_hook is not None:
+        fault_hook(checkpoint)
+
+
+def _normalize_schema_sql(value: str) -> str:
+    return " ".join(value.split())
+
+
+def _quote_sql_identifier(value: str) -> str:
+    return f'"{value.replace(chr(34), chr(34) * 2)}"'
+
+
+def _query_dict_rows(
+    conn: sqlite3.Connection,
+    statement: str,
+) -> list[dict[str, object]]:
+    cursor = conn.execute(statement)
+    names = tuple(str(item[0]) for item in cursor.description or ())
+    return [dict(zip(names, tuple(row), strict=True)) for row in cursor]
+
+
+def _index_signatures(
+    conn: sqlite3.Connection,
+    *,
+    table_name: str,
+) -> list[dict[str, object]]:
+    indexes: list[dict[str, object]] = []
+    quoted_table = _quote_sql_identifier(table_name)
+    for row in _query_dict_rows(conn, f"PRAGMA index_list({quoted_table})"):
+        index_name = str(row["name"])
+        quoted_index = _quote_sql_identifier(index_name)
+        indexes.append(
+            {
+                "name": index_name,
+                "unique": row["unique"],
+                "origin": row["origin"],
+                "partial": row["partial"],
+                "xinfo": sorted(
+                    _query_dict_rows(
+                        conn,
+                        f"PRAGMA index_xinfo({quoted_index})",
+                    ),
+                    key=lambda item: int(item["seqno"]),
+                ),
+            }
+        )
+    return sorted(indexes, key=lambda item: str(item["name"]))
+
+
+def _foreign_key_signatures(
+    conn: sqlite3.Connection,
+    *,
+    table_name: str,
+) -> list[dict[str, object]]:
+    quoted_table = _quote_sql_identifier(table_name)
+    grouped: dict[int, list[dict[str, object]]] = {}
+    for row in _query_dict_rows(conn, f"PRAGMA foreign_key_list({quoted_table})"):
+        grouped.setdefault(int(row["id"]), []).append(row)
+
+    foreign_keys: list[dict[str, object]] = []
+    for rows in grouped.values():
+        ordered = sorted(rows, key=lambda item: int(item["seq"]))
+        first = ordered[0]
+        foreign_keys.append(
+            {
+                "table": first["table"],
+                "on_update": first["on_update"],
+                "on_delete": first["on_delete"],
+                "match": first["match"],
+                "columns": [
+                    {
+                        "sequence": row["seq"],
+                        "from": row["from"],
+                        "to": row["to"],
+                    }
+                    for row in ordered
+                ],
+            }
+        )
+    return sorted(
+        foreign_keys,
+        key=lambda item: json.dumps(item, sort_keys=True, separators=(",", ":")),
     )
 
 
@@ -4492,6 +5272,11 @@ def _set_foreign_keys(conn: sqlite3.Connection) -> None:
 
 def _validate_schema_version(conn: sqlite3.Connection) -> None:
     version = _schema_version(conn)
+    if version == REGISTRY_MIGRATION_SOURCE_VERSION:
+        raise ValidationError(
+            "registry.db schema version 18 requires explicit migration; run "
+            "'nipact registry migrate --context CONTEXT --project-dir PROJECT_DIR'"
+        )
     if version != REGISTRY_SCHEMA_VERSION:
         raise ValidationError(
             "registry.db schema version is incompatible: "

@@ -1,17 +1,29 @@
 from __future__ import annotations
 
+import builtins
 import json
+import os
 import sqlite3
 from pathlib import Path
 
 import pytest
 
 import nipact.execution as execution_module
-from conftest import RegistryV18Fixture
+from conftest import (
+    RegistryV18Fixture,
+    RegistryV19Fixture,
+    registry_schema_signature,
+)
 from nipact.execution import build_run_plan, execute_run_plan
 from nipact.hashing import sha256_file_digest
 from nipact.project_setup import validate_project
-from nipact.registry import initialize_registry_db
+from nipact.registry import (
+    REGISTRY_SCHEMA_VERSION,
+    REGISTRY_V18_SCHEMA_SIGNATURE_SHA256,
+    migrate_registry_db,
+    registry_schema_signature as production_registry_schema_signature,
+    registry_schema_signature_digest,
+)
 from nipact.trace import build_trace_graph_for_artifact_id
 from registry_v18_fixture_runtime import (
     fixture_analysis_file,
@@ -37,133 +49,6 @@ _APPLICATION_TABLES = (
 _MANIFEST_SCHEMA = "entity_set_v1"
 _MANIFEST_DIGEST = "ffffea2a8dcf44d4db1f54d3dd36f9755b22c54e04919745e22956bb0b1d8c23"
 _SOURCE_DIGEST = "45e8f93b1f72302e7d14f405c7a101472a47af2aa307248b1710afdb348bfef9"
-
-
-def _normalize_sql(value: str) -> str:
-    return " ".join(value.split())
-
-
-def _pragma_rows(
-    connection: sqlite3.Connection,
-    statement: str,
-) -> list[dict[str, object]]:
-    return [dict(row) for row in connection.execute(statement)]
-
-
-def _index_signatures(
-    connection: sqlite3.Connection,
-    *,
-    table_name: str,
-) -> list[dict[str, object]]:
-    indexes: list[dict[str, object]] = []
-    for row in _pragma_rows(connection, f'PRAGMA index_list("{table_name}")'):
-        index_name = str(row["name"])
-        indexes.append(
-            {
-                "name": index_name,
-                "unique": row["unique"],
-                "origin": row["origin"],
-                "partial": row["partial"],
-                "xinfo": sorted(
-                    _pragma_rows(
-                        connection,
-                        f'PRAGMA index_xinfo("{index_name}")',
-                    ),
-                    key=lambda item: int(item["seqno"]),
-                ),
-            }
-        )
-    return sorted(indexes, key=lambda item: str(item["name"]))
-
-
-def _foreign_key_signatures(
-    connection: sqlite3.Connection,
-    *,
-    table_name: str,
-) -> list[dict[str, object]]:
-    grouped: dict[int, list[dict[str, object]]] = {}
-    for row in _pragma_rows(
-        connection,
-        f'PRAGMA foreign_key_list("{table_name}")',
-    ):
-        grouped.setdefault(int(row["id"]), []).append(row)
-
-    foreign_keys: list[dict[str, object]] = []
-    for rows in grouped.values():
-        ordered = sorted(rows, key=lambda item: int(item["seq"]))
-        first = ordered[0]
-        foreign_keys.append(
-            {
-                "table": first["table"],
-                "on_update": first["on_update"],
-                "on_delete": first["on_delete"],
-                "match": first["match"],
-                "columns": [
-                    {
-                        "sequence": row["seq"],
-                        "from": row["from"],
-                        "to": row["to"],
-                    }
-                    for row in ordered
-                ],
-            }
-        )
-    return sorted(
-        foreign_keys,
-        key=lambda item: json.dumps(item, sort_keys=True, separators=(",", ":")),
-    )
-
-
-def _schema_signature(database: Path) -> dict[str, object]:
-    with sqlite3.connect(database) as connection:
-        connection.row_factory = sqlite3.Row
-        objects = _pragma_rows(
-            connection,
-            """
-            SELECT type, name, tbl_name
-            FROM sqlite_master
-            WHERE name NOT LIKE 'sqlite_%'
-            ORDER BY type, name
-            """,
-        )
-        tables: dict[str, object] = {}
-        for table_name in sorted(
-            str(obj["name"]) for obj in objects if obj["type"] == "table"
-        ):
-            tables[table_name] = {
-                "columns": _pragma_rows(
-                    connection,
-                    f'PRAGMA table_xinfo("{table_name}")',
-                ),
-                "foreign_keys": _foreign_key_signatures(
-                    connection,
-                    table_name=table_name,
-                ),
-                "indexes": _index_signatures(
-                    connection,
-                    table_name=table_name,
-                ),
-            }
-        sql = {
-            str(row["name"]): _normalize_sql(str(row["sql"]))
-            for row in connection.execute(
-                """
-                SELECT name, sql
-                FROM sqlite_master
-                WHERE name NOT LIKE 'sqlite_%'
-                  AND type IN ('table', 'index')
-                  AND sql IS NOT NULL
-                ORDER BY name
-                """
-            )
-        }
-        user_version = int(connection.execute("PRAGMA user_version").fetchone()[0])
-    return {
-        "objects": objects,
-        "sql": sql,
-        "tables": tables,
-        "user_version": user_version,
-    }
 
 
 def _application_rows(database: Path) -> dict[str, tuple[tuple[object, ...], ...]]:
@@ -237,29 +122,22 @@ def test_registry_v18_fixture_callables_produce_frozen_bytes(tmp_path: Path) -> 
 
 
 def test_registry_v18_schema_signature_is_non_self_referential(
-    tmp_path: Path,
     registry_v18_fixture: RegistryV18Fixture,
 ) -> None:
     expected = json.loads(
         (_FIXTURE_ROOT / "schema-signature.json").read_text(encoding="utf-8")
     )
     assert expected["user_version"] == 18
-    assert _schema_signature(registry_v18_fixture.registry_path) == expected
-
-    current_runtime = tmp_path / "current-runtime"
-    current_database = current_runtime / "database/registry.db"
-    current_database.parent.mkdir(parents=True)
-    initialize_registry_db(
-        current_database,
-        context="current",
-        runtime_root=current_runtime,
-        manifests={},
-        manifest_paths={},
+    assert registry_schema_signature(registry_v18_fixture.registry_path) == expected
+    with sqlite3.connect(registry_v18_fixture.registry_path) as connection:
+        production = production_registry_schema_signature(connection)
+    assert production == expected
+    assert registry_schema_signature_digest(production) == (
+        REGISTRY_V18_SCHEMA_SIGNATURE_SHA256
     )
-    assert _schema_signature(current_database) == expected
 
 
-def test_registry_v18_fixture_has_complete_rows_files_and_trace(
+def test_registry_v18_fixture_has_complete_rows_and_files(
     registry_v18_fixture: RegistryV18Fixture,
 ) -> None:
     fixture = registry_v18_fixture
@@ -305,13 +183,14 @@ def test_registry_v18_fixture_has_complete_rows_files_and_trace(
     assert run_plan_digest
     assert not (fixture.runtime_dir / str(run_plan_path)).exists()
 
-    result = validate_project(
-        project_dir=fixture.project_dir,
-        context=fixture.context,
-    )
+
+def test_migrated_registry_preserves_current_readers_and_trace(
+    registry_v19_fixture: RegistryV19Fixture,
+) -> None:
+    fixture = registry_v19_fixture
+    result = validate_project(project_dir=fixture.project_dir, context=fixture.context)
     assert (result.manifest_count, result.workflow_count, result.step_count) == (1, 2, 3)
     assert (result.source_entities, result.published_outputs) == (1, 4)
-
     graph = build_trace_graph_for_artifact_id(
         fixture.registry_path,
         artifact_id=fixture.selected_artifact_id,
@@ -384,10 +263,90 @@ def test_registry_v18_fixture_has_complete_rows_files_and_trace(
     ]
 
 
-def test_registry_v18_fixture_preserves_reuse_and_parameter_divergence(
+def _scientific_file_bytes(runtime_dir: Path) -> dict[Path, bytes]:
+    return {
+        path.relative_to(runtime_dir): path.read_bytes()
+        for root in (runtime_dir / "data", runtime_dir / "outputs")
+        for path in root.rglob("*")
+        if path.is_file()
+    }
+
+
+def _sqlite_sequence(database: Path) -> tuple[tuple[object, ...], ...]:
+    with sqlite3.connect(database) as connection:
+        return tuple(connection.execute("SELECT name, seq FROM sqlite_sequence ORDER BY name"))
+
+
+def test_registry_migration_preserves_rows_sequences_and_scientific_files(
     registry_v18_fixture: RegistryV18Fixture,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     fixture = registry_v18_fixture
+    rows_before = _application_rows(fixture.registry_path)
+    sequences_before = _sqlite_sequence(fixture.registry_path)
+    files_before = _scientific_file_bytes(fixture.runtime_dir)
+    protected = {
+        (fixture.runtime_dir / relative).resolve() for relative in files_before
+    }
+
+    def check(value: object) -> None:
+        if isinstance(value, int):
+            return
+        try:
+            candidate = Path(os.path.abspath(os.fspath(value)))
+        except TypeError:
+            return
+        if candidate in protected:
+            pytest.fail(f"migration opened scientific file: {candidate}")
+
+    original_path_open = Path.open
+    original_open = builtins.open
+
+    def guarded_path_open(self: Path, *args: object, **kwargs: object) -> object:
+        check(self)
+        return original_path_open(self, *args, **kwargs)
+
+    def guarded_open(file: object, *args: object, **kwargs: object) -> object:
+        check(file)
+        return original_open(file, *args, **kwargs)
+
+    with monkeypatch.context() as guard:
+        guard.setattr(Path, "open", guarded_path_open)
+        guard.setattr(builtins, "open", guarded_open)
+        result = migrate_registry_db(
+            fixture.registry_path,
+            context=fixture.context,
+            runtime_root=fixture.runtime_dir,
+        )
+
+    assert result.status == "migrated"
+    assert result.backup_path is not None
+    assert _application_rows(fixture.registry_path) == rows_before
+    assert _application_rows(result.backup_path) == rows_before
+    assert _sqlite_sequence(fixture.registry_path) == sequences_before
+    assert _sqlite_sequence(result.backup_path) == sequences_before
+    assert _scientific_file_bytes(fixture.runtime_dir) == files_before
+    with sqlite3.connect(fixture.registry_path) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone() == (
+            REGISTRY_SCHEMA_VERSION,
+        )
+        assert all(
+            connection.execute(f'SELECT COUNT(*) FROM "{table}"').fetchone()[0] == 0
+            for table in (
+                "specification_snapshots",
+                "specification_members",
+                "specification_snapshot_manifest_values",
+                "specification_expected_results",
+                "specification_member_attempts",
+                "specification_attempt_results",
+            )
+        )
+
+
+def test_migrated_registry_preserves_reuse_and_parameter_divergence(
+    registry_v19_fixture: RegistryV19Fixture,
+) -> None:
+    fixture = registry_v19_fixture
     base = build_run_plan(
         project_dir=fixture.project_dir,
         context=fixture.context,
@@ -430,11 +389,11 @@ def test_registry_v18_fixture_preserves_reuse_and_parameter_divergence(
     assert variant.selected_reused_output_refs == ()
 
 
-def test_registry_v18_reuse_only_execution_records_selection_not_generation(
-    registry_v18_fixture: RegistryV18Fixture,
+def test_migrated_registry_reuse_only_execution_records_selection_not_generation(
+    registry_v19_fixture: RegistryV19Fixture,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    fixture = registry_v18_fixture
+    fixture = registry_v19_fixture
     before = _application_rows(fixture.registry_path)
     before_publications = before["published_outputs"]
     source_before = before["artifacts"][0]
@@ -534,10 +493,7 @@ def test_registry_v18_reuse_only_execution_records_selection_not_generation(
     )
 
 
-def test_registry_v18_autoincrement_state_allocates_above_frozen_sequences(
-    registry_v18_fixture: RegistryV18Fixture,
-) -> None:
-    database = registry_v18_fixture.registry_path
+def _assert_autoincrement_state_allocates_above_frozen_sequences(database: Path) -> None:
     with sqlite3.connect(database) as connection:
         connection.execute("PRAGMA foreign_keys = ON")
         sequences = dict(connection.execute("SELECT name, seq FROM sqlite_sequence"))
@@ -596,3 +552,19 @@ def test_registry_v18_autoincrement_state_allocates_above_frozen_sequences(
             for table in ("artifacts", "workflow_runs", "parameters")
         } == counts
         assert dict(connection.execute("SELECT name, seq FROM sqlite_sequence")) == sequences
+
+
+def test_registry_v18_autoincrement_state_allocates_above_frozen_sequences(
+    registry_v18_fixture: RegistryV18Fixture,
+) -> None:
+    _assert_autoincrement_state_allocates_above_frozen_sequences(
+        registry_v18_fixture.registry_path
+    )
+
+
+def test_migrated_registry_autoincrement_state_allocates_above_frozen_sequences(
+    registry_v19_fixture: RegistryV19Fixture,
+) -> None:
+    _assert_autoincrement_state_allocates_above_frozen_sequences(
+        registry_v19_fixture.registry_path
+    )

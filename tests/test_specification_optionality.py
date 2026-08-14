@@ -11,7 +11,7 @@ import yaml
 from fastapi.testclient import TestClient
 
 import nipact.execution as execution_module
-from conftest import RegistryV18Fixture
+from conftest import RegistryV19Fixture
 from nipact.cli import main
 from nipact.execution import build_run_plan, execute_run_plan
 from nipact.gui.app import create_gui_app
@@ -145,11 +145,11 @@ def _guard_registered_targets(
 
 
 def test_dormant_specification_registrations_do_not_affect_ordinary_surfaces(
-    registry_v18_fixture: RegistryV18Fixture,
+    registry_v19_fixture: RegistryV19Fixture,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    fixture = registry_v18_fixture
+    fixture = registry_v19_fixture
     loaded_before = load_workflow_project(
         project_dir=fixture.project_dir,
         context=fixture.context,
@@ -298,6 +298,19 @@ def test_dormant_specification_registrations_do_not_affect_ordinary_surfaces(
             ORDER BY run_id
             """
         ).fetchall()
+        specification_counts = {
+            table: connection.execute(
+                f'SELECT COUNT(*) FROM "{table}"'
+            ).fetchone()[0]
+            for table in (
+                "specification_snapshots",
+                "specification_members",
+                "specification_snapshot_manifest_values",
+                "specification_expected_results",
+                "specification_member_attempts",
+                "specification_attempt_results",
+            )
+        }
     assert outcome.all_selected_resolved
     assert outcome.selected_generated_count == 0
     assert outcome.selected_reused_count == 1
@@ -333,4 +346,5 @@ def test_dormant_specification_registrations_do_not_affect_ordinary_surfaces(
         _MANIFEST_SCHEMA,
         _MANIFEST_DIGEST,
     )
+    assert set(specification_counts.values()) == {0}
     assert accessed == []

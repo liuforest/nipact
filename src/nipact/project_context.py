@@ -1,4 +1,4 @@
-"""Shared project context resolution for read-only command surfaces."""
+"""Shared project context resolution for command surfaces."""
 
 from __future__ import annotations
 
@@ -24,6 +24,33 @@ class ResolvedProjectContext:
 
 def resolve_project_context(*, project_dir: Path, context: str) -> ResolvedProjectContext:
     """Resolve project/runtime paths and verify registry context binding."""
+    resolved = _resolve_project_context_paths(
+        project_dir=project_dir,
+        context=context,
+    )
+    registered_runtime_path = read_context_runtime_path(
+        resolved.registry_path,
+        context=resolved.context,
+    )
+    if registered_runtime_path != str(resolved.runtime_root):
+        raise ValidationError("registry.db context runtime path is out of date")
+    return resolved
+
+
+def resolve_project_context_for_migration(
+    *,
+    project_dir: Path,
+    context: str,
+) -> ResolvedProjectContext:
+    """Resolve fixed registry paths without requiring the current schema version."""
+    return _resolve_project_context_paths(project_dir=project_dir, context=context)
+
+
+def _resolve_project_context_paths(
+    *,
+    project_dir: Path,
+    context: str,
+) -> ResolvedProjectContext:
     context = validate_path_token(context, label="context")
     project_root = project_dir.expanduser().resolve()
     if not project_root.is_dir():
@@ -40,13 +67,6 @@ def resolve_project_context(*, project_dir: Path, context: str) -> ResolvedProje
         raise ValidationError(f"runtime dir does not exist: {runtime_root}")
 
     registry_path = runtime_root / REGISTRY_DB_PATH
-    registered_runtime_path = read_context_runtime_path(
-        registry_path,
-        context=context,
-    )
-    if registered_runtime_path != str(runtime_root):
-        raise ValidationError("registry.db context runtime path is out of date")
-
     return ResolvedProjectContext(
         project_root=project_root,
         runtime_root=runtime_root,

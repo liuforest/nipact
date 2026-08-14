@@ -162,6 +162,23 @@ def build_parser() -> argparse.ArgumentParser:
         help="Print trace graph JSON instead of the text summary.",
     )
 
+    registry_parser = subparsers.add_parser(
+        "registry",
+        help="manage the project registry",
+        description="Manage the selected NIPACT project registry.",
+    )
+    registry_subparsers = registry_parser.add_subparsers(
+        dest="registry_command",
+        metavar="registry-command",
+        required=True,
+    )
+    registry_migrate_parser = registry_subparsers.add_parser(
+        "migrate",
+        help="migrate an exact schema-18 registry to schema 19",
+        description="migrate an exact schema-18 registry to schema 19",
+    )
+    _add_project_context_args(registry_migrate_parser)
+
     workflow_parser = subparsers.add_parser(
         "workflow",
         help="work with declared workflows",
@@ -535,6 +552,41 @@ def _run_workflow_command(args: argparse.Namespace) -> int | None:
     raise ValidationError(f"unknown workflow command: {args.workflow_command}")
 
 
+def _run_registry_command(args: argparse.Namespace) -> None:
+    from .errors import ValidationError
+    from .project_context import resolve_project_context_for_migration
+    from .registry import REGISTRY_SCHEMA_VERSION, migrate_registry_db
+
+    if args.registry_command != "migrate":
+        raise ValidationError(f"unknown registry command: {args.registry_command}")
+
+    project_dir = _resolve_project_dir_arg(args)
+    resolved = resolve_project_context_for_migration(
+        project_dir=project_dir,
+        context=args.context,
+    )
+    result = migrate_registry_db(
+        resolved.registry_path,
+        context=resolved.context,
+        runtime_root=resolved.runtime_root,
+    )
+    print(f"context={result.context}")
+    print(f"registry={_display_path(result.registry_path)}")
+    print(f"status={result.status}")
+    if result.status == "migrated":
+        print(f"from_schema={result.from_schema}")
+        print(f"to_schema={result.to_schema}")
+        if result.backup_path is None:  # pragma: no cover - internal invariant.
+            raise RuntimeError("migrated registry result is missing its backup path")
+        print(f"backup={_display_path(result.backup_path)}")
+        print(
+            "recovery=restore the backup manually before using schema-18 software"
+        )
+    else:
+        print(f"schema={REGISTRY_SCHEMA_VERSION}")
+    _print_pass("PASS: registry migrate")
+
+
 def _run_trace_command(args: argparse.Namespace) -> None:
     project_dir = _resolve_project_dir_arg(args)
     registry_path = _trace_registry_path(
@@ -768,6 +820,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             _run_gui_command(args)
         elif args.command == "trace":
             _run_trace_command(args)
+        elif args.command == "registry":
+            _run_registry_command(args)
         elif args.command == "workflow":
             return _run_workflow_command(args) or 0
         else:  # pragma: no cover - argparse enforces the command choices.
