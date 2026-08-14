@@ -159,6 +159,7 @@ SpecificationFailureStage = Literal[
     "execution",
     "acceptance",
 ]
+SpecificationAttemptOutcome = Literal["failed", "partial", "complete"]
 
 
 @dataclass(frozen=True)
@@ -841,6 +842,78 @@ def fail_specification_member_attempt(
             if conn.in_transaction:
                 conn.rollback()
             raise
+
+
+def read_specification_attempt_outcome(
+    path: Path,
+    *,
+    runtime_root: Path,
+    attempt: SpecificationAttemptRef,
+    member: CanonicalSpecificationMember,
+) -> SpecificationAttemptOutcome | None:
+    """Read one attempt outcome after verifying its terminal cardinality."""
+    _validate_specification_attempt_ref(attempt)
+    registry_path, resolved_runtime_root = _validate_snapshot_registry_binding(
+        path,
+        runtime_root=runtime_root,
+    )
+    try:
+        with _connect_readonly_rows(registry_path) as conn:
+            _validate_schema_version(conn)
+            _validate_exact_registry_structure(
+                conn,
+                expected_version=REGISTRY_SCHEMA_VERSION,
+            )
+            _require_snapshot_context_binding(
+                conn,
+                context=attempt.context,
+                runtime_root=resolved_runtime_root,
+            )
+            _validate_targeted_specification_member(
+                conn,
+                context=attempt.context,
+                snapshot_digest=attempt.snapshot_digest,
+                member=member,
+            )
+            if member.disposition != "included":
+                raise ValidationError(
+                    "excluded specification member cannot have an attempt"
+                )
+            row = _read_specification_attempt(
+                conn,
+                attempt=attempt,
+                member=member,
+            )
+            result_count = int(
+                conn.execute(
+                    """
+                    SELECT COUNT(*)
+                    FROM specification_attempt_results
+                    WHERE attempt_id = ?
+                    """,
+                    (attempt.attempt_id,),
+                ).fetchone()[0]
+            )
+    except sqlite3.Error as exc:
+        raise ValidationError(
+            f"could not read specification attempt outcome: {exc}"
+        ) from exc
+
+    outcome = row["outcome"]
+    expected_count = len(member.expected_results)
+    if outcome is None:
+        valid_count = result_count == 0
+    elif outcome == "failed":
+        valid_count = result_count == 0
+    elif outcome == "partial":
+        valid_count = 0 < result_count < expected_count
+    else:
+        valid_count = result_count == expected_count
+    if not valid_count:
+        raise ValidationError(
+            "stored specification attempt result count is inconsistent"
+        )
+    return outcome
 
 
 def _insert_manifest_declarations(

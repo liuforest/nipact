@@ -38,6 +38,7 @@ from nipact.registry import (
     initialize_registry_db,
     insert_or_verify_specification_snapshot,
     migrate_registry_db,
+    read_specification_attempt_outcome,
     read_specification_snapshot,
     record_workflow_run,
 )
@@ -1215,6 +1216,98 @@ def test_conditional_failure_rolls_back_and_rejects_contradictory_or_wrong_refs(
             diagnostic=diagnostic,
         )
     assert _freeze_state(fixture.registry_path) == contradictory
+
+
+@pytest.mark.parametrize(
+    (
+        "outcome",
+        "result_count",
+        "has_selecting_run",
+        "expected_outcome",
+        "is_valid",
+    ),
+    [
+        (None, 0, False, None, True),
+        ("failed", 0, False, "failed", True),
+        ("failed", 0, True, "failed", True),
+        ("partial", 1, True, "partial", True),
+        ("complete", 2, True, "complete", True),
+        (None, 1, False, None, False),
+        ("failed", 1, False, None, False),
+        ("partial", 0, True, None, False),
+        ("partial", 2, True, None, False),
+        ("complete", 1, True, None, False),
+    ],
+)
+def test_specification_attempt_outcome_reader_validates_state_and_cardinality(
+    registry_v18_fixture: RegistryV18Fixture,
+    outcome: str | None,
+    result_count: int,
+    has_selecting_run: bool,
+    expected_outcome: str | None,
+    is_valid: bool,
+) -> None:
+    fixture = registry_v18_fixture
+    snapshot, member = _prepare_snapshot(fixture, route="migrated")
+    attempt = _append_attempt(fixture, snapshot, member)
+    assert len(member.expected_results) == 2
+
+    with sqlite3.connect(fixture.registry_path) as connection:
+        selecting_run_id = connection.execute(
+            "SELECT run_id FROM workflow_runs ORDER BY run_id LIMIT 1"
+        ).fetchone()[0]
+        if outcome is not None:
+            failure_stage = "execution" if outcome == "failed" else None
+            failure_summary = "compact failure" if outcome == "failed" else None
+            connection.execute(
+                """
+                UPDATE specification_member_attempts
+                SET finished_at = ?, outcome = ?, selecting_run_id = ?,
+                    failure_stage = ?, failure_summary = ?
+                WHERE attempt_id = ?
+                """,
+                (
+                    "2026-08-13T12:00:00+00:00",
+                    outcome,
+                    selecting_run_id if has_selecting_run else None,
+                    failure_stage,
+                    failure_summary,
+                    attempt.attempt_id,
+                ),
+            )
+        for descriptor in member.expected_results[:result_count]:
+            connection.execute(
+                """
+                INSERT INTO specification_attempt_results (
+                    attempt_id, snapshot_digest, member_key,
+                    role, address, artifact_id
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    attempt.attempt_id,
+                    snapshot.snapshot_digest,
+                    member.member_key,
+                    descriptor.role,
+                    descriptor.address,
+                    fixture.selected_artifact_id,
+                ),
+            )
+
+    if is_valid:
+        assert read_specification_attempt_outcome(
+            fixture.registry_path,
+            runtime_root=fixture.runtime_dir,
+            attempt=attempt,
+            member=member,
+        ) == expected_outcome
+    else:
+        with pytest.raises(ValidationError, match="result count is inconsistent"):
+            read_specification_attempt_outcome(
+                fixture.registry_path,
+                runtime_root=fixture.runtime_dir,
+                attempt=attempt,
+                member=member,
+            )
 
 
 def test_scientific_acceptance_records_two_fresh_sibling_results(

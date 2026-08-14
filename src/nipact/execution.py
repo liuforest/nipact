@@ -67,6 +67,8 @@ from .registry import (
     RunExecutionPopulationRow,
     RunManifestBindingRow,
     SelectedOutputResolutionIntent,
+    SpecificationAcceptanceIntent,
+    SpecificationFailureStage,
     WorkflowOutputArtifactRow,
     RegisteredSourceAuthority,
     reconcile_manifest_and_source_authorities,
@@ -98,6 +100,20 @@ from .workflow import (
 )
 
 RunStatusCallback = Callable[[str], None]
+
+
+class _SpecificationExecutionStageError(Exception):
+    """Carry a specification failure stage without replacing its cause."""
+
+    def __init__(
+        self,
+        *,
+        stage: SpecificationFailureStage,
+        original: Exception,
+    ) -> None:
+        self.stage = stage
+        self.original = original
+        super().__init__(str(original))
 
 
 # Private rollout boundary for representation-transparent consumers. Unknown
@@ -671,55 +687,71 @@ def _execute_run_plan_already_locked(
     *,
     cores: int,
     status_callback: RunStatusCallback | None,
+    specification_acceptance: SpecificationAcceptanceIntent | None = None,
 ) -> RunOutcome:
     """Execute one real structural plan while its caller holds the runtime lock."""
-    registry_path = run_plan.forecast.runtime_root / REGISTRY_DB_PATH
-    coordinates = tuple(
-        declaration.coordinate for declaration in run_plan.source_declarations
-    )
-    registered = read_registered_source_authorities(
-        registry_path,
-        coordinates=coordinates,
-    )
-    observations = tuple(
-        observe_source_authority(
-            runtime_root=run_plan.forecast.runtime_root,
-            declaration=declaration,
-            registered=(
-                registered[declaration.coordinate].authority
-                if declaration.coordinate in registered
-                else None
-            ),
+    try:
+        registry_path = run_plan.forecast.runtime_root / REGISTRY_DB_PATH
+        coordinates = tuple(
+            declaration.coordinate for declaration in run_plan.source_declarations
         )
-        for declaration in run_plan.source_declarations
-    )
-    relevant_manifests, relevant_manifest_paths = (
-        _relevant_manifest_authority_inputs(
+        registered = read_registered_source_authorities(
+            registry_path,
+            coordinates=coordinates,
+        )
+        observations = tuple(
+            observe_source_authority(
+                runtime_root=run_plan.forecast.runtime_root,
+                declaration=declaration,
+                registered=(
+                    registered[declaration.coordinate].authority
+                    if declaration.coordinate in registered
+                    else None
+                ),
+            )
+            for declaration in run_plan.source_declarations
+        )
+        relevant_manifests, relevant_manifest_paths = (
+            _relevant_manifest_authority_inputs(
+                loaded=run_plan.loaded_project,
+                plan=run_plan.workflow_plan,
+            )
+        )
+        source_authorities = reconcile_manifest_and_source_authorities(
+            registry_path,
+            context=run_plan.loaded_project.context,
+            manifests=relevant_manifests,
+            manifest_paths=relevant_manifest_paths,
+            observations=observations,
+        )
+        for status in ("new", "changed", "unchanged"):
+            count = sum(observation.status == status for observation in observations)
+            _emit_status(status_callback, f"sources_{status}:{count}")
+        executable = _build_executable_run_plan(
             loaded=run_plan.loaded_project,
             plan=run_plan.workflow_plan,
+            address=run_plan.forecast.requested_address,
+            dry_run=False,
+            source_authorities=source_authorities,
         )
-    )
-    source_authorities = reconcile_manifest_and_source_authorities(
-        registry_path,
-        context=run_plan.loaded_project.context,
-        manifests=relevant_manifests,
-        manifest_paths=relevant_manifest_paths,
-        observations=observations,
-    )
-    for status in ("new", "changed", "unchanged"):
-        count = sum(observation.status == status for observation in observations)
-        _emit_status(status_callback, f"sources_{status}:{count}")
-    executable = _build_executable_run_plan(
-        loaded=run_plan.loaded_project,
-        plan=run_plan.workflow_plan,
-        address=run_plan.forecast.requested_address,
-        dry_run=False,
-        source_authorities=source_authorities,
-    )
+    except Exception as exc:
+        if specification_acceptance is None:
+            raise
+        raise _SpecificationExecutionStageError(
+            stage="planning",
+            original=exc,
+        ) from exc
+    if specification_acceptance is None:
+        return _execute_executable_run_plan(
+            executable,
+            cores=cores,
+            status_callback=status_callback,
+        )
     return _execute_executable_run_plan(
         executable,
         cores=cores,
         status_callback=status_callback,
+        specification_acceptance=specification_acceptance,
     )
 
 
@@ -764,6 +796,7 @@ def _execute_executable_run_plan(
     *,
     cores: int,
     status_callback: RunStatusCallback | None,
+    specification_acceptance: SpecificationAcceptanceIntent | None = None,
 ) -> RunOutcome:
     """Execute one finalized plan and record dependency-consistent survivors.
 
@@ -888,29 +921,76 @@ def _execute_executable_run_plan(
         published_rows=published_rows,
         actual_reused_artifacts=actual_reused_artifacts,
     )
-    published_count = record_workflow_run(
-        run_plan.runtime_root / REGISTRY_DB_PATH,
-        runtime_root=run_plan.runtime_root,
-        context=run_plan.context,
-        workflow_name=run_plan.workflow_name,
-        base_workflow_name=run_plan.base_workflow_name,
-        selected_step_name=run_plan.selected_step_name,
-        selected_output_name=run_plan.selected_output_name,
-        run_workspace=_runtime_relative_path(run_plan.runtime_root, run_plan.run_workspace),
-        run_plan_path=_runtime_relative_path(
-            run_plan.runtime_root,
-            run_plan.run_workspace / "run_plan.json",
-        ),
-        run_plan_digest=sha256_file_digest(run_plan.run_workspace / "run_plan.json"),
-        artifacts=artifact_rows,
-        projection_recipes=projection_recipes,
-        reused_projection_seeds=reused_projection_seeds,
-        selected_resolution_intents=selected_resolution_intents,
-        environment_observation=_environment_observation(),
-        execution_population=_run_execution_population_row(run_plan),
-        manifest_bindings=_run_manifest_binding_rows(run_plan),
-        membership_intents=membership_intents,
+    acceptance_intent = specification_acceptance
+    if acceptance_intent is not None:
+        expected_coordinates = {
+            (
+                run_plan.context,
+                run_plan.workflow_name,
+                result.step_name,
+                result.output_name,
+                result.address,
+            )
+            for result in acceptance_intent.member.expected_results
+        }
+        membership_coordinates = {
+            (
+                intent.row.context,
+                intent.row.workflow_name,
+                intent.row.step_name,
+                intent.row.output_name,
+                intent.row.address,
+            )
+            for intent in membership_intents
+        }
+        if expected_coordinates & membership_coordinates:
+            acceptance_intent = replace(acceptance_intent, failure=None)
+    registry_path = run_plan.runtime_root / REGISTRY_DB_PATH
+    run_workspace = _runtime_relative_path(
+        run_plan.runtime_root,
+        run_plan.run_workspace,
     )
+    run_plan_path = _runtime_relative_path(
+        run_plan.runtime_root,
+        run_plan.run_workspace / "run_plan.json",
+    )
+    run_plan_digest = sha256_file_digest(run_plan.run_workspace / "run_plan.json")
+    environment_observation = _environment_observation()
+    execution_population = _run_execution_population_row(run_plan)
+    manifest_bindings = _run_manifest_binding_rows(run_plan)
+    try:
+        published_count = record_workflow_run(
+            registry_path,
+            runtime_root=run_plan.runtime_root,
+            context=run_plan.context,
+            workflow_name=run_plan.workflow_name,
+            base_workflow_name=run_plan.base_workflow_name,
+            selected_step_name=run_plan.selected_step_name,
+            selected_output_name=run_plan.selected_output_name,
+            run_workspace=run_workspace,
+            run_plan_path=run_plan_path,
+            run_plan_digest=run_plan_digest,
+            artifacts=artifact_rows,
+            projection_recipes=projection_recipes,
+            reused_projection_seeds=reused_projection_seeds,
+            selected_resolution_intents=selected_resolution_intents,
+            environment_observation=environment_observation,
+            execution_population=execution_population,
+            manifest_bindings=manifest_bindings,
+            membership_intents=membership_intents,
+            **(
+                {"specification_acceptance": acceptance_intent}
+                if acceptance_intent is not None
+                else {}
+            ),
+        )
+    except Exception as exc:
+        if specification_acceptance is None:
+            raise
+        raise _SpecificationExecutionStageError(
+            stage="acceptance",
+            original=exc,
+        ) from exc
     _emit_status(status_callback, "registry_updated")
     cleanup_warnings = _finalize_published_output_staging(published_results)
     selected_generated_count = sum(

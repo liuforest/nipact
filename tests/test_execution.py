@@ -2567,7 +2567,7 @@ def test_public_real_execution_acquires_one_lock_before_already_locked_seam(
         execute_run_plan(object())  # type: ignore[arg-type]
 
 
-def test_already_locked_seam_executes_compact_real_plan_without_nested_lock(
+def test_ordinary_already_locked_seam_omits_specification_acceptance(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2589,7 +2589,17 @@ def test_already_locked_seam_executes_compact_real_plan_without_nested_lock(
     def unexpected_lock(*_args: object, **_kwargs: object) -> object:
         pytest.fail("already-locked execution attempted nested lock acquisition")
 
+    real_record = execution_module.record_workflow_run
+    record_calls = 0
+
+    def record_ordinary(*args: object, **kwargs: object) -> int:
+        nonlocal record_calls
+        record_calls += 1
+        assert "specification_acceptance" not in kwargs
+        return real_record(*args, **kwargs)
+
     monkeypatch.setattr(execution_module, "_run_snakemake", run_every_job)
+    monkeypatch.setattr(execution_module, "record_workflow_run", record_ordinary)
     monkeypatch.setattr(
         execution_module,
         "acquire_mutating_runtime_lock",
@@ -2608,6 +2618,7 @@ def test_already_locked_seam_executes_compact_real_plan_without_nested_lock(
     assert outcome.selected_generated_count == 1
     assert outcome.selected_reused_count == 0
     assert outcome.all_selected_resolved is True
+    assert record_calls == 1
     assert events == [
         "sources_new:1",
         "sources_changed:0",
