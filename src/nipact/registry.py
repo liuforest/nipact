@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 import json
 from pathlib import Path
 import sqlite3
-from typing import Any, Callable, Iterable, Iterator
+from typing import Any, Callable, Iterable, Iterator, Literal
 from urllib.parse import quote
 
 from .artifacts import (
@@ -37,7 +37,9 @@ from .source_authority import (
     registered_source_authority_from_facts,
 )
 from .specification_canonical import (
+    CanonicalSpecificationMember,
     CanonicalSpecificationSnapshot,
+    decode_specification_row,
     decode_specification_snapshot,
 )
 
@@ -150,6 +152,34 @@ class SelectedOutputResolutionIntent:
 class MembershipIntent:
     row: PublishedOutputRow
     existing_artifact_id: int | None = None
+
+
+SpecificationFailureStage = Literal[
+    "planning",
+    "execution",
+    "acceptance",
+]
+
+
+@dataclass(frozen=True)
+class SpecificationAttemptRef:
+    attempt_id: int
+    context: str
+    snapshot_digest: str
+    member_key: str
+
+
+@dataclass(frozen=True)
+class SpecificationFailureDiagnostic:
+    stage: SpecificationFailureStage
+    summary: str
+
+
+@dataclass(frozen=True)
+class SpecificationAcceptanceIntent:
+    attempt: SpecificationAttemptRef
+    member: CanonicalSpecificationMember
+    failure: SpecificationFailureDiagnostic | None = None
 
 
 @dataclass(frozen=True)
@@ -663,6 +693,156 @@ def read_specification_snapshot(
         ) from exc
 
 
+def append_specification_member_attempt(
+    path: Path,
+    *,
+    runtime_root: Path,
+    context: str,
+    snapshot_digest: str,
+    member: CanonicalSpecificationMember,
+    _fault_hook: Callable[[str], None] | None = None,
+) -> SpecificationAttemptRef:
+    """Append one unresolved attempt for an included specification member."""
+    context = validate_path_token(context, label="context")
+    snapshot_digest = _validate_specification_snapshot_digest(snapshot_digest)
+    registry_path, resolved_runtime_root = _validate_snapshot_registry_binding(
+        path,
+        runtime_root=runtime_root,
+    )
+    with _connect_readwrite_existing(registry_path) as conn:
+        _validate_schema_version(conn)
+        _validate_exact_registry_structure(
+            conn,
+            expected_version=REGISTRY_SCHEMA_VERSION,
+        )
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            _require_snapshot_context_binding(
+                conn,
+                context=context,
+                runtime_root=resolved_runtime_root,
+            )
+            _validate_targeted_specification_member(
+                conn,
+                context=context,
+                snapshot_digest=snapshot_digest,
+                member=member,
+            )
+            if member.disposition != "included":
+                raise ValidationError(
+                    "excluded specification member cannot have an attempt"
+                )
+            cursor = conn.execute(
+                """
+                INSERT INTO specification_member_attempts (
+                    snapshot_digest, member_key, started_at
+                )
+                VALUES (?, ?, ?)
+                """,
+                (snapshot_digest, member.member_key, _utc_now()),
+            )
+            attempt = SpecificationAttemptRef(
+                attempt_id=int(cursor.lastrowid),
+                context=context,
+                snapshot_digest=snapshot_digest,
+                member_key=member.member_key,
+            )
+            _invoke_specification_fault(_fault_hook, "after_attempt_insert")
+            conn.commit()
+            return attempt
+        except Exception:
+            if conn.in_transaction:
+                conn.rollback()
+            raise
+
+
+def fail_specification_member_attempt(
+    path: Path,
+    *,
+    runtime_root: Path,
+    attempt: SpecificationAttemptRef,
+    member: CanonicalSpecificationMember,
+    diagnostic: SpecificationFailureDiagnostic,
+    _fault_hook: Callable[[str], None] | None = None,
+) -> bool:
+    """Conditionally fill one unresolved attempt with an early failure."""
+    _validate_specification_attempt_ref(attempt)
+    stage, summary = _validate_specification_failure_diagnostic(diagnostic)
+    registry_path, resolved_runtime_root = _validate_snapshot_registry_binding(
+        path,
+        runtime_root=runtime_root,
+    )
+    with _connect_readwrite_existing(registry_path) as conn:
+        _validate_schema_version(conn)
+        _validate_exact_registry_structure(
+            conn,
+            expected_version=REGISTRY_SCHEMA_VERSION,
+        )
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            _require_snapshot_context_binding(
+                conn,
+                context=attempt.context,
+                runtime_root=resolved_runtime_root,
+            )
+            _validate_targeted_specification_member(
+                conn,
+                context=attempt.context,
+                snapshot_digest=attempt.snapshot_digest,
+                member=member,
+            )
+            if member.disposition != "included":
+                raise ValidationError(
+                    "excluded specification member cannot have an attempt"
+                )
+            row = _read_specification_attempt(
+                conn,
+                attempt=attempt,
+                member=member,
+            )
+            if row["outcome"] is not None:
+                conn.rollback()
+                return False
+            _require_unresolved_specification_attempt(conn, row=row)
+            cursor = conn.execute(
+                """
+                UPDATE specification_member_attempts
+                SET finished_at = ?, outcome = 'failed',
+                    failure_stage = ?, failure_summary = ?
+                WHERE attempt_id = ?
+                  AND snapshot_digest = ?
+                  AND member_key = ?
+                  AND outcome IS NULL
+                  AND finished_at IS NULL
+                  AND selecting_run_id IS NULL
+                  AND failure_stage IS NULL
+                  AND failure_summary IS NULL
+                """,
+                (
+                    _utc_now(),
+                    stage,
+                    summary,
+                    attempt.attempt_id,
+                    attempt.snapshot_digest,
+                    attempt.member_key,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise ValidationError(
+                    "specification attempt could not be marked failed"
+                )
+            _invoke_specification_fault(
+                _fault_hook,
+                "after_attempt_failure_update",
+            )
+            conn.commit()
+            return True
+        except Exception:
+            if conn.in_transaction:
+                conn.rollback()
+            raise
+
+
 def _insert_manifest_declarations(
     conn: sqlite3.Connection,
     *,
@@ -1000,6 +1180,8 @@ def record_workflow_run(
     manifest_bindings: Iterable[RunManifestBindingRow],
     membership_intents: Iterable[MembershipIntent],
     base_workflow_name: str | None = None,
+    specification_acceptance: SpecificationAcceptanceIntent | None = None,
+    _fault_hook: Callable[[str], None] | None = None,
 ) -> int:
     """Record one run, superseding current rows while retaining history."""
     artifact_rows = tuple(artifacts)
@@ -1043,111 +1225,178 @@ def record_workflow_run(
         membership_rows,
     )
     now = _utc_now()
+    specification_failure: tuple[str, str] | None = None
+    if specification_acceptance is None:
+        connection = _connect(path)
+        recording_runtime_root = runtime_root
+    else:
+        registry_path, recording_runtime_root = _validate_snapshot_registry_binding(
+            path,
+            runtime_root=runtime_root,
+        )
+        connection = _connect_readwrite_existing(registry_path)
     try:
-        with _connect(path) as conn:
-            _validate_schema_version(conn)
-            _delete_current_run_scope(
-                conn,
-                context=context,
-                workflow_name=workflow_name,
-                selected_step_name=selected_step_name,
-                selected_output_name=selected_output_name,
-            )
-            run_id = _insert_workflow_run(
-                conn,
-                context=context,
-                workflow_name=workflow_name,
-                base_workflow_name=base_workflow_name,
-                selected_step_name=selected_step_name,
-                selected_output_name=selected_output_name,
-                run_workspace=run_workspace,
-                run_plan_path=run_plan_path,
-                run_plan_digest=run_plan_digest,
-                resolution_summary_json=_resolution_summary_json(
-                    selected_resolution_rows,
-                    artifact_ids=None,
-                ),
-                environment_observation_json=_environment_observation_json(
-                    environment_observation
-                ),
-                created_at=now,
-            )
-            finalized_projections = _finalize_retained_job_projections(
-                conn,
-                context=context,
-                artifact_rows=artifact_rows,
-                projection_recipes=projection_recipe_rows,
-                reused_projection_seeds=reused_projection_seed_rows,
-            )
-            reused_projection_identities = _reused_projection_identities(
-                context=context,
-                seeds=reused_projection_seed_rows,
-            )
-            _validate_no_divergent_fresh_bundles(
-                conn,
-                context=context,
-                run_id=run_id,
-                artifact_rows=artifact_rows,
-                finalized_projections=finalized_projections,
-            )
-            parameter_ids = {
-                (row.step_name, row.parameters_json): _upsert_parameter(
+        with connection as conn:
+            try:
+                _validate_schema_version(conn)
+                if specification_acceptance is not None:
+                    _validate_exact_registry_structure(
+                        conn,
+                        expected_version=REGISTRY_SCHEMA_VERSION,
+                    )
+                    conn.execute("BEGIN IMMEDIATE")
+                    _require_snapshot_context_binding(
+                        conn,
+                        context=context,
+                        runtime_root=recording_runtime_root,
+                    )
+                    specification_failure = (
+                        _validate_specification_acceptance_state(
+                            conn,
+                            context=context,
+                            workflow_name=workflow_name,
+                            selected_step_name=selected_step_name,
+                            selected_output_name=selected_output_name,
+                            intent=specification_acceptance,
+                        )
+                    )
+                _delete_current_run_scope(
                     conn,
-                    step_name=row.step_name,
-                    parameters_json=row.parameters_json,
+                    context=context,
+                    workflow_name=workflow_name,
+                    selected_step_name=selected_step_name,
+                    selected_output_name=selected_output_name,
+                )
+                run_id = _insert_workflow_run(
+                    conn,
+                    context=context,
+                    workflow_name=workflow_name,
+                    base_workflow_name=base_workflow_name,
+                    selected_step_name=selected_step_name,
+                    selected_output_name=selected_output_name,
+                    run_workspace=run_workspace,
+                    run_plan_path=run_plan_path,
+                    run_plan_digest=run_plan_digest,
+                    resolution_summary_json=_resolution_summary_json(
+                        selected_resolution_rows,
+                        artifact_ids=None,
+                    ),
+                    environment_observation_json=_environment_observation_json(
+                        environment_observation
+                    ),
                     created_at=now,
                 )
-                for row in artifact_rows
-            }
-            artifact_ids = _insert_workflow_output_artifacts(
-                conn,
-                context=context,
-                workflow_name=workflow_name,
-                run_id=run_id,
-                artifact_rows=artifact_rows,
-                parameter_ids=parameter_ids,
-                finalized_projections=finalized_projections,
-                created_at=now,
-            )
-            _insert_artifact_dependencies(
-                conn,
-                runtime_root=runtime_root,
-                context=context,
-                reused_projection_identities=reused_projection_identities,
-                artifact_rows=artifact_rows,
-                artifact_ids=artifact_ids,
-            )
-            _insert_run_manifest_bindings(
-                conn,
-                run_id=run_id,
-                rows=manifest_binding_rows,
-            )
-            if execution_population is not None:
-                _insert_run_execution_population(
+                if specification_acceptance is not None:
+                    _invoke_specification_fault(_fault_hook, "after_workflow_run")
+                finalized_projections = _finalize_retained_job_projections(
+                    conn,
+                    context=context,
+                    artifact_rows=artifact_rows,
+                    projection_recipes=projection_recipe_rows,
+                    reused_projection_seeds=reused_projection_seed_rows,
+                )
+                reused_projection_identities = _reused_projection_identities(
+                    context=context,
+                    seeds=reused_projection_seed_rows,
+                )
+                _validate_no_divergent_fresh_bundles(
+                    conn,
+                    context=context,
+                    run_id=run_id,
+                    artifact_rows=artifact_rows,
+                    finalized_projections=finalized_projections,
+                )
+                parameter_ids = {
+                    (row.step_name, row.parameters_json): _upsert_parameter(
+                        conn,
+                        step_name=row.step_name,
+                        parameters_json=row.parameters_json,
+                        created_at=now,
+                    )
+                    for row in artifact_rows
+                }
+                artifact_ids = _insert_workflow_output_artifacts(
+                    conn,
+                    context=context,
+                    workflow_name=workflow_name,
+                    run_id=run_id,
+                    artifact_rows=artifact_rows,
+                    parameter_ids=parameter_ids,
+                    finalized_projections=finalized_projections,
+                    created_at=now,
+                )
+                _insert_artifact_dependencies(
+                    conn,
+                    runtime_root=recording_runtime_root,
+                    context=context,
+                    reused_projection_identities=reused_projection_identities,
+                    artifact_rows=artifact_rows,
+                    artifact_ids=artifact_ids,
+                )
+                _insert_run_manifest_bindings(
                     conn,
                     run_id=run_id,
-                    row=execution_population,
+                    rows=manifest_binding_rows,
                 )
-            _delete_published_output_coordinates(
-                conn,
-                rows=tuple(intent.row for intent in membership_rows),
-            )
-            _insert_memberships(
-                conn,
-                intents=membership_rows,
-                artifact_ids=artifact_ids,
-            )
-            conn.execute(
-                "UPDATE workflow_runs SET resolution_summary_json = ? WHERE run_id = ?",
-                (
-                    _resolution_summary_json(
-                        selected_resolution_rows,
-                        artifact_ids=artifact_ids,
-                        conn=conn,
+                if execution_population is not None:
+                    _insert_run_execution_population(
+                        conn,
+                        run_id=run_id,
+                        row=execution_population,
+                    )
+                _delete_published_output_coordinates(
+                    conn,
+                    rows=tuple(intent.row for intent in membership_rows),
+                )
+                accepted_memberships = _insert_memberships(
+                    conn,
+                    intents=membership_rows,
+                    artifact_ids=artifact_ids,
+                )
+                conn.execute(
+                    "UPDATE workflow_runs SET resolution_summary_json = ? WHERE run_id = ?",
+                    (
+                        _resolution_summary_json(
+                            selected_resolution_rows,
+                            artifact_ids=artifact_ids,
+                            conn=conn,
+                        ),
+                        run_id,
                     ),
-                    run_id,
-                ),
-            )
+                )
+                if specification_acceptance is not None:
+                    _invoke_specification_fault(
+                        _fault_hook,
+                        "after_ordinary_acceptance",
+                    )
+                    resolved_count = _insert_specification_attempt_results(
+                        conn,
+                        context=context,
+                        workflow_name=workflow_name,
+                        intent=specification_acceptance,
+                        accepted_memberships=accepted_memberships,
+                    )
+                    _invoke_specification_fault(
+                        _fault_hook,
+                        "after_specification_results",
+                    )
+                    _terminalize_specification_attempt(
+                        conn,
+                        intent=specification_acceptance,
+                        run_id=run_id,
+                        finished_at=now,
+                        resolved_count=resolved_count,
+                        failure=specification_failure,
+                    )
+                    _invoke_specification_fault(
+                        _fault_hook,
+                        "after_specification_terminalization",
+                    )
+                    conn.commit()
+            except Exception:
+                if specification_acceptance is not None and conn.in_transaction:
+                    conn.rollback()
+                raise
     except sqlite3.Error as exc:
         raise ValidationError(f"registry.db is malformed: {exc}") from exc
     return len(artifact_rows)
@@ -3564,7 +3813,8 @@ def _insert_memberships(
     *,
     intents: tuple[MembershipIntent, ...],
     artifact_ids: dict[tuple[str, str, str], int],
-) -> None:
+) -> dict[tuple[str, str, str, str, str], int]:
+    accepted: dict[tuple[str, str, str, str, str], int] = {}
     for intent in intents:
         row = intent.row
         if intent.existing_artifact_id is None:
@@ -3610,6 +3860,16 @@ def _insert_memberships(
                 artifact_id,
             ),
         )
+        accepted[
+            (
+                row.context,
+                row.workflow_name,
+                row.step_name,
+                row.output_name,
+                row.address,
+            )
+        ] = artifact_id
+    return accepted
 
 
 def _resolution_summary_json(
@@ -5613,6 +5873,416 @@ def _invoke_specification_snapshot_fault(
         fault_hook(checkpoint)
 
 
+def _validate_specification_snapshot_digest(value: object) -> str:
+    if not is_valid_digest(value):
+        raise ValidationError(
+            "snapshot_digest must be a lowercase 64-character hexadecimal string"
+        )
+    return value
+
+
+def _validate_canonical_specification_member(
+    member: CanonicalSpecificationMember,
+) -> None:
+    if type(member) is not CanonicalSpecificationMember:
+        raise ValidationError("member must be a CanonicalSpecificationMember")
+    validate_path_token(member.member_key, label="specification member key")
+    decoded_row = decode_specification_row(member.row.canonical_bytes)
+    if (
+        decoded_row != member.row
+        or decoded_row.canonical_bytes != member.row.canonical_bytes
+    ):
+        raise ValidationError(
+            "specification member does not match its canonical row bytes"
+        )
+
+
+def _validate_targeted_specification_member(
+    conn: sqlite3.Connection,
+    *,
+    context: str,
+    snapshot_digest: str,
+    member: CanonicalSpecificationMember,
+) -> None:
+    snapshot_digest = _validate_specification_snapshot_digest(snapshot_digest)
+    _validate_canonical_specification_member(member)
+    parent = conn.execute(
+        """
+        SELECT context
+        FROM specification_snapshots
+        WHERE snapshot_digest = ?
+        """,
+        (snapshot_digest,),
+    ).fetchone()
+    if parent is None:
+        raise ValidationError(f"unknown specification snapshot: {snapshot_digest}")
+    if parent["context"] != context:
+        raise ValidationError("specification snapshot context does not match")
+
+    stored_member = conn.execute(
+        """
+        SELECT row_digest, disposition, exclusion_reason
+        FROM specification_members
+        WHERE snapshot_digest = ? AND member_key = ?
+        """,
+        (snapshot_digest, member.member_key),
+    ).fetchone()
+    expected_member = (
+        member.row.row_digest,
+        member.disposition,
+        member.exclusion_reason,
+    )
+    if stored_member is None:
+        raise ValidationError(
+            f"unknown specification member: {member.member_key}"
+        )
+    if tuple(stored_member) != expected_member:
+        raise ValidationError(
+            "stored specification member projection is inconsistent"
+        )
+
+    stored_results = tuple(
+        tuple(row)
+        for row in conn.execute(
+            """
+            SELECT role, step_name, output_name, address
+            FROM specification_expected_results
+            WHERE snapshot_digest = ? AND member_key = ?
+            ORDER BY role, address, step_name, output_name
+            """,
+            (snapshot_digest, member.member_key),
+        )
+    )
+    expected_results = tuple(
+        (
+            result.role,
+            result.step_name,
+            result.output_name,
+            result.address,
+        )
+        for result in member.expected_results
+    )
+    if stored_results != expected_results:
+        raise ValidationError(
+            "stored specification expected-result projection is inconsistent"
+        )
+
+
+def _validate_specification_attempt_ref(attempt: SpecificationAttemptRef) -> None:
+    if type(attempt) is not SpecificationAttemptRef:
+        raise ValidationError("attempt must be a SpecificationAttemptRef")
+    _validate_positive_id(attempt.attempt_id, label="specification attempt id")
+    validate_path_token(attempt.context, label="specification attempt context")
+    _validate_specification_snapshot_digest(attempt.snapshot_digest)
+    validate_path_token(
+        attempt.member_key,
+        label="specification attempt member key",
+    )
+
+
+def _validate_specification_failure_diagnostic(
+    diagnostic: SpecificationFailureDiagnostic,
+) -> tuple[str, str]:
+    if type(diagnostic) is not SpecificationFailureDiagnostic:
+        raise ValidationError(
+            "diagnostic must be a SpecificationFailureDiagnostic"
+        )
+    if type(diagnostic.stage) is not str or diagnostic.stage not in {
+        "planning",
+        "execution",
+        "acceptance",
+    }:
+        raise ValidationError("specification failure stage is invalid")
+    if type(diagnostic.summary) is not str:
+        raise ValidationError("specification failure summary must be a string")
+    summary = diagnostic.summary.strip()
+    if not summary:
+        raise ValidationError("specification failure summary cannot be blank")
+    if len(summary) > 4096:
+        raise ValidationError(
+            "specification failure summary cannot exceed 4096 characters"
+        )
+    return diagnostic.stage, summary
+
+
+def _read_specification_attempt(
+    conn: sqlite3.Connection,
+    *,
+    attempt: SpecificationAttemptRef,
+    member: CanonicalSpecificationMember,
+) -> sqlite3.Row:
+    if attempt.member_key != member.member_key:
+        raise ValidationError("specification attempt member does not match")
+    row = conn.execute(
+        """
+        SELECT attempt_id, snapshot_digest, member_key, started_at,
+               finished_at, outcome, selecting_run_id,
+               failure_stage, failure_summary
+        FROM specification_member_attempts
+        WHERE attempt_id = ?
+        """,
+        (attempt.attempt_id,),
+    ).fetchone()
+    if row is None:
+        raise ValidationError(
+            f"unknown specification attempt: {attempt.attempt_id}"
+        )
+    if (row["snapshot_digest"], row["member_key"]) != (
+        attempt.snapshot_digest,
+        attempt.member_key,
+    ):
+        raise ValidationError("specification attempt reference does not match")
+    _validate_stored_specification_attempt(row)
+    return row
+
+
+def _validate_stored_specification_attempt(row: sqlite3.Row) -> None:
+    started_at = row["started_at"]
+    if type(started_at) is not str or not started_at.strip():
+        raise ValidationError("stored specification attempt is malformed")
+    outcome = row["outcome"]
+    finished_at = row["finished_at"]
+    selecting_run_id = row["selecting_run_id"]
+    failure_stage = row["failure_stage"]
+    failure_summary = row["failure_summary"]
+    if outcome is None:
+        if any(
+            value is not None
+            for value in (
+                finished_at,
+                selecting_run_id,
+                failure_stage,
+                failure_summary,
+            )
+        ):
+            raise ValidationError("stored specification attempt is malformed")
+        return
+    if type(finished_at) is not str or not finished_at.strip():
+        raise ValidationError("stored specification attempt is malformed")
+    if outcome in {"partial", "complete"}:
+        _validate_positive_id(
+            selecting_run_id,
+            label="specification selecting run id",
+        )
+        if failure_stage is not None or failure_summary is not None:
+            raise ValidationError("stored specification attempt is malformed")
+        return
+    if outcome != "failed":
+        raise ValidationError("stored specification attempt is malformed")
+    if selecting_run_id is not None:
+        _validate_positive_id(
+            selecting_run_id,
+            label="specification selecting run id",
+        )
+    _validate_specification_failure_diagnostic(
+        SpecificationFailureDiagnostic(
+            stage=failure_stage,
+            summary=failure_summary,
+        )
+    )
+
+
+def _require_unresolved_specification_attempt(
+    conn: sqlite3.Connection,
+    *,
+    row: sqlite3.Row,
+) -> None:
+    if row["outcome"] is not None:
+        raise ValidationError("specification attempt is already terminal")
+    result_count = int(
+        conn.execute(
+            """
+            SELECT COUNT(*)
+            FROM specification_attempt_results
+            WHERE attempt_id = ?
+            """,
+            (row["attempt_id"],),
+        ).fetchone()[0]
+    )
+    if result_count != 0:
+        raise ValidationError(
+            "unresolved specification attempt already has result memberships"
+        )
+
+
+def _validate_specification_acceptance_state(
+    conn: sqlite3.Connection,
+    *,
+    context: str,
+    workflow_name: str,
+    selected_step_name: str,
+    selected_output_name: str,
+    intent: SpecificationAcceptanceIntent,
+) -> tuple[str, str] | None:
+    if type(intent) is not SpecificationAcceptanceIntent:
+        raise ValidationError(
+            "specification_acceptance must be a SpecificationAcceptanceIntent"
+        )
+    context = validate_path_token(context, label="context")
+    workflow_name = validate_path_token(workflow_name, label="workflow name")
+    selected_step_name = validate_path_token(
+        selected_step_name,
+        label="selected step name",
+    )
+    selected_output_name = validate_path_token(
+        selected_output_name,
+        label="selected output name",
+    )
+    attempt = intent.attempt
+    member = intent.member
+    _validate_specification_attempt_ref(attempt)
+    if attempt.context != context:
+        raise ValidationError("specification attempt context does not match")
+    _validate_targeted_specification_member(
+        conn,
+        context=context,
+        snapshot_digest=attempt.snapshot_digest,
+        member=member,
+    )
+    if member.disposition != "included":
+        raise ValidationError(
+            "excluded specification member cannot be accepted"
+        )
+    row = _read_specification_attempt(
+        conn,
+        attempt=attempt,
+        member=member,
+    )
+    _require_unresolved_specification_attempt(conn, row=row)
+
+    effective = member.row.effective_declaration
+    if workflow_name != member.row.workflow_selector:
+        raise ValidationError("specification member workflow does not match")
+    if (selected_step_name, selected_output_name) != (
+        effective.target_step_name,
+        effective.target_output_name,
+    ):
+        raise ValidationError("specification member target does not match")
+    if not member.expected_results or any(
+        result.step_name != effective.target_step_name
+        for result in member.expected_results
+    ):
+        raise ValidationError(
+            "specification member results must be siblings on its target step"
+        )
+    if intent.failure is None:
+        return None
+    return _validate_specification_failure_diagnostic(intent.failure)
+
+
+def _insert_specification_attempt_results(
+    conn: sqlite3.Connection,
+    *,
+    context: str,
+    workflow_name: str,
+    intent: SpecificationAcceptanceIntent,
+    accepted_memberships: dict[tuple[str, str, str, str, str], int],
+) -> int:
+    resolved_count = 0
+    for descriptor in intent.member.expected_results:
+        artifact_id = accepted_memberships.get(
+            (
+                context,
+                workflow_name,
+                descriptor.step_name,
+                descriptor.output_name,
+                descriptor.address,
+            )
+        )
+        if artifact_id is None:
+            continue
+        conn.execute(
+            """
+            INSERT INTO specification_attempt_results (
+                attempt_id, snapshot_digest, member_key,
+                role, address, artifact_id
+            )
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                intent.attempt.attempt_id,
+                intent.attempt.snapshot_digest,
+                intent.attempt.member_key,
+                descriptor.role,
+                descriptor.address,
+                artifact_id,
+            ),
+        )
+        resolved_count += 1
+    return resolved_count
+
+
+def _terminalize_specification_attempt(
+    conn: sqlite3.Connection,
+    *,
+    intent: SpecificationAcceptanceIntent,
+    run_id: int,
+    finished_at: str,
+    resolved_count: int,
+    failure: tuple[str, str] | None,
+) -> None:
+    expected_count = len(intent.member.expected_results)
+    if expected_count <= 0 or not 0 <= resolved_count <= expected_count:
+        raise ValidationError("specification result count is invalid")
+    if resolved_count == 0:
+        outcome = "failed"
+    elif resolved_count < expected_count:
+        outcome = "partial"
+    else:
+        outcome = "complete"
+
+    if outcome == "failed":
+        if failure is None or failure[0] != "execution":
+            raise ValidationError(
+                "zero-result specification acceptance requires an execution failure"
+            )
+        failure_stage, failure_summary = failure
+    else:
+        if failure is not None:
+            raise ValidationError(
+                "accepted specification results cannot include a failure diagnostic"
+            )
+        failure_stage = None
+        failure_summary = None
+
+    _validate_positive_id(run_id, label="specification selecting run id")
+    cursor = conn.execute(
+        """
+        UPDATE specification_member_attempts
+        SET finished_at = ?, outcome = ?, selecting_run_id = ?,
+            failure_stage = ?, failure_summary = ?
+        WHERE attempt_id = ?
+          AND snapshot_digest = ?
+          AND member_key = ?
+          AND outcome IS NULL
+          AND finished_at IS NULL
+          AND selecting_run_id IS NULL
+          AND failure_stage IS NULL
+          AND failure_summary IS NULL
+        """,
+        (
+            finished_at,
+            outcome,
+            run_id,
+            failure_stage,
+            failure_summary,
+            intent.attempt.attempt_id,
+            intent.attempt.snapshot_digest,
+            intent.attempt.member_key,
+        ),
+    )
+    if cursor.rowcount != 1:
+        raise ValidationError("specification attempt could not be terminalized")
+
+
+def _invoke_specification_fault(
+    fault_hook: Callable[[str], None] | None,
+    checkpoint: str,
+) -> None:
+    if fault_hook is not None:
+        fault_hook(checkpoint)
+
+
 def _count_rows(
     conn: sqlite3.Connection,
     table: str,
@@ -5726,7 +6396,7 @@ def _connect_readwrite_existing(path: Path) -> Iterator[sqlite3.Connection]:
         if conn.in_transaction:
             conn.rollback()
         raise ValidationError(
-            f"could not persist specification snapshot: {exc}"
+            f"could not persist specification state: {exc}"
         ) from exc
     finally:
         conn.close()
