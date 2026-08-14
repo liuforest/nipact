@@ -14,6 +14,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+      - run: git diff --check HEAD^1 HEAD
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
@@ -48,24 +51,91 @@ jobs:
         run: python -m build --sdist --wheel
       - name: Twine metadata check
         run: python -m twine check dist/*
-      - name: Inspect wheel contents
+      - name: Inspect distribution contents
         run: |
           python - <<'PY'
-          import glob, zipfile
-          wheels = glob.glob('dist/*.whl')
-          assert len(wheels) == 1, f"expected one wheel, found {wheels}"
-          names = zipfile.ZipFile(wheels[0]).namelist()
-          banned = [
-              n for n in names
-              if '.local/' in n
-              or 'node_modules/' in n
-              or '__pycache__/' in n
-              or n.endswith('.pyc')
-          ]
-          assert not banned, f"banned entries in wheel: {banned[:20]}"
-          assert any(n.startswith('nipact/gui/static/') for n in names), \
-              "wheel is missing nipact/gui/static assets"
-          print(f"wheel ok: {len(names)} entries")
+          from pathlib import Path
+          import subprocess
+          import tarfile
+          import zipfile
+
+          sdists = list(Path('dist').glob('*.tar.gz'))
+          wheels = list(Path('dist').glob('*.whl'))
+          assert len(sdists) == len(wheels) == 1, (sdists, wheels)
+          required_modules = {
+              f'nipact/{name}.py' for name in (
+                  '__init__', 'cli', 'execution', 'registry',
+                  'specification_adapter', 'specification_canonical',
+                  'specification_compiler', 'specification_config',
+                  'specification_execution', 'specification_loading',
+              )
+          }
+          tracked_payload = {
+              path.removeprefix('src/')
+              for path in subprocess.check_output(
+                  ['git', 'ls-files', '--', 'src/nipact'], text=True
+              ).splitlines()
+              if path.endswith('.py')
+              or path.startswith('src/nipact/gui/static/')
+          }
+          assert required_modules <= tracked_payload
+
+          with tarfile.open(sdists[0]) as archive:
+              raw_sdist = [member.name for member in archive.getmembers() if member.isfile()]
+          roots = {name.split('/', 1)[0] for name in raw_sdist}
+          assert len(roots) == 1, roots
+          root = roots.pop()
+          sdist = {name.removeprefix(f'{root}/') for name in raw_sdist}
+          with zipfile.ZipFile(wheels[0]) as archive:
+              wheel = {name for name in archive.namelist() if not name.endswith('/')}
+
+          cache_parts = {
+              '.cache', '.hypothesis', '.mypy_cache', '.pytest_cache',
+              '.ruff_cache', '__pycache__', 'node_modules',
+          }
+          for label, names, prefix in (
+              ('sdist', sdist, 'src/'),
+              ('wheel', wheel, ''),
+          ):
+              payload = {
+                  name.removeprefix(prefix)
+                  for name in names
+                  if name.startswith(f'{prefix}nipact/')
+                  and (
+                      name.endswith('.py')
+                      or name.startswith(f'{prefix}nipact/gui/static/')
+                  )
+              }
+              assert payload == tracked_payload, (
+                  label,
+                  sorted(tracked_payload - payload),
+                  sorted(payload - tracked_payload),
+              )
+              assert f'{prefix}nipact/gui/static/index.html' in names
+              assert any(
+                  name.startswith(f'{prefix}nipact/gui/static/assets/')
+                  for name in names
+              )
+              banned = [
+                  name for name in names
+                  if name.split('/')[0] in {'.local', 'tests'}
+                  or cache_parts.intersection(name.split('/'))
+                  or name.endswith(('.pyc', '.pyo'))
+              ]
+              assert not banned, (label, banned[:20])
+
+          assert {'LICENSE', 'MANIFEST.in', 'README.md', 'pyproject.toml'} <= sdist
+          dist_info = {name.split('/', 1)[0] for name in wheel if '.dist-info/' in name}
+          assert len(dist_info) == 1, dist_info
+          metadata = dist_info.pop()
+          assert {
+              f'{metadata}/METADATA',
+              f'{metadata}/RECORD',
+              f'{metadata}/WHEEL',
+              f'{metadata}/entry_points.txt',
+              f'{metadata}/licenses/LICENSE',
+          } <= wheel
+          print(f'distributions ok: {len(sdist)} sdist files, {len(wheel)} wheel files')
           PY
       - name: Installed-wheel smoke test
         run: |
@@ -87,3 +157,91 @@ jobs:
           nipact workflow run --context colors --workflow base --step color_sector_analysis --dry-run
           nipact workflow run --context colors --workflow base --step color_sector_analysis --cores 1
           nipact trace --context colors --workflow base --step color_sector_analysis --output sector_counts --address cohort
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          import subprocess
+          import yaml
+
+          project = Path('demos/colors/project')
+          (project / 'specifications').mkdir()
+          specification = {
+              'schema': 'nipact/specification-set/v1',
+              'specification_set': {'key': 'installed-wheel-smoke'},
+              'libraries': [],
+              'fixed': {
+                  'workflow': 'base',
+                  'target': {'step': 'color_sector_analysis', 'output': 'sector_counts'},
+                  'results': {
+                      'sector_counts': {
+                          'step': 'color_sector_analysis', 'output': 'sector_counts',
+                      },
+                  },
+              },
+              'members': [{
+                  'key': 'member-000001',
+                  'decision_coordinates': {'case': 'baseline'},
+                  'disposition': 'included',
+              }],
+              'expected_counts': {'candidates': 1, 'included': 1, 'excluded': 0},
+          }
+          (project / 'specifications/installed-wheel-smoke.yaml').write_text(
+              yaml.safe_dump(specification, sort_keys=False), encoding='utf-8'
+          )
+          config_path = project / 'nipact.yaml'
+          config = yaml.safe_load(config_path.read_text(encoding='utf-8'))
+          config['specifications'] = {
+              'installed-wheel-smoke': 'specifications/installed-wheel-smoke.yaml'
+          }
+          config_path.write_text(yaml.safe_dump(config, sort_keys=False), encoding='utf-8')
+          base = ['--project-dir', str(project), '--context', 'colors']
+
+          def invoke(*args):
+              output = subprocess.check_output(['nipact', *args, *base], text=True)
+              return json.loads(output)
+
+          counts = {'candidates': 1, 'included': 1, 'excluded': 0}
+          preview = invoke('specifications', 'preview', 'installed-wheel-smoke')
+          assert preview['schema'] == 'nipact/specification-preview/v1'
+          assert preview['persistence_performed'] is False
+          assert preview['counts'] == counts
+          digest = preview['snapshot_digest']
+          assert isinstance(digest, str) and len(digest) == 64
+
+          frozen = invoke('specifications', 'freeze', 'installed-wheel-smoke')
+          assert frozen == {
+              'schema': 'nipact/specification-freeze/v1',
+              'context': 'colors',
+              'snapshot_digest': digest,
+              'status': 'inserted',
+              'counts': counts,
+          }
+          run = invoke('specifications', 'run', digest, '--all', '--cores', '1')
+          assert run['schema'] == 'nipact/specification-run/v1'
+          assert run['snapshot_digest'] == digest
+          assert len(run['reached_members']) == 1
+          reached = run['reached_members'][0]
+          assert reached['outcome'] == 'complete'
+          ordinary = reached['ordinary_outcome']
+          assert (
+              ordinary['published_outputs'], ordinary['selected_fresh_outputs'],
+              ordinary['selected_reused_outputs'], ordinary['all_selected_resolved'],
+          ) == (0, 0, 1, True)
+
+          results = invoke('specifications', 'results', digest)
+          assert results['schema'] == 'nipact/specification-results/v1'
+          assert results['snapshot_digest'] == digest
+          assert tuple(map(len, (
+              results['members'], results['attempts'], results['results'],
+          ))) == (1, 1, 1)
+          attempt = results['attempts'][0]
+          result = results['results'][0]
+          assert attempt['attempt_id'] == reached['attempt_id']
+          assert attempt['outcome'] == 'complete'
+          assert isinstance(attempt['selecting_run_id'], int)
+          assert isinstance(result['artifact_id'], int)
+          assert isinstance(result['producing_run_id'], int)
+          assert result['producing_run_id'] != attempt['selecting_run_id']
+          assert results['result_source_basis']
+          print('installed-wheel specification reuse smoke ok')
+          PY
