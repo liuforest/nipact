@@ -1,6 +1,7 @@
 import json
 import os
 import sqlite3
+from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -2473,6 +2474,305 @@ def test_staging_replacement_after_prepare_is_rejected_before_move(
         ("uppercase_text", "sub_001", "upstream materialization failed"),
     )
     assert not list((runtime_dir / "outputs/v1").rglob("*.json"))
+
+
+def test_public_real_execution_acquires_one_lock_before_already_locked_seam(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project_dir, runtime_dir = _write_tiny_non_colors_project(tmp_path, monkeypatch)
+    run_plan = build_run_plan(
+        project_dir=project_dir,
+        context="mini",
+        workflow_name="main",
+        step_name="uppercase_text",
+        address="sub_001",
+    )
+    callback_events: list[str] = []
+    callback = callback_events.append
+    expected = execution_module.RunOutcome(
+        published_count=0,
+        selected_generated_count=0,
+        selected_reused_count=0,
+        failed_jobs=(),
+        all_selected_resolved=True,
+    )
+    real_lock = execution_module.acquire_mutating_runtime_lock
+    acquired_roots: list[Path] = []
+    seam_calls: list[tuple[object, int, object]] = []
+    active_depth = 0
+    maximum_depth = 0
+
+    @contextmanager
+    def counting_lock(runtime_root: Path):
+        nonlocal active_depth, maximum_depth
+        acquired_roots.append(runtime_root)
+        if active_depth:
+            pytest.fail("public execution nested the runtime lock")
+        with real_lock(runtime_root):
+            active_depth += 1
+            maximum_depth = max(maximum_depth, active_depth)
+            try:
+                yield
+            finally:
+                active_depth -= 1
+
+    def sentinel_seam(
+        received_plan: object,
+        *,
+        cores: int,
+        status_callback: object,
+    ) -> object:
+        assert active_depth == 1
+        seam_calls.append((received_plan, cores, status_callback))
+        return expected
+
+    monkeypatch.setattr(
+        execution_module,
+        "acquire_mutating_runtime_lock",
+        counting_lock,
+    )
+    monkeypatch.setattr(
+        execution_module,
+        "_execute_run_plan_already_locked",
+        sentinel_seam,
+    )
+
+    actual = execute_run_plan(run_plan, cores=3, status_callback=callback)
+
+    assert actual is expected
+    assert acquired_roots == [runtime_dir]
+    assert maximum_depth == 1
+    assert active_depth == 0
+    assert len(seam_calls) == 1
+    forwarded_plan, forwarded_cores, forwarded_callback = seam_calls[0]
+    assert forwarded_plan is run_plan
+    assert forwarded_cores == 3
+    assert forwarded_callback is callback
+
+    def unexpected_call(*_args: object, **_kwargs: object) -> object:
+        pytest.fail("invalid public input reached real execution")
+
+    monkeypatch.setattr(
+        execution_module,
+        "acquire_mutating_runtime_lock",
+        unexpected_call,
+    )
+    monkeypatch.setattr(
+        execution_module,
+        "_execute_run_plan_already_locked",
+        unexpected_call,
+    )
+    with pytest.raises(ValidationError, match="run plan must be a StructuralRunPlan"):
+        execute_run_plan(object())  # type: ignore[arg-type]
+
+
+def test_already_locked_seam_executes_compact_real_plan_without_nested_lock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project_dir, runtime_dir = _write_tiny_non_colors_project(tmp_path, monkeypatch)
+    run_plan = build_run_plan(
+        project_dir=project_dir,
+        context="mini",
+        workflow_name="main",
+        step_name="uppercase_text",
+        address="sub_001",
+    )
+
+    def run_every_job(executable_plan: object, **_kwargs: object) -> int:
+        run_plan_path = executable_plan.run_workspace / "run_plan.json"
+        for job in executable_plan.jobs:
+            run_job(run_plan_path=run_plan_path, job_id=job.job_id)
+        return 0
+
+    def unexpected_lock(*_args: object, **_kwargs: object) -> object:
+        pytest.fail("already-locked execution attempted nested lock acquisition")
+
+    monkeypatch.setattr(execution_module, "_run_snakemake", run_every_job)
+    monkeypatch.setattr(
+        execution_module,
+        "acquire_mutating_runtime_lock",
+        unexpected_lock,
+    )
+    events: list[str] = []
+
+    with acquire_mutating_runtime_lock(runtime_dir):
+        outcome = execution_module._execute_run_plan_already_locked(
+            run_plan,
+            cores=1,
+            status_callback=events.append,
+        )
+
+    assert outcome.published_count == 2
+    assert outcome.selected_generated_count == 1
+    assert outcome.selected_reused_count == 0
+    assert outcome.all_selected_resolved is True
+    assert events == [
+        "sources_new:1",
+        "sources_changed:0",
+        "sources_unchanged:0",
+        "building_workspace",
+        "starting_snakemake",
+        "snakemake_complete",
+        "publishing_outputs",
+        "registry_updated",
+    ]
+
+    with sqlite3.connect(runtime_dir / "database/registry.db") as conn:
+        source_rows = conn.execute(
+            "SELECT path FROM artifacts WHERE origin = 'source' ORDER BY path"
+        ).fetchall()
+        workflow_rows = conn.execute(
+            """
+            SELECT step_name, output_name, address
+            FROM artifacts
+            WHERE origin = 'workflow_output'
+            ORDER BY step_name, output_name, address
+            """
+        ).fetchall()
+        dependency_rows = conn.execute(
+            """
+            SELECT dependent.step_name, dependent.output_name, dependent.address,
+                   dependency.binding_name, dependency.dependency_role,
+                   source.origin, source.step_name, source.output_name, source.address
+            FROM artifact_dependencies AS dependency
+            JOIN artifacts AS dependent
+              ON dependent.artifact_id = dependency.dependent_artifact_id
+            JOIN artifacts AS source
+              ON source.artifact_id = dependency.source_artifact_id
+            ORDER BY dependent.step_name, dependent.output_name, dependent.address
+            """
+        ).fetchall()
+        published_rows = conn.execute(
+            """
+            SELECT step_name, output_name, address, path
+            FROM published_outputs
+            ORDER BY step_name, output_name, address
+            """
+        ).fetchall()
+        workflow_run_count = conn.execute(
+            "SELECT COUNT(*) FROM workflow_runs"
+        ).fetchone()[0]
+        specification_counts = {
+            table: conn.execute(f'SELECT COUNT(*) FROM "{table}"').fetchone()[0]
+            for table in (
+                "specification_snapshots",
+                "specification_members",
+                "specification_snapshot_manifest_values",
+                "specification_expected_results",
+                "specification_member_attempts",
+                "specification_attempt_results",
+            )
+        }
+
+    assert source_rows == [("data/source/sub_001.txt",)]
+    assert workflow_rows == [
+        ("source_text", "raw_text", "sub_001"),
+        ("uppercase_text", "upper_text", "sub_001"),
+    ]
+    assert dependency_rows == [
+        (
+            "source_text",
+            "raw_text",
+            "sub_001",
+            "source_text",
+            "source_input",
+            "source",
+            None,
+            None,
+            None,
+        ),
+        (
+            "uppercase_text",
+            "upper_text",
+            "sub_001",
+            "raw_text",
+            "source_input",
+            "workflow_output",
+            "source_text",
+            "raw_text",
+            "sub_001",
+        ),
+    ]
+    assert [row[:3] for row in published_rows] == workflow_rows
+    assert workflow_run_count == 1
+    assert set(specification_counts.values()) == {0}
+    assert len(published_rows) == 2
+    assert all((runtime_dir / row[3]).is_file() for row in published_rows)
+    canonical_files = {
+        path.relative_to(runtime_dir).as_posix()
+        for path in (runtime_dir / "outputs/v1").rglob("*")
+        if path.is_file()
+    }
+    assert canonical_files == {row[3] for row in published_rows}
+    assert all(
+        not output.staging_path.exists()
+        for job in run_plan.jobs
+        for output in job.outputs.values()
+    )
+
+
+def test_public_dry_run_routes_forecast_without_lock_or_real_seam(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project_dir, _runtime_dir = _write_tiny_non_colors_project(tmp_path, monkeypatch)
+    run_plan = build_run_plan(
+        project_dir=project_dir,
+        context="mini",
+        workflow_name="main",
+        step_name="uppercase_text",
+        address="sub_001",
+        dry_run=True,
+    )
+    callback_events: list[str] = []
+    callback = callback_events.append
+    expected = execution_module.RunOutcome(
+        published_count=0,
+        selected_generated_count=0,
+        selected_reused_count=0,
+        failed_jobs=(),
+        all_selected_resolved=True,
+    )
+    lower_calls: list[tuple[object, int, object]] = []
+
+    def unexpected_call(*_args: object, **_kwargs: object) -> object:
+        pytest.fail("dry-run routing reached real execution")
+
+    def sentinel_lower(
+        received_plan: object,
+        *,
+        cores: int,
+        status_callback: object,
+    ) -> object:
+        lower_calls.append((received_plan, cores, status_callback))
+        return expected
+
+    monkeypatch.setattr(
+        execution_module,
+        "acquire_mutating_runtime_lock",
+        unexpected_call,
+    )
+    monkeypatch.setattr(
+        execution_module,
+        "_execute_run_plan_already_locked",
+        unexpected_call,
+    )
+    monkeypatch.setattr(
+        execution_module,
+        "_execute_executable_run_plan",
+        sentinel_lower,
+    )
+
+    actual = execute_run_plan(run_plan, cores=4, status_callback=callback)
+
+    assert actual is expected
+    assert len(lower_calls) == 1
+    forwarded_forecast, forwarded_cores, forwarded_callback = lower_calls[0]
+    assert forwarded_forecast is run_plan.forecast
+    assert forwarded_cores == 4
+    assert forwarded_callback is callback
 
 
 def test_runtime_lock_remains_held_through_publication_finalize(
