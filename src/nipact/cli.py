@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import argparse
+from collections.abc import Mapping, Sequence as PresentationSequence
+from dataclasses import fields, is_dataclass
 import json
 from importlib.metadata import PackageNotFoundError, metadata, version
 import os
@@ -179,6 +181,76 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_project_context_args(registry_migrate_parser)
 
+    specifications_parser = subparsers.add_parser(
+        "specifications",
+        help="preview, freeze, run, or inspect specification snapshots",
+        description="Work with immutable NIPACT specification snapshots.",
+    )
+    specifications_subparsers = specifications_parser.add_subparsers(
+        dest="specifications_command",
+        metavar="specifications-command",
+        required=True,
+    )
+
+    specifications_preview_parser = specifications_subparsers.add_parser(
+        "preview",
+        help="compile a specification snapshot without persisting it",
+        description="Compile and display a specification snapshot without persisting it.",
+    )
+    _add_specification_source_args(specifications_preview_parser)
+    _add_project_context_args(specifications_preview_parser)
+
+    specifications_freeze_parser = specifications_subparsers.add_parser(
+        "freeze",
+        help="freeze an immutable specification snapshot",
+        description="Compile and freeze an immutable specification snapshot.",
+    )
+    _add_specification_source_args(specifications_freeze_parser)
+    _add_project_context_args(specifications_freeze_parser)
+
+    specifications_run_parser = specifications_subparsers.add_parser(
+        "run",
+        help="run frozen specification members",
+        description="Run selected members from an immutable specification snapshot.",
+    )
+    specifications_run_parser.add_argument(
+        "snapshot_digest",
+        metavar="full-snapshot-digest",
+        help="Full digest of the frozen specification snapshot.",
+    )
+    specifications_run_selection = (
+        specifications_run_parser.add_mutually_exclusive_group(required=True)
+    )
+    specifications_run_selection.add_argument(
+        "--member",
+        help="Included specification member key to run.",
+    )
+    specifications_run_selection.add_argument(
+        "--all",
+        action="store_true",
+        dest="all_members",
+        help="Run all included members in canonical order.",
+    )
+    _add_project_context_args(specifications_run_parser)
+    specifications_run_parser.add_argument(
+        "--cores",
+        type=_positive_int,
+        default=1,
+        help="Number of Snakemake cores to use. Default: 1.",
+    )
+
+    specifications_results_parser = specifications_subparsers.add_parser(
+        "results",
+        help="read exact results for a frozen specification snapshot",
+        description="Read exact normalized results for a frozen specification snapshot.",
+    )
+    specifications_results_parser.add_argument(
+        "snapshot_digest",
+        metavar="full-snapshot-digest",
+        help="Full digest of the frozen specification snapshot.",
+    )
+    _add_project_context_args(specifications_results_parser)
+
     workflow_parser = subparsers.add_parser(
         "workflow",
         help="work with declared workflows",
@@ -279,6 +351,23 @@ def _add_project_context_args(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def _add_specification_source_args(parser: argparse.ArgumentParser) -> None:
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument(
+        "registered_specification_key",
+        nargs="?",
+        metavar="registered-specification-key",
+        help="Registered specification key.",
+    )
+    source.add_argument(
+        "--file",
+        type=Path,
+        dest="specification_file",
+        metavar="PATH",
+        help="Path to an explicit strict specification member file.",
+    )
+
+
 def _add_workflow_step_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--workflow",
@@ -317,6 +406,231 @@ def _print_pass(text: str) -> None:
     from .cli_feedback import CliFeedback
 
     CliFeedback().pass_line(text)
+
+
+def _run_specifications_command(args: argparse.Namespace) -> int:
+    from .errors import ValidationError
+
+    project_dir = _resolve_project_dir_arg(args)
+    if args.specifications_command == "preview":
+        from .specification_execution import compile_specification_snapshot
+
+        compiled = compile_specification_snapshot(
+            project_dir=project_dir,
+            context=args.context,
+            source=_specification_source(args),
+        )
+        _print_json_document(_specification_preview_payload(compiled))
+        return 0
+
+    if args.specifications_command == "freeze":
+        from .specification_execution import freeze_specification_snapshot
+
+        result = freeze_specification_snapshot(
+            project_dir=project_dir,
+            context=args.context,
+            source=_specification_source(args),
+        )
+        _print_json_document(
+            {
+                "schema": "nipact/specification-freeze/v1",
+                "context": result.snapshot.context,
+                "snapshot_digest": result.snapshot.snapshot_digest,
+                "status": "inserted" if result.inserted else "verified_existing",
+                "counts": _specification_counts(result.snapshot.members),
+            }
+        )
+        return 0
+
+    if args.specifications_command == "run":
+        return _run_frozen_specification(args=args, project_dir=project_dir)
+
+    if args.specifications_command == "results":
+        from .project_context import resolve_project_context
+        from .registry import read_specification_snapshot_projections
+
+        resolved = resolve_project_context(
+            project_dir=project_dir,
+            context=args.context,
+        )
+        projections = read_specification_snapshot_projections(
+            resolved.registry_path,
+            context=resolved.context,
+            snapshot_digest=args.snapshot_digest,
+        )
+        _print_json_document(
+            {
+                "schema": "nipact/specification-results/v1",
+                "context": projections.context,
+                "snapshot_digest": projections.snapshot_digest,
+                "members": _presentation_value(projections.members),
+                "attempts": _presentation_value(projections.attempts),
+                "results": _presentation_value(projections.results),
+                "result_source_basis": _presentation_value(
+                    projections.result_source_basis
+                ),
+            }
+        )
+        return 0
+
+    raise ValidationError(
+        f"unknown specifications command: {args.specifications_command}"
+    )
+
+
+def _specification_source(args: argparse.Namespace) -> object:
+    from .specification_loading import (
+        ExplicitSpecificationSource,
+        RegisteredSpecificationSource,
+    )
+
+    if args.specification_file is not None:
+        return ExplicitSpecificationSource(path=args.specification_file)
+    return RegisteredSpecificationSource(name=args.registered_specification_key)
+
+
+def _specification_preview_payload(compiled: object) -> dict[str, Any]:
+    snapshot = compiled.snapshot
+    members = []
+    for member in snapshot.members:
+        row = json.loads(member.row.canonical_bytes)
+        if type(row) is not dict:  # pragma: no cover - canonical row invariant.
+            raise TypeError("canonical specification row must decode to an object")
+        members.append(
+            {
+                "member_key": member.member_key,
+                "disposition": member.disposition,
+                "exclusion_reason": member.exclusion_reason,
+                "row_digest": member.row.row_digest,
+                "row": row,
+                "expected_results": _presentation_value(member.expected_results),
+            }
+        )
+    return {
+        "schema": "nipact/specification-preview/v1",
+        "context": snapshot.context,
+        "specification_set": compiled.set_key,
+        "snapshot_digest": snapshot.snapshot_digest,
+        "persistence_performed": False,
+        "source_policy": "reconcile_at_attempt",
+        "counts": _specification_counts(snapshot.members),
+        "equal_effective_member_groups": _presentation_value(
+            compiled.equal_effective_member_groups
+        ),
+        "manifest_values": [
+            {
+                "value_schema": value.value_schema,
+                "manifest_digest": value.manifest_digest,
+                "entity_count": value.entity_count,
+            }
+            for value in snapshot.manifest_values
+        ],
+        "members": members,
+    }
+
+
+def _run_frozen_specification(*, args: argparse.Namespace, project_dir: Path) -> int:
+    from .specification_execution import (
+        run_all_specification_members,
+        run_specification_member,
+    )
+
+    if args.member is not None:
+        reached_members = (
+            run_specification_member(
+                project_dir=project_dir,
+                context=args.context,
+                snapshot_digest=args.snapshot_digest,
+                member_key=args.member,
+                cores=args.cores,
+            ),
+        )
+        selection = {"mode": "member", "member_key": args.member}
+        snapshot_digest = args.snapshot_digest
+    else:
+        result = run_all_specification_members(
+            project_dir=project_dir,
+            context=args.context,
+            snapshot_digest=args.snapshot_digest,
+            cores=args.cores,
+        )
+        reached_members = result.members
+        selection = {"mode": "all", "member_key": None}
+        snapshot_digest = result.snapshot_digest
+
+    payload = {
+        "schema": "nipact/specification-run/v1",
+        "context": args.context,
+        "snapshot_digest": snapshot_digest,
+        "selection": selection,
+        "cores": args.cores,
+        "reached_members": [
+            _specification_run_member_payload(member) for member in reached_members
+        ],
+    }
+    _print_json_document(payload)
+    return 0 if all(member.outcome == "complete" for member in reached_members) else 1
+
+
+def _specification_run_member_payload(member: object) -> dict[str, Any]:
+    ordinary = member.ordinary_outcome
+    return {
+        "member_key": member.attempt.member_key,
+        "attempt_id": member.attempt.attempt_id,
+        "outcome": member.outcome,
+        "ordinary_outcome": {
+            "published_outputs": ordinary.published_count,
+            "published_bytes": ordinary.published_bytes,
+            "selected_fresh_outputs": ordinary.selected_generated_count,
+            "selected_reused_outputs": ordinary.selected_reused_count,
+            "all_selected_resolved": ordinary.all_selected_resolved,
+            "failed_jobs": [
+                {
+                    "step_name": step_name,
+                    "address": address,
+                    "reason": reason,
+                }
+                for step_name, address, reason in ordinary.failed_jobs
+            ],
+            "cleanup_warnings": list(ordinary.cleanup_warnings),
+        },
+    }
+
+
+def _specification_counts(members: PresentationSequence[object]) -> dict[str, int]:
+    included = sum(member.disposition == "included" for member in members)
+    excluded = sum(member.disposition == "excluded" for member in members)
+    return {
+        "candidates": len(members),
+        "included": included,
+        "excluded": excluded,
+    }
+
+
+def _presentation_value(value: object) -> Any:
+    if value is None or type(value) in {bool, int, float, str}:
+        return value
+    if is_dataclass(value) and not isinstance(value, type):
+        return {
+            field.name: _presentation_value(getattr(value, field.name))
+            for field in fields(value)
+        }
+    if isinstance(value, Mapping):
+        converted: dict[str, Any] = {}
+        for key, item in value.items():
+            if type(key) is not str:
+                raise TypeError("presentation mapping keys must be strings")
+            converted[key] = _presentation_value(item)
+        return converted
+    if isinstance(value, PresentationSequence) and not isinstance(
+        value, (bytes, bytearray, memoryview)
+    ):
+        return [_presentation_value(item) for item in value]
+    raise TypeError(f"unsupported presentation value type: {type(value).__name__}")
+
+
+def _print_json_document(payload: Mapping[str, Any]) -> None:
+    print(json.dumps(payload, indent=2, sort_keys=True))
 
 
 def _run_workflow_command(args: argparse.Namespace) -> int | None:
@@ -822,6 +1136,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             _run_trace_command(args)
         elif args.command == "registry":
             _run_registry_command(args)
+        elif args.command == "specifications":
+            return _run_specifications_command(args)
         elif args.command == "workflow":
             return _run_workflow_command(args) or 0
         else:  # pragma: no cover - argparse enforces the command choices.

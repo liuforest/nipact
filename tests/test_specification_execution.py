@@ -27,7 +27,9 @@ from nipact.runtime import run_job
 from nipact.specification_canonical import canonicalize_specification_snapshot
 from nipact.specification_compiler import compile_specification
 from nipact.specification_execution import (
+    CompiledSpecificationSnapshot,
     SpecificationMemberRunResult,
+    compile_specification_snapshot,
     freeze_specification_snapshot,
     run_all_specification_members,
     run_specification_member,
@@ -48,16 +50,148 @@ from test_specification_registry import (
     _table_rows,
     build_entity_snapshot,
     build_snapshot,
+    configure_specification_project,
     prepare_v19,
 )
 
 
-def test_registered_and_explicit_freeze_share_identity_and_exact_replay(
+def test_compile_specification_snapshot_reports_equal_effective_members(
+    registry_v18_fixture: RegistryV18Fixture,
+) -> None:
+    fixture = registry_v18_fixture
+    specification_path = configure_specification_project(fixture)
+    payload = _specification_payload()
+    payload.pop("dimensions")
+    payload.pop("combine")
+    payload.pop("exclude")
+    payload["members"] = [
+        {
+            "key": "member-z",
+            "decision_coordinates": {"analysis_label": "z"},
+            "disposition": "included",
+            "set": [
+                {
+                    "step": "fixture_transform",
+                    "parameter": "variant",
+                    "value": "base",
+                }
+            ],
+        },
+        {
+            "key": "member-a",
+            "decision_coordinates": {"analysis_label": "a"},
+            "disposition": "included",
+        },
+    ]
+    payload["expected_counts"] = {
+        "candidates": 2,
+        "included": 2,
+        "excluded": 0,
+    }
+    specification_path.write_text(
+        yaml.safe_dump(payload, sort_keys=False),
+        encoding="utf-8",
+    )
+    assert compile_specification(payload, {}).equivalent_member_groups == ()
+
+    compiled = compile_specification_snapshot(
+        project_dir=fixture.project_dir,
+        context=fixture.context,
+        source=RegisteredSpecificationSource("compact"),
+    )
+
+    assert compiled.loaded_project.project_root == fixture.project_dir
+    assert compiled.loaded_project.runtime_root == fixture.runtime_dir
+    assert compiled.set_key == "compact-freeze"
+    assert tuple(member.member_key for member in compiled.snapshot.members) == (
+        "member-a",
+        "member-z",
+    )
+    assert compiled.equal_effective_member_groups == (("member-a", "member-z"),)
+
+
+def test_freeze_uses_one_compilation_and_exact_preflight_order(
     registry_v18_fixture: RegistryV18Fixture,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     fixture = registry_v18_fixture
-    expected = prepare_v19(fixture, route="fresh")
+    prepare_v19(fixture, route="fresh")
+    compiled = compile_specification_snapshot(
+        project_dir=fixture.project_dir,
+        context=fixture.context,
+        source=RegisteredSpecificationSource("compact"),
+    )
+    resolved = execution_module.resolve_project_context
+    resolved_context = resolved(
+        project_dir=fixture.project_dir,
+        context=fixture.context,
+    )
+    events: list[str] = []
+
+    def compile_once(**kwargs: object) -> CompiledSpecificationSnapshot:
+        events.append("compile")
+        assert kwargs == {
+            "project_dir": fixture.project_dir,
+            "context": fixture.context,
+            "source": RegisteredSpecificationSource("compact"),
+        }
+        return compiled
+
+    def resolve_once(**kwargs: object) -> object:
+        events.append("resolve")
+        assert kwargs == {
+            "project_dir": fixture.project_dir,
+            "context": fixture.context,
+        }
+        return resolved_context
+
+    @contextmanager
+    def tracked_lock(runtime_root: Path) -> Iterator[None]:
+        events.append("lock-enter")
+        assert runtime_root == fixture.runtime_dir
+        yield
+        events.append("lock-exit")
+
+    def persist_exact(
+        registry_path: Path,
+        *,
+        runtime_root: Path,
+        snapshot: object,
+    ) -> bool:
+        events.append("persist")
+        assert registry_path == fixture.registry_path
+        assert runtime_root == fixture.runtime_dir
+        assert snapshot is compiled.snapshot
+        return True
+
+    monkeypatch.setattr(execution_module, "compile_specification_snapshot", compile_once)
+    monkeypatch.setattr(execution_module, "resolve_project_context", resolve_once)
+    monkeypatch.setattr(execution_module, "acquire_mutating_runtime_lock", tracked_lock)
+    monkeypatch.setattr(
+        execution_module,
+        "insert_or_verify_specification_snapshot",
+        persist_exact,
+    )
+
+    result = freeze_specification_snapshot(
+        project_dir=fixture.project_dir,
+        context=fixture.context,
+        source=RegisteredSpecificationSource("compact"),
+    )
+
+    assert result.snapshot is compiled.snapshot
+    assert result.inserted is True
+    assert events == ["compile", "resolve", "lock-enter", "persist", "lock-exit"]
+
+
+@pytest.mark.parametrize("route", ("fresh", "migrated"))
+def test_registered_and_explicit_freeze_share_identity_and_exact_replay(
+    registry_v18_fixture: RegistryV18Fixture,
+    monkeypatch: pytest.MonkeyPatch,
+    route: str,
+) -> None:
+    fixture = registry_v18_fixture
+    expected = prepare_v19(fixture, route=route)
     specification_path = fixture.project_dir / "specifications/compact.yaml"
     scientific_source = fixture.runtime_dir / "data/source/entity_002.txt"
     before_ordinary = _ordinary_state(fixture.registry_path)
@@ -151,8 +285,7 @@ def test_compiler_failure_precedes_lock_and_registry_mutation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     fixture = registry_v18_fixture
-    prepare_v19(fixture, route="fresh")
-    specification_path = fixture.project_dir / "specifications/compact.yaml"
+    specification_path = configure_specification_project(fixture)
     invalid = _specification_payload()
     invalid["expected_counts"] = {
         "candidates": 3,
@@ -171,6 +304,7 @@ def test_compiler_failure_precedes_lock_and_registry_mutation(
         pytest.fail("invalid specification reached the mutation boundary")
 
     monkeypatch.setattr(execution_module, "acquire_mutating_runtime_lock", forbidden)
+    monkeypatch.setattr(execution_module, "resolve_project_context", forbidden)
     monkeypatch.setattr(
         execution_module,
         "insert_or_verify_specification_snapshot",

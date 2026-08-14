@@ -18,7 +18,6 @@ from .hashing import is_valid_digest
 from .identity import validate_path_token
 from .project_context import ResolvedProjectContext, resolve_project_context
 from .registry import (
-    REGISTRY_DB_PATH,
     SpecificationAcceptanceIntent,
     SpecificationAttemptOutcome,
     SpecificationAttemptRef,
@@ -32,6 +31,7 @@ from .registry import (
 )
 from .runtime_lock import acquire_mutating_runtime_lock
 from .specification_canonical import (
+    CanonicalEffectiveDeclaration,
     CanonicalSpecificationMember,
     CanonicalSpecificationSnapshot,
     canonicalize_specification_snapshot,
@@ -48,6 +48,14 @@ _ZERO_RESULT_FAILURE = SpecificationFailureDiagnostic(
     stage="execution",
     summary="ordinary execution accepted no required specification results",
 )
+
+
+@dataclass(frozen=True)
+class CompiledSpecificationSnapshot:
+    loaded_project: LoadedWorkflowProject
+    set_key: str
+    equal_effective_member_groups: tuple[tuple[str, ...], ...]
+    snapshot: CanonicalSpecificationSnapshot
 
 
 @dataclass(frozen=True)
@@ -69,13 +77,13 @@ class SpecificationRunResult:
     members: tuple[SpecificationMemberRunResult, ...]
 
 
-def freeze_specification_snapshot(
+def compile_specification_snapshot(
     *,
     project_dir: Path,
     context: str,
     source: SpecificationSource,
-) -> SpecificationFreezeResult:
-    """Compile, canonicalize, and atomically freeze one selected specification."""
+) -> CompiledSpecificationSnapshot:
+    """Compile one selected specification into a declaration-only snapshot."""
     loaded = load_specification_project(
         project_dir=project_dir,
         context=context,
@@ -89,15 +97,55 @@ def freeze_specification_snapshot(
         loaded=loaded.workflow_project,
         compilation=compilation,
     )
-    runtime_root = loaded.workflow_project.runtime_root
-    registry_path = runtime_root / REGISTRY_DB_PATH
-    with acquire_mutating_runtime_lock(runtime_root):
+    return CompiledSpecificationSnapshot(
+        loaded_project=loaded.workflow_project,
+        set_key=compilation.set_key,
+        equal_effective_member_groups=_equal_effective_member_groups(snapshot),
+        snapshot=snapshot,
+    )
+
+
+def freeze_specification_snapshot(
+    *,
+    project_dir: Path,
+    context: str,
+    source: SpecificationSource,
+) -> SpecificationFreezeResult:
+    """Compile, canonicalize, and atomically freeze one selected specification."""
+    compiled = compile_specification_snapshot(
+        project_dir=project_dir,
+        context=context,
+        source=source,
+    )
+    resolved = resolve_project_context(project_dir=project_dir, context=context)
+    _require_loaded_boundary(loaded=compiled.loaded_project, resolved=resolved)
+    with acquire_mutating_runtime_lock(resolved.runtime_root):
         inserted = insert_or_verify_specification_snapshot(
-            registry_path,
-            runtime_root=runtime_root,
-            snapshot=snapshot,
+            resolved.registry_path,
+            runtime_root=resolved.runtime_root,
+            snapshot=compiled.snapshot,
         )
-    return SpecificationFreezeResult(snapshot=snapshot, inserted=inserted)
+    return SpecificationFreezeResult(snapshot=compiled.snapshot, inserted=inserted)
+
+
+def _equal_effective_member_groups(
+    snapshot: CanonicalSpecificationSnapshot,
+) -> tuple[tuple[str, ...], ...]:
+    grouped: list[tuple[CanonicalEffectiveDeclaration, list[str]]] = []
+    for member in snapshot.members:
+        declaration = member.row.effective_declaration
+        for existing, member_keys in grouped:
+            if declaration == existing:
+                member_keys.append(member.member_key)
+                break
+        else:
+            grouped.append((declaration, [member.member_key]))
+    groups = [
+        tuple(sorted(member_keys))
+        for _declaration, member_keys in grouped
+        if len(member_keys) > 1
+    ]
+    return tuple(sorted(groups))
 
 
 def run_specification_member(
