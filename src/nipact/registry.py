@@ -36,6 +36,10 @@ from .source_authority import (
     SourceOccurrenceGuard,
     registered_source_authority_from_facts,
 )
+from .specification_canonical import (
+    CanonicalSpecificationSnapshot,
+    decode_specification_snapshot,
+)
 
 REGISTRY_DB_PATH = "database/registry.db"
 REGISTRY_SCHEMA_VERSION = 19
@@ -464,6 +468,199 @@ def initialize_prepared_demo_registry_db(
             manifests=manifests,
             manifest_paths=manifest_paths,
         )
+
+
+def insert_or_verify_specification_snapshot(
+    path: Path,
+    *,
+    runtime_root: Path,
+    snapshot: CanonicalSpecificationSnapshot,
+    _fault_hook: Callable[[str], None] | None = None,
+) -> bool:
+    """Atomically insert one canonical snapshot, or verify an exact replay."""
+    if type(snapshot) is not CanonicalSpecificationSnapshot:
+        raise ValidationError("snapshot must be a CanonicalSpecificationSnapshot")
+    decoded = decode_specification_snapshot(snapshot.canonical_bytes)
+    if decoded != snapshot:
+        raise ValidationError(
+            "specification snapshot does not match its canonical bytes"
+        )
+
+    registry_path, resolved_runtime_root = _validate_snapshot_registry_binding(
+        path,
+        runtime_root=runtime_root,
+    )
+    with _connect_readwrite_existing(registry_path) as conn:
+        _validate_schema_version(conn)
+        _validate_exact_registry_structure(
+            conn,
+            expected_version=REGISTRY_SCHEMA_VERSION,
+        )
+        _require_snapshot_context_binding(
+            conn,
+            context=snapshot.context,
+            runtime_root=resolved_runtime_root,
+        )
+
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            existing = conn.execute(
+                """
+                SELECT 1
+                FROM specification_snapshots
+                WHERE snapshot_digest = ?
+                """,
+                (snapshot.snapshot_digest,),
+            ).fetchone()
+            if existing is not None:
+                stored = _read_specification_snapshot_conn(
+                    conn,
+                    context=snapshot.context,
+                    snapshot_digest=snapshot.snapshot_digest,
+                )
+                if (
+                    stored != snapshot
+                    or stored.canonical_bytes != snapshot.canonical_bytes
+                ):
+                    raise ValidationError(
+                        "stored specification snapshot does not match exact replay"
+                    )
+                conn.rollback()
+                return False
+
+            for value in snapshot.manifest_values:
+                _insert_or_verify_snapshot_manifest_value(conn, value=value)
+            _invoke_specification_snapshot_fault(_fault_hook, "after_manifest_values")
+
+            conn.execute(
+                """
+                INSERT INTO specification_snapshots (
+                    snapshot_digest, context, canonical_bytes
+                )
+                VALUES (?, ?, ?)
+                """,
+                (
+                    snapshot.snapshot_digest,
+                    snapshot.context,
+                    snapshot.canonical_bytes,
+                ),
+            )
+            _invoke_specification_snapshot_fault(_fault_hook, "after_snapshot")
+
+            conn.executemany(
+                """
+                INSERT INTO specification_members (
+                    snapshot_digest, member_key, row_digest,
+                    disposition, exclusion_reason
+                )
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    (
+                        snapshot.snapshot_digest,
+                        member.member_key,
+                        member.row.row_digest,
+                        member.disposition,
+                        member.exclusion_reason,
+                    )
+                    for member in snapshot.members
+                ),
+            )
+            _invoke_specification_snapshot_fault(_fault_hook, "after_members")
+
+            conn.executemany(
+                """
+                INSERT INTO specification_snapshot_manifest_values (
+                    snapshot_digest, value_schema, manifest_digest
+                )
+                VALUES (?, ?, ?)
+                """,
+                (
+                    (
+                        snapshot.snapshot_digest,
+                        value.value_schema,
+                        value.manifest_digest,
+                    )
+                    for value in snapshot.manifest_values
+                ),
+            )
+            _invoke_specification_snapshot_fault(
+                _fault_hook,
+                "after_manifest_associations",
+            )
+
+            conn.executemany(
+                """
+                INSERT INTO specification_expected_results (
+                    snapshot_digest, member_key, role,
+                    step_name, output_name, address
+                )
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    (
+                        snapshot.snapshot_digest,
+                        member.member_key,
+                        result.role,
+                        result.step_name,
+                        result.output_name,
+                        result.address,
+                    )
+                    for member in snapshot.members
+                    for result in member.expected_results
+                ),
+            )
+            _invoke_specification_snapshot_fault(
+                _fault_hook,
+                "after_expected_results",
+            )
+
+            stored = _read_specification_snapshot_conn(
+                conn,
+                context=snapshot.context,
+                snapshot_digest=snapshot.snapshot_digest,
+            )
+            if stored != snapshot or stored.canonical_bytes != snapshot.canonical_bytes:
+                raise ValidationError(
+                    "persisted specification snapshot failed exact verification"
+                )
+            _invoke_specification_snapshot_fault(_fault_hook, "after_verification")
+            conn.commit()
+            return True
+        except Exception:
+            if conn.in_transaction:
+                conn.rollback()
+            raise
+
+
+def read_specification_snapshot(
+    path: Path,
+    *,
+    context: str,
+    snapshot_digest: str,
+) -> CanonicalSpecificationSnapshot:
+    """Read one immutable snapshot after verifying all normalized projections."""
+    context = validate_path_token(context, label="context")
+    if not is_valid_digest(snapshot_digest):
+        raise ValidationError(
+            "snapshot_digest must be a lowercase 64-character hexadecimal string"
+        )
+    try:
+        with _connect_readonly_rows(path) as conn:
+            _validate_schema_version(conn)
+            _validate_exact_registry_structure(
+                conn,
+                expected_version=REGISTRY_SCHEMA_VERSION,
+            )
+            return _read_specification_snapshot_conn(
+                conn,
+                context=context,
+                snapshot_digest=snapshot_digest,
+            )
+    except sqlite3.Error as exc:
+        raise ValidationError(
+            f"could not read specification snapshot: {exc}"
+        ) from exc
 
 
 def _insert_manifest_declarations(
@@ -5147,6 +5344,275 @@ def _manifest_value_from_registry_row(row: sqlite3.Row) -> ManifestValue:
     return value
 
 
+def _validate_snapshot_registry_binding(
+    path: Path,
+    *,
+    runtime_root: Path,
+) -> tuple[Path, Path]:
+    if not isinstance(path, Path):
+        raise ValidationError("registry path must be a Path")
+    if not isinstance(runtime_root, Path):
+        raise ValidationError("runtime_root must be a Path")
+
+    requested_runtime_root = runtime_root.expanduser()
+    if requested_runtime_root.is_symlink():
+        raise ValidationError("specification runtime root must be a real directory")
+    try:
+        resolved_runtime_root = requested_runtime_root.resolve(strict=True)
+    except (FileNotFoundError, OSError) as exc:
+        raise ValidationError(
+            "specification runtime root must be an existing directory"
+        ) from exc
+    if not resolved_runtime_root.is_dir():
+        raise ValidationError(
+            "specification runtime root must be an existing directory"
+        )
+
+    registry_relative_path = Path(REGISTRY_DB_PATH)
+    database_dir = resolved_runtime_root / registry_relative_path.parent
+    if database_dir.is_symlink() or not database_dir.is_dir():
+        raise ValidationError(
+            "specification registry database path must be a real directory"
+        )
+    try:
+        resolved_database_dir = database_dir.resolve(strict=True)
+    except OSError as exc:
+        raise ValidationError(
+            "specification registry database path must be a real directory"
+        ) from exc
+    if not _path_contains_or_same(resolved_runtime_root, resolved_database_dir):
+        raise ValidationError(
+            "specification registry database path must stay inside runtime_root"
+        )
+
+    expected_path = resolved_database_dir / registry_relative_path.name
+    if expected_path.is_symlink() or not expected_path.is_file():
+        raise ValidationError("specification registry path must be a real file")
+
+    requested_path = path.expanduser()
+    if requested_path.is_symlink():
+        raise ValidationError("specification registry path must be a real file")
+    if not requested_path.is_absolute():
+        requested_path = Path.cwd() / requested_path
+    try:
+        resolved_path = requested_path.parent.resolve(strict=True) / requested_path.name
+    except (FileNotFoundError, OSError) as exc:
+        raise ValidationError(
+            "specification registry path must be a real file"
+        ) from exc
+    if resolved_path != expected_path:
+        raise ValidationError("specification registry path is incompatible")
+    if not resolved_path.is_file():
+        raise ValidationError("specification registry path must be a real file")
+    return resolved_path, resolved_runtime_root
+
+
+def _require_snapshot_context_binding(
+    conn: sqlite3.Connection,
+    *,
+    context: str,
+    runtime_root: Path,
+) -> None:
+    row = conn.execute(
+        """
+        SELECT runtime_path, storage_layout_version
+        FROM contexts
+        WHERE context = ?
+        """,
+        (context,),
+    ).fetchone()
+    if row is None:
+        raise ValidationError("registry.db missing specification context row")
+    try:
+        stored_runtime_root = Path(str(row[0])).expanduser().resolve(strict=True)
+    except (FileNotFoundError, OSError) as exc:
+        raise ValidationError(
+            "registry.db specification context binding is incompatible"
+        ) from exc
+    if (
+        stored_runtime_root != runtime_root
+        or row[1] != STORAGE_LAYOUT_VERSION
+    ):
+        raise ValidationError(
+            "registry.db specification context binding is incompatible"
+        )
+
+
+def _insert_or_verify_snapshot_manifest_value(
+    conn: sqlite3.Connection,
+    *,
+    value: ManifestValue,
+) -> None:
+    row = conn.execute(
+        """
+        SELECT canonical_body, entity_count
+        FROM manifest_values
+        WHERE value_schema = ? AND manifest_digest = ?
+        """,
+        (value.value_schema, value.manifest_digest),
+    ).fetchone()
+    if row is None:
+        conn.execute(
+            """
+            INSERT INTO manifest_values (
+                value_schema, manifest_digest, canonical_body, entity_count
+            )
+            VALUES (?, ?, ?, ?)
+            """,
+            (
+                value.value_schema,
+                value.manifest_digest,
+                value.canonical_body,
+                value.entity_count,
+            ),
+        )
+        return
+    if tuple(row) != (value.canonical_body, value.entity_count):
+        raise ValidationError(
+            "registry manifest value does not match specification snapshot"
+        )
+
+
+def _read_specification_snapshot_conn(
+    conn: sqlite3.Connection,
+    *,
+    context: str,
+    snapshot_digest: str,
+) -> CanonicalSpecificationSnapshot:
+    parent = conn.execute(
+        """
+        SELECT snapshot_digest, context, canonical_bytes
+        FROM specification_snapshots
+        WHERE snapshot_digest = ?
+        """,
+        (snapshot_digest,),
+    ).fetchone()
+    if parent is None:
+        raise ValidationError(f"unknown specification snapshot: {snapshot_digest}")
+    if parent[1] != context:
+        raise ValidationError("specification snapshot context does not match")
+    canonical_bytes = parent[2]
+    if type(canonical_bytes) is not bytes:
+        raise ValidationError("specification snapshot canonical bytes must be a BLOB")
+    snapshot = decode_specification_snapshot(canonical_bytes)
+    if (
+        snapshot.snapshot_digest != parent[0]
+        or snapshot.snapshot_digest != snapshot_digest
+        or snapshot.context != parent[1]
+    ):
+        raise ValidationError(
+            "stored specification snapshot identity does not match canonical bytes"
+        )
+
+    stored_members = tuple(
+        tuple(row)
+        for row in conn.execute(
+            """
+            SELECT member_key, row_digest, disposition, exclusion_reason
+            FROM specification_members
+            WHERE snapshot_digest = ?
+            ORDER BY member_key
+            """,
+            (snapshot_digest,),
+        )
+    )
+    expected_members = tuple(
+        (
+            member.member_key,
+            member.row.row_digest,
+            member.disposition,
+            member.exclusion_reason,
+        )
+        for member in snapshot.members
+    )
+    if stored_members != expected_members:
+        raise ValidationError("stored specification member projection is inconsistent")
+
+    stored_manifest_identities = tuple(
+        tuple(row)
+        for row in conn.execute(
+            """
+            SELECT value_schema, manifest_digest
+            FROM specification_snapshot_manifest_values
+            WHERE snapshot_digest = ?
+            ORDER BY value_schema, manifest_digest
+            """,
+            (snapshot_digest,),
+        )
+    )
+    expected_manifest_identities = tuple(
+        (value.value_schema, value.manifest_digest)
+        for value in snapshot.manifest_values
+    )
+    if stored_manifest_identities != expected_manifest_identities:
+        raise ValidationError(
+            "stored specification manifest association is inconsistent"
+        )
+    for expected_value in snapshot.manifest_values:
+        stored_value = conn.execute(
+            """
+            SELECT canonical_body, entity_count
+            FROM manifest_values
+            WHERE value_schema = ? AND manifest_digest = ?
+            """,
+            (expected_value.value_schema, expected_value.manifest_digest),
+        ).fetchone()
+        if stored_value is None:
+            raise ValidationError("stored specification manifest value is missing")
+        canonical_body, entity_count = tuple(stored_value)
+        if type(canonical_body) is not str or type(entity_count) is not int:
+            raise ValidationError("stored specification manifest value is malformed")
+        value = ManifestValue(
+            value_schema=expected_value.value_schema,
+            manifest_digest=expected_value.manifest_digest,
+            canonical_body=canonical_body,
+        )
+        if value.entity_count != entity_count or value != expected_value:
+            raise ValidationError("stored specification manifest value is inconsistent")
+
+    stored_results = tuple(
+        tuple(row)
+        for row in conn.execute(
+            """
+            SELECT member_key, role, step_name, output_name, address
+            FROM specification_expected_results
+            WHERE snapshot_digest = ?
+            ORDER BY member_key, role, address, step_name, output_name
+            """,
+            (snapshot_digest,),
+        )
+    )
+    expected_results = tuple(
+        sorted(
+            (
+                (
+                    member.member_key,
+                    result.role,
+                    result.step_name,
+                    result.output_name,
+                    result.address,
+                )
+                for member in snapshot.members
+                for result in member.expected_results
+            ),
+            key=lambda row: (row[0], row[1], row[4], row[2], row[3]),
+        )
+    )
+    if stored_results != expected_results:
+        raise ValidationError(
+            "stored specification expected-result projection is inconsistent"
+        )
+    return snapshot
+
+
+def _invoke_specification_snapshot_fault(
+    fault_hook: Callable[[str], None] | None,
+    checkpoint: str,
+) -> None:
+    if fault_hook is not None:
+        fault_hook(checkpoint)
+
+
 def _count_rows(
     conn: sqlite3.Connection,
     table: str,
@@ -5238,6 +5704,30 @@ def _connect(path: Path) -> Iterator[sqlite3.Connection]:
     try:
         with conn:
             yield conn
+    finally:
+        conn.close()
+
+
+@contextmanager
+def _connect_readwrite_existing(path: Path) -> Iterator[sqlite3.Connection]:
+    conn: sqlite3.Connection | None = None
+    try:
+        uri_path = quote(path.as_posix(), safe="/")
+        conn = sqlite3.connect(f"file:{uri_path}?mode=rw", uri=True)
+        _set_foreign_keys(conn)
+    except sqlite3.Error as exc:
+        if conn is not None:
+            conn.close()
+        raise ValidationError(f"could not open database {path}: {exc}") from exc
+    conn.row_factory = sqlite3.Row
+    try:
+        yield conn
+    except sqlite3.Error as exc:
+        if conn.in_transaction:
+            conn.rollback()
+        raise ValidationError(
+            f"could not persist specification snapshot: {exc}"
+        ) from exc
     finally:
         conn.close()
 
