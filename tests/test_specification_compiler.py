@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+import math
 from pathlib import Path
 from typing import Any
 
@@ -62,6 +63,19 @@ def _parameter_values(compilation: Any, parameter: str = "alpha.value") -> list[
         for member in compilation.members
         for write in member.writes
         if isinstance(write, ParameterWrite) and write.parameter_name == parameter
+    ]
+
+
+def test_signed_zero_values_remain_distinct_and_order_deterministically() -> None:
+    compiled = compile_specification(_base_spec(values=[-0.0, 0.0]), {})
+
+    assert [
+        math.copysign(1.0, member.decision_coordinates[0].value)
+        for member in compiled.members
+    ] == [1.0, -1.0]
+    assert [member.member_key for member in compiled.members] == [
+        "member-000001",
+        "member-000002",
     ]
 
 
