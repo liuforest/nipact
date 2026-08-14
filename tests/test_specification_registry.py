@@ -3,6 +3,7 @@ from __future__ import annotations
 import shutil
 import sqlite3
 import subprocess
+from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
 from typing import Callable
@@ -40,6 +41,7 @@ from nipact.registry import (
     migrate_registry_db,
     read_specification_attempt_outcome,
     read_specification_snapshot,
+    read_specification_snapshot_projections,
     record_workflow_run,
 )
 from nipact.specification_canonical import (
@@ -1938,3 +1940,510 @@ def test_ordinary_default_bypasses_all_specification_state(
         context=fixture.context,
         snapshot_digest=snapshot.snapshot_digest,
     ) == snapshot
+
+
+def test_specification_projections_preserve_denominator_attempts_and_missing_results(
+    registry_v18_fixture: RegistryV18Fixture,
+) -> None:
+    fixture = registry_v18_fixture
+    prepare_v19(fixture, route="fresh")
+    payload = _specification_payload()
+    dimensions = payload["dimensions"]
+    assert isinstance(dimensions, dict)
+    variant = dimensions["variant"]
+    assert isinstance(variant, dict)
+    variant["values"] = ["base", "changed", "alternative"]
+    payload["expected_counts"] = {
+        "candidates": 3,
+        "included": 2,
+        "excluded": 1,
+    }
+    snapshot = build_snapshot(fixture, payload=payload)
+    assert insert_or_verify_specification_snapshot(
+        fixture.registry_path,
+        runtime_root=fixture.runtime_dir,
+        snapshot=snapshot,
+    )
+    included = tuple(
+        member for member in snapshot.members if member.disposition == "included"
+    )
+    excluded = tuple(
+        member for member in snapshot.members if member.disposition == "excluded"
+    )
+    assert len(included) == 2
+    assert len(excluded) == 1
+    member = included[0]
+
+    unresolved = _append_attempt(fixture, snapshot, member)
+    early_failed = _append_attempt(fixture, snapshot, member)
+    assert fail_specification_member_attempt(
+        fixture.registry_path,
+        runtime_root=fixture.runtime_dir,
+        attempt=early_failed,
+        member=member,
+        diagnostic=SpecificationFailureDiagnostic(
+            stage="planning",
+            summary="compact planning failure",
+        ),
+    )
+
+    transaction_failed = _append_attempt(fixture, snapshot, member)
+    upstream_artifacts, upstream_recipe, upstream_memberships = _fresh_job(
+        context=fixture.context,
+        workflow_name="base",
+        step_name="fixture_transform",
+        address="entity_001",
+        output_names=("left",),
+        selected_output_name="left",
+        token="projection-failed",
+    )
+    _record(
+        fixture,
+        token="projection-failed",
+        selected_step_name="fixture_analysis",
+        selected_output_name="summary",
+        artifacts=upstream_artifacts,
+        recipes=(upstream_recipe,),
+        memberships=upstream_memberships,
+        acceptance=SpecificationAcceptanceIntent(
+            attempt=transaction_failed,
+            member=member,
+            failure=SpecificationFailureDiagnostic(
+                stage="execution",
+                summary="no requested result survived",
+            ),
+        ),
+    )
+
+    terminal_attempts: list[SpecificationAttemptRef] = []
+    for token, accepted_outputs in (
+        ("projection-partial", frozenset({"summary"})),
+        ("projection-complete", None),
+        ("projection-repeat", None),
+    ):
+        attempt = _append_attempt(fixture, snapshot, member)
+        artifacts, recipe, memberships = _fresh_job(
+            context=fixture.context,
+            workflow_name="base",
+            step_name="fixture_analysis",
+            address="cohort",
+            output_names=("summary", "detail"),
+            selected_output_name="summary",
+            token=token,
+            accepted_outputs=accepted_outputs,
+        )
+        _record(
+            fixture,
+            token=token,
+            selected_step_name="fixture_analysis",
+            selected_output_name="summary",
+            artifacts=artifacts,
+            recipes=(recipe,),
+            resolutions=(
+                _selected_resolution(
+                    context=fixture.context,
+                    workflow_name="base",
+                    step_name="fixture_analysis",
+                    output_name="summary",
+                    address="cohort",
+                    outcome="generated",
+                ),
+            ),
+            memberships=memberships,
+            acceptance=SpecificationAcceptanceIntent(
+                attempt=attempt,
+                member=member,
+            ),
+        )
+        terminal_attempts.append(attempt)
+
+    projections = read_specification_snapshot_projections(
+        fixture.registry_path,
+        context=fixture.context,
+        snapshot_digest=snapshot.snapshot_digest,
+    )
+    assert projections.snapshot_digest == snapshot.snapshot_digest
+    assert tuple(row.member_key for row in projections.members) == tuple(
+        member.member_key for member in snapshot.members
+    )
+    assert (
+        projections.members[0].decision_coordinates
+        == snapshot.members[0].row.decision_coordinates
+    )
+    assert (
+        projections.members[0].effective_declaration
+        == snapshot.members[0].row.effective_declaration
+    )
+    assert projections.members[0].expected_results == snapshot.members[0].expected_results
+    assert not {
+        included[1].member_key,
+        excluded[0].member_key,
+    } & {attempt.member_key for attempt in projections.attempts}
+    assert tuple(attempt.attempt_id for attempt in projections.attempts) == tuple(
+        sorted(attempt.attempt_id for attempt in projections.attempts)
+    )
+    by_attempt = {
+        attempt.attempt_id: attempt for attempt in projections.attempts
+    }
+    assert by_attempt[unresolved.attempt_id].outcome is None
+    assert by_attempt[early_failed.attempt_id].failure == SpecificationFailureDiagnostic(
+        stage="planning",
+        summary="compact planning failure",
+    )
+    assert by_attempt[transaction_failed.attempt_id].outcome == "failed"
+    assert [by_attempt[value.attempt_id].outcome for value in terminal_attempts] == [
+        "partial",
+        "complete",
+        "complete",
+    ]
+    results_by_attempt: dict[int, list[object]] = {}
+    for result in projections.results:
+        results_by_attempt.setdefault(result.attempt_id, []).append(result)
+    expected_descriptor_order = tuple(
+        (
+            descriptor.role,
+            descriptor.step_name,
+            descriptor.output_name,
+            descriptor.address,
+        )
+        for descriptor in member.expected_results
+    )
+    assert all(
+        len(results_by_attempt[attempt.attempt_id]) == len(member.expected_results)
+        for attempt in projections.attempts
+    )
+    assert all(
+        tuple(
+            (result.role, result.step_name, result.output_name, result.address)
+            for result in results_by_attempt[attempt.attempt_id]
+        )
+        == expected_descriptor_order
+        for attempt in projections.attempts
+    )
+    absent_artifact_fields = (
+        "artifact_id",
+        "producing_run_id",
+        "producing_workflow_name",
+        "artifact_path",
+        "content_digest",
+        "output_hash",
+        "file_size",
+        "extension",
+        "request_bundle_digest",
+        "current_publication_path",
+    )
+    assert all(
+        all(getattr(result, field) is None for field in absent_artifact_fields)
+        for attempt in (unresolved, early_failed, transaction_failed)
+        for result in results_by_attempt[attempt.attempt_id]
+    )
+    assert {
+        result.role
+        for result in results_by_attempt[terminal_attempts[0].attempt_id]
+        if result.artifact_id is not None
+    } == {"summary"}
+    assert all(
+        all(
+            result.artifact_id is not None
+            for result in results_by_attempt[attempt.attempt_id]
+        )
+        for attempt in terminal_attempts[1:]
+    )
+
+
+def test_specification_projection_reader_is_read_only_bounded_and_v19_only(
+    registry_v18_fixture: RegistryV18Fixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = registry_v18_fixture
+    with pytest.raises(ValidationError, match=_MIGRATION_GUIDANCE):
+        read_specification_snapshot_projections(
+            fixture.registry_path,
+            context=fixture.context,
+            snapshot_digest="0" * 64,
+        )
+
+    prepare_v19(fixture, route="migrated")
+    payload = _specification_payload()
+    fixed = payload["fixed"]
+    assert isinstance(fixed, dict)
+    fixed["execution_population"] = "cohort"
+    fixed["manifest_bindings"] = []
+    fixed["target"] = {"step": "fixture_transform", "output": "left"}
+    fixed["results"] = {
+        "left": {"step": "fixture_transform", "output": "left"},
+        "right": {"step": "fixture_transform", "output": "right"},
+    }
+    snapshot = build_snapshot(fixture, payload=payload)
+    member = _persist_snapshot(fixture, snapshot)
+    memberships = _reused_memberships(
+        fixture.registry_path,
+        context=fixture.context,
+        workflow_name="base",
+        coordinates=frozenset(
+            {
+                ("fixture_transform", "left", "entity_001"),
+                ("fixture_transform", "right", "entity_001"),
+            }
+        ),
+    )
+    selected_artifact_id = next(
+        intent.existing_artifact_id
+        for intent in memberships
+        if intent.row.output_name == "left"
+    )
+    assert selected_artifact_id is not None
+
+    def record_complete_attempt(token: str) -> None:
+        attempt = _append_attempt(fixture, snapshot, member)
+        _record(
+            fixture,
+            token=token,
+            selected_step_name="fixture_transform",
+            selected_output_name="left",
+            resolutions=(
+                _selected_resolution(
+                    context=fixture.context,
+                    workflow_name="base",
+                    step_name="fixture_transform",
+                    output_name="left",
+                    address="entity_001",
+                    outcome="reused",
+                    existing_artifact_id=selected_artifact_id,
+                ),
+            ),
+            memberships=memberships,
+            acceptance=SpecificationAcceptanceIntent(
+                attempt=attempt,
+                member=member,
+            ),
+        )
+
+    record_complete_attempt("projection-bounded-0")
+    original_connect = registry._connect_readonly_rows
+    statements: list[str] = []
+    connection_count = 0
+
+    @contextmanager
+    def traced_connection(path: Path):
+        nonlocal connection_count
+        connection_count += 1
+        with original_connect(path) as connection:
+            connection.set_trace_callback(statements.append)
+            yield connection
+
+    monkeypatch.setattr(registry, "_connect_readonly_rows", traced_connection)
+    first_projection = read_specification_snapshot_projections(
+        fixture.registry_path,
+        context=fixture.context,
+        snapshot_digest=snapshot.snapshot_digest,
+    )
+    assert len(first_projection.attempts) == 1
+    assert len(first_projection.results) == 2
+    assert len(first_projection.result_source_basis) == 2
+    assert connection_count == 1
+    assert sum(statement == "BEGIN" for statement in statements) == 1
+    application_reads = [
+        statement
+        for statement in statements
+        if statement.lstrip().upper().startswith(("SELECT", "WITH"))
+        and "SQLITE_MASTER" not in statement.upper()
+    ]
+    assert len(application_reads) <= 10
+    first_count = len(application_reads)
+
+    monkeypatch.setattr(registry, "_connect_readonly_rows", original_connect)
+    for index in range(1, 5):
+        record_complete_attempt(f"projection-bounded-{index}")
+    statements.clear()
+    connection_count = 0
+    monkeypatch.setattr(registry, "_connect_readonly_rows", traced_connection)
+    multiplied_projection = read_specification_snapshot_projections(
+        fixture.registry_path,
+        context=fixture.context,
+        snapshot_digest=snapshot.snapshot_digest,
+    )
+    assert len(multiplied_projection.attempts) == 5
+    assert len(multiplied_projection.results) == 10
+    assert len(multiplied_projection.result_source_basis) == 10
+    assert connection_count == 1
+    multiplied_reads = [
+        statement
+        for statement in statements
+        if statement.lstrip().upper().startswith(("SELECT", "WITH"))
+        and "SQLITE_MASTER" not in statement.upper()
+    ]
+    assert len(multiplied_reads) == first_count
+    state_before_read = _table_rows(fixture.registry_path)
+    read_specification_snapshot_projections(
+        fixture.registry_path,
+        context=fixture.context,
+        snapshot_digest=snapshot.snapshot_digest,
+    )
+    assert _table_rows(fixture.registry_path) == state_before_read
+
+
+@pytest.mark.parametrize(
+    "case",
+    ["cardinality", "artifact", "selecting-run", "producer", "cycle"],
+)
+def test_specification_projection_reader_rejects_contradictory_state(
+    registry_v18_fixture: RegistryV18Fixture,
+    case: str,
+) -> None:
+    fixture = registry_v18_fixture
+    route = "migrated" if case == "cycle" else "fresh"
+    prepare_v19(fixture, route=route)
+    payload = _specification_payload()
+    fixed = payload["fixed"]
+    assert isinstance(fixed, dict)
+    if case == "cycle":
+        fixed["results"] = {
+            "summary": {"step": "fixture_analysis", "output": "summary"}
+        }
+    snapshot = build_snapshot(fixture, payload=payload)
+    member = _persist_snapshot(fixture, snapshot)
+    attempt = _append_attempt(fixture, snapshot, member)
+
+    if case == "cycle":
+        reused = _reused_memberships(
+            fixture.registry_path,
+            context=fixture.context,
+            workflow_name="base",
+            coordinates=frozenset({("fixture_analysis", "summary", "cohort")}),
+        )
+        artifact_id = reused[0].existing_artifact_id
+        assert artifact_id is not None
+        artifacts: tuple[WorkflowOutputArtifactRow, ...] = ()
+        recipes: tuple[RetainedJobProjectionRecipe, ...] = ()
+        memberships = reused
+        resolution = _selected_resolution(
+            context=fixture.context,
+            workflow_name="base",
+            step_name="fixture_analysis",
+            output_name="summary",
+            address="cohort",
+            outcome="reused",
+            existing_artifact_id=artifact_id,
+        )
+    else:
+        artifacts, recipe, memberships = _fresh_job(
+            context=fixture.context,
+            workflow_name="base",
+            step_name="fixture_analysis",
+            address="cohort",
+            output_names=("summary", "detail"),
+            selected_output_name="summary",
+            token=f"projection-corrupt-{case}",
+        )
+        recipes = (recipe,)
+        resolution = _selected_resolution(
+            context=fixture.context,
+            workflow_name="base",
+            step_name="fixture_analysis",
+            output_name="summary",
+            address="cohort",
+            outcome="generated",
+        )
+    _record(
+        fixture,
+        token=f"projection-corrupt-{case}",
+        selected_step_name="fixture_analysis",
+        selected_output_name="summary",
+        artifacts=artifacts,
+        recipes=recipes,
+        resolutions=(resolution,),
+        memberships=memberships,
+        acceptance=SpecificationAcceptanceIntent(attempt=attempt, member=member),
+    )
+
+    with sqlite3.connect(fixture.registry_path) as connection:
+        connection.execute("PRAGMA foreign_keys = OFF")
+        if case == "cardinality":
+            connection.execute(
+                """
+                DELETE FROM specification_attempt_results
+                WHERE attempt_id = ? AND role = 'diagnostic'
+                """,
+                (attempt.attempt_id,),
+            )
+        elif case == "artifact":
+            connection.execute(
+                """
+                UPDATE specification_attempt_results
+                SET artifact_id = 999999
+                WHERE attempt_id = ?
+                """,
+                (attempt.attempt_id,),
+            )
+        elif case == "cycle":
+            result_artifact_id = connection.execute(
+                """
+                SELECT artifact_id FROM specification_attempt_results
+                WHERE attempt_id = ? AND role = 'summary'
+                """,
+                (attempt.attempt_id,),
+            ).fetchone()[0]
+            dependent_artifact_id = connection.execute(
+                """
+                SELECT dependency.source_artifact_id
+                FROM artifact_dependencies AS dependency
+                JOIN artifacts AS source
+                  ON source.artifact_id = dependency.source_artifact_id
+                WHERE dependency.dependent_artifact_id = ?
+                  AND source.origin = 'workflow_output'
+                ORDER BY dependency.source_artifact_id
+                LIMIT 1
+                """,
+                (result_artifact_id,),
+            ).fetchone()[0]
+            connection.execute(
+                """
+                INSERT INTO artifact_dependencies (
+                    dependent_artifact_id, source_artifact_id,
+                    source_content_digest, source_file_size, source_extension,
+                    input_path, binding_name, dependency_role,
+                    source_step_name, source_output_name, source_address,
+                    source_scope, source_name, source_entity_id,
+                    source_occurrence_path, manifest_value_schema,
+                    manifest_digest, edge_cardinality
+                )
+                SELECT ?, artifact_id, content_digest, file_size, extension,
+                       'outputs/test/projection-cycle.json',
+                       'projection_cycle', 'analysis_input',
+                       step_name, output_name, address,
+                       NULL, NULL, NULL, NULL, NULL, NULL, NULL
+                FROM artifacts WHERE artifact_id = ?
+                """,
+                (dependent_artifact_id, result_artifact_id),
+            )
+        elif case == "selecting-run":
+            connection.execute(
+                """
+                UPDATE workflow_runs SET workflow_name = 'other'
+                WHERE run_id = (
+                    SELECT selecting_run_id
+                    FROM specification_member_attempts
+                    WHERE attempt_id = ?
+                )
+                """,
+                (attempt.attempt_id,),
+            )
+        else:
+            connection.execute(
+                """
+                UPDATE artifacts SET workflow_name = 'other'
+                WHERE artifact_id IN (
+                    SELECT artifact_id FROM specification_attempt_results
+                    WHERE attempt_id = ?
+                )
+                """,
+                (attempt.attempt_id,),
+            )
+
+    with pytest.raises(ValidationError):
+        read_specification_snapshot_projections(
+            fixture.registry_path,
+            context=fixture.context,
+            snapshot_digest=snapshot.snapshot_digest,
+        )

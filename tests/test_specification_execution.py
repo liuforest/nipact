@@ -21,6 +21,7 @@ from nipact.registry import (
     SpecificationAttemptRef,
     insert_or_verify_specification_snapshot,
     read_specification_attempt_outcome,
+    read_specification_snapshot_projections,
 )
 from nipact.runtime import run_job
 from nipact.specification_canonical import canonicalize_specification_snapshot
@@ -570,55 +571,257 @@ def test_specification_source_change_reconciles_at_attempt(
     snapshot = build_entity_snapshot(fixture)
     member = _persist_snapshot(fixture, snapshot)
     source = fixture.runtime_dir / "data/source/entity_002.txt"
-    source.write_text("changed after freeze\n", encoding="utf-8")
-    expected_digest = sha256_file_digest(source)
+    initial_digest = sha256_file_digest(source)
     monkeypatch.setattr(
         ordinary_execution_module,
         "_run_snakemake",
         _run_jobs_in_process,
     )
 
-    result = run_specification_member(
+    first = run_specification_member(
         project_dir=fixture.project_dir,
         context=fixture.context,
         snapshot_digest=snapshot.snapshot_digest,
         member_key=member.member_key,
     )
 
-    assert result.outcome == "complete"
-    assert result.attempt.snapshot_digest == snapshot.snapshot_digest
-    source_digests = _attempt_source_digests(
-        fixture.registry_path,
-        attempt_id=result.attempt.attempt_id,
+    source.write_text("changed after freeze\n", encoding="utf-8")
+    changed_digest = sha256_file_digest(source)
+
+    second = run_specification_member(
+        project_dir=fixture.project_dir,
+        context=fixture.context,
+        snapshot_digest=snapshot.snapshot_digest,
+        member_key=member.member_key,
     )
-    assert source_digests["entity_002"] == expected_digest
-    assert set(source_digests) == {"entity_001", "entity_002"}
 
-
-def _attempt_source_digests(database: Path, *, attempt_id: int) -> dict[str, str]:
-    with sqlite3.connect(database) as connection:
-        return {
-            str(entity_id): str(content_digest)
-            for entity_id, content_digest in connection.execute(
-                """
-                WITH RECURSIVE ancestry(artifact_id) AS (
-                    SELECT artifact_id FROM specification_attempt_results
-                    WHERE attempt_id = ?
-                    UNION
-                    SELECT dependency.source_artifact_id
-                    FROM artifact_dependencies AS dependency
-                    JOIN ancestry
-                      ON dependency.dependent_artifact_id = ancestry.artifact_id
-                )
-                SELECT artifact.source_entity_id, artifact.content_digest
-                FROM artifacts AS artifact
-                JOIN ancestry USING (artifact_id)
-                WHERE artifact.origin = 'source'
-                ORDER BY artifact.source_entity_id
-                """,
-                (attempt_id,),
-            )
+    assert first.outcome == second.outcome == "complete"
+    assert first.attempt.snapshot_digest == snapshot.snapshot_digest
+    assert second.attempt.snapshot_digest == snapshot.snapshot_digest
+    assert initial_digest != changed_digest
+    projections = read_specification_snapshot_projections(
+        fixture.registry_path,
+        context=fixture.context,
+        snapshot_digest=snapshot.snapshot_digest,
+    )
+    entity_002_digests = {
+        attempt_id: {
+            basis.source_content_digest
+            for basis in projections.result_source_basis
+            if basis.attempt_id == attempt_id
+            and basis.source_entity_id == "entity_002"
         }
+        for attempt_id in (
+            first.attempt.attempt_id,
+            second.attempt.attempt_id,
+        )
+    }
+    assert entity_002_digests == {
+        first.attempt.attempt_id: {initial_digest},
+        second.attempt.attempt_id: {changed_digest},
+    }
+
+
+def test_specification_projection_preserves_cross_workflow_reuse_and_lineage(
+    registry_v18_fixture: RegistryV18Fixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = registry_v18_fixture
+    prepare_v19(fixture, route="fresh")
+    config_path = fixture.project_dir / "nipact.yaml"
+    config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    workflows = config["workflows"]
+    assert isinstance(workflows, dict)
+    for workflow_name in ("producer_alias", "consumer_alias"):
+        workflow_path = fixture.project_dir / f"workflows/{workflow_name}.yaml"
+        workflow_path.write_text(
+            yaml.safe_dump(
+                {
+                    "workflow_name": workflow_name,
+                    "base_workflow": "base",
+                    "step_overrides": {},
+                },
+                sort_keys=False,
+            ),
+            encoding="utf-8",
+        )
+        workflows[workflow_name] = f"workflows/{workflow_name}.yaml"
+    config_path.write_text(
+        yaml.safe_dump(config, sort_keys=False),
+        encoding="utf-8",
+    )
+    analysis_path = fixture.project_dir / "steps/fixture_analysis.yaml"
+    analysis = yaml.safe_load(analysis_path.read_text(encoding="utf-8"))
+    del analysis["outputs"]["detail"]
+    analysis_path.write_text(
+        yaml.safe_dump(analysis, sort_keys=False),
+        encoding="utf-8",
+    )
+
+    loaded = load_workflow_project(
+        project_dir=fixture.project_dir,
+        context=fixture.context,
+    )
+    snapshot = canonicalize_specification_snapshot(
+        loaded=loaded,
+        compilation=compile_specification(
+            {
+                "schema": "nipact/specification-set/v1",
+                "specification_set": {"key": "cross-workflow-reuse"},
+                "libraries": [],
+                "fixed": {
+                    "workflow": "consumer_alias",
+                    "target": {
+                        "step": "fixture_analysis",
+                        "output": "summary",
+                    },
+                    "results": {
+                        "summary": {
+                            "step": "fixture_analysis",
+                            "output": "summary",
+                        }
+                    },
+                },
+                "members": [
+                    {
+                        "key": "member-000001",
+                        "decision_coordinates": {"workflow": "consumer_alias"},
+                        "disposition": "included",
+                    }
+                ],
+                "expected_counts": {
+                    "candidates": 1,
+                    "included": 1,
+                    "excluded": 0,
+                },
+            },
+            {},
+        ),
+    )
+    member = _persist_snapshot(fixture, snapshot)
+    producer_plan = build_run_plan(
+        project_dir=fixture.project_dir,
+        context=fixture.context,
+        workflow_name="producer_alias",
+        step_name="fixture_analysis",
+    )
+    consumer_plan = build_run_plan(
+        project_dir=fixture.project_dir,
+        context=fixture.context,
+        workflow_name="consumer_alias",
+        step_name="fixture_analysis",
+    )
+    producer_analysis = next(
+        job for job in producer_plan.jobs if job.step_name == "fixture_analysis"
+    )
+    consumer_analysis = next(
+        job for job in consumer_plan.jobs if job.step_name == "fixture_analysis"
+    )
+    assert producer_analysis.projection_plan == consumer_analysis.projection_plan
+    assert producer_analysis.projection_state == consumer_analysis.projection_state
+    monkeypatch.setattr(
+        ordinary_execution_module,
+        "_run_snakemake",
+        _run_jobs_in_process,
+    )
+
+    producer = execute_run_plan(producer_plan)
+
+    assert producer.selected_generated_count == 1
+    with sqlite3.connect(fixture.registry_path) as connection:
+        producer_run_id, producer_artifact_id = connection.execute(
+            """
+            SELECT run.run_id, publication.artifact_id
+            FROM workflow_runs AS run
+            JOIN published_outputs AS publication
+              ON publication.context = run.context
+             AND publication.workflow_name = run.workflow_name
+            WHERE run.context = ? AND run.workflow_name = 'producer_alias'
+              AND publication.step_name = 'fixture_analysis'
+              AND publication.output_name = 'summary'
+              AND publication.address = 'cohort'
+            """,
+            (fixture.context,),
+        ).fetchone()
+    monkeypatch.setattr(
+        ordinary_execution_module,
+        "_run_snakemake",
+        lambda *_args, **_kwargs: pytest.fail(
+            "exact cross-workflow reuse ran Snakemake"
+        ),
+    )
+
+    selected = run_specification_member(
+        project_dir=fixture.project_dir,
+        context=fixture.context,
+        snapshot_digest=snapshot.snapshot_digest,
+        member_key=member.member_key,
+    )
+
+    assert selected.outcome == "complete"
+    assert selected.ordinary_outcome.selected_generated_count == 0
+    assert selected.ordinary_outcome.selected_reused_count == 1
+    projections = read_specification_snapshot_projections(
+        fixture.registry_path,
+        context=fixture.context,
+        snapshot_digest=snapshot.snapshot_digest,
+    )
+    attempt = projections.attempts[0]
+    result = projections.results[0]
+    assert attempt.selecting_run_id != producer_run_id
+    with sqlite3.connect(fixture.registry_path) as connection:
+        selecting_workflow = connection.execute(
+            "SELECT workflow_name FROM workflow_runs WHERE run_id = ?",
+            (attempt.selecting_run_id,),
+        ).fetchone()[0]
+    assert selecting_workflow == "consumer_alias"
+    assert result.artifact_id == producer_artifact_id
+    assert result.producing_run_id == producer_run_id
+    assert result.producing_workflow_name == "producer_alias"
+    assert result.current_publication_path == result.artifact_path
+    basis = tuple(
+        row
+        for row in projections.result_source_basis
+        if row.attempt_id == attempt.attempt_id
+        and row.role == result.role
+        and row.address == result.address
+    )
+    assert len(basis) == 1
+    assert basis[0].source_entity_id == "entity_001"
+    assert basis[0].source_content_digest == sha256_file_digest(
+        fixture.runtime_dir / "data/source/entity_001.txt"
+    )
+
+    with sqlite3.connect(fixture.registry_path) as connection:
+        removed = connection.execute(
+            """
+            DELETE FROM published_outputs
+            WHERE context = ? AND workflow_name = 'consumer_alias'
+              AND step_name = 'fixture_analysis'
+              AND output_name = 'summary' AND address = 'cohort'
+            """,
+            (fixture.context,),
+        )
+        assert removed.rowcount == 1
+        assert connection.execute(
+            """
+            SELECT artifact_id FROM published_outputs
+            WHERE context = ? AND workflow_name = 'producer_alias'
+              AND step_name = 'fixture_analysis'
+              AND output_name = 'summary' AND address = 'cohort'
+            """,
+            (fixture.context,),
+        ).fetchone() == (producer_artifact_id,)
+
+    after = read_specification_snapshot_projections(
+        fixture.registry_path,
+        context=fixture.context,
+        snapshot_digest=snapshot.snapshot_digest,
+    )
+    assert after == replace(
+        projections,
+        results=(replace(result, current_publication_path=None),),
+    )
 
 
 @pytest.mark.parametrize(

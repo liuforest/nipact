@@ -37,11 +37,14 @@ from .source_authority import (
     registered_source_authority_from_facts,
 )
 from .specification_canonical import (
+    CanonicalEffectiveDeclaration,
     CanonicalSpecificationMember,
     CanonicalSpecificationSnapshot,
+    ExpectedResultDescriptor,
     decode_specification_row,
     decode_specification_snapshot,
 )
+from .specification_compiler import DecisionCoordinate
 
 REGISTRY_DB_PATH = "database/registry.db"
 REGISTRY_SCHEMA_VERSION = 19
@@ -174,6 +177,75 @@ class SpecificationAttemptRef:
 class SpecificationFailureDiagnostic:
     stage: SpecificationFailureStage
     summary: str
+
+
+@dataclass(frozen=True)
+class SpecificationMemberProjection:
+    member_key: str
+    row_digest: str
+    disposition: Literal["included", "excluded"]
+    exclusion_reason: str | None
+    workflow_selector: str
+    decision_coordinates: tuple[DecisionCoordinate, ...]
+    effective_declaration: CanonicalEffectiveDeclaration
+    expected_results: tuple[ExpectedResultDescriptor, ...]
+
+
+@dataclass(frozen=True)
+class SpecificationAttemptProjection:
+    attempt_id: int
+    member_key: str
+    started_at: str
+    finished_at: str | None
+    outcome: SpecificationAttemptOutcome | None
+    selecting_run_id: int | None
+    failure: SpecificationFailureDiagnostic | None
+
+
+@dataclass(frozen=True)
+class SpecificationResultProjection:
+    attempt_id: int
+    member_key: str
+    role: str
+    step_name: str
+    output_name: str
+    address: str
+    artifact_id: int | None
+    producing_run_id: int | None
+    producing_workflow_name: str | None
+    artifact_path: str | None
+    content_digest: str | None
+    output_hash: str | None
+    file_size: int | None
+    extension: str | None
+    request_bundle_digest: str | None
+    current_publication_path: str | None
+
+
+@dataclass(frozen=True)
+class SpecificationResultSourceBasisProjection:
+    attempt_id: int
+    member_key: str
+    role: str
+    address: str
+    result_artifact_id: int
+    source_scope: Literal["global", "entity"]
+    source_name: str
+    source_entity_id: str | None
+    source_occurrence_path: str
+    source_content_digest: str
+    source_file_size: int
+    source_extension: str
+
+
+@dataclass(frozen=True)
+class SpecificationSnapshotProjections:
+    snapshot_digest: str
+    context: str
+    members: tuple[SpecificationMemberProjection, ...]
+    attempts: tuple[SpecificationAttemptProjection, ...]
+    results: tuple[SpecificationResultProjection, ...]
+    result_source_basis: tuple[SpecificationResultSourceBasisProjection, ...]
 
 
 @dataclass(frozen=True)
@@ -691,6 +763,43 @@ def read_specification_snapshot(
     except sqlite3.Error as exc:
         raise ValidationError(
             f"could not read specification snapshot: {exc}"
+        ) from exc
+
+
+def read_specification_snapshot_projections(
+    path: Path,
+    *,
+    context: str,
+    snapshot_digest: str,
+) -> SpecificationSnapshotProjections:
+    """Read normalized scientific projections for one exact frozen snapshot."""
+    context = validate_path_token(context, label="context")
+    snapshot_digest = _validate_specification_snapshot_digest(snapshot_digest)
+    try:
+        with _connect_readonly_rows(path) as conn:
+            conn.execute("BEGIN")
+            try:
+                _validate_schema_version(conn)
+                _validate_exact_registry_structure(
+                    conn,
+                    expected_version=REGISTRY_SCHEMA_VERSION,
+                )
+                snapshot = _read_specification_snapshot_conn(
+                    conn,
+                    context=context,
+                    snapshot_digest=snapshot_digest,
+                )
+                projections = _read_specification_snapshot_projections_conn(
+                    conn,
+                    snapshot=snapshot,
+                )
+            finally:
+                if conn.in_transaction:
+                    conn.rollback()
+            return projections
+    except sqlite3.Error as exc:
+        raise ValidationError(
+            f"could not read specification snapshot projections: {exc}"
         ) from exc
 
 
@@ -5861,17 +5970,23 @@ def _read_specification_snapshot_conn(
     if stored_members != expected_members:
         raise ValidationError("stored specification member projection is inconsistent")
 
-    stored_manifest_identities = tuple(
-        tuple(row)
-        for row in conn.execute(
+    stored_manifest_rows = tuple(
+        conn.execute(
             """
-            SELECT value_schema, manifest_digest
-            FROM specification_snapshot_manifest_values
-            WHERE snapshot_digest = ?
-            ORDER BY value_schema, manifest_digest
+            SELECT association.value_schema, association.manifest_digest,
+                   value.canonical_body, value.entity_count
+            FROM specification_snapshot_manifest_values AS association
+            LEFT JOIN manifest_values AS value
+              ON value.value_schema = association.value_schema
+             AND value.manifest_digest = association.manifest_digest
+            WHERE association.snapshot_digest = ?
+            ORDER BY association.value_schema, association.manifest_digest
             """,
             (snapshot_digest,),
         )
+    )
+    stored_manifest_identities = tuple(
+        (row[0], row[1]) for row in stored_manifest_rows
     )
     expected_manifest_identities = tuple(
         (value.value_schema, value.manifest_digest)
@@ -5881,18 +5996,14 @@ def _read_specification_snapshot_conn(
         raise ValidationError(
             "stored specification manifest association is inconsistent"
         )
-    for expected_value in snapshot.manifest_values:
-        stored_value = conn.execute(
-            """
-            SELECT canonical_body, entity_count
-            FROM manifest_values
-            WHERE value_schema = ? AND manifest_digest = ?
-            """,
-            (expected_value.value_schema, expected_value.manifest_digest),
-        ).fetchone()
-        if stored_value is None:
+    for expected_value, stored_row in zip(
+        snapshot.manifest_values,
+        stored_manifest_rows,
+        strict=True,
+    ):
+        canonical_body, entity_count = stored_row[2], stored_row[3]
+        if canonical_body is None or entity_count is None:
             raise ValidationError("stored specification manifest value is missing")
-        canonical_body, entity_count = tuple(stored_value)
         if type(canonical_body) is not str or type(entity_count) is not int:
             raise ValidationError("stored specification manifest value is malformed")
         value = ManifestValue(
@@ -5936,6 +6047,734 @@ def _read_specification_snapshot_conn(
             "stored specification expected-result projection is inconsistent"
         )
     return snapshot
+
+
+def _read_specification_snapshot_projections_conn(
+    conn: sqlite3.Connection,
+    *,
+    snapshot: CanonicalSpecificationSnapshot,
+) -> SpecificationSnapshotProjections:
+    members = tuple(
+        SpecificationMemberProjection(
+            member_key=member.member_key,
+            row_digest=member.row.row_digest,
+            disposition=member.disposition,  # type: ignore[arg-type]
+            exclusion_reason=member.exclusion_reason,
+            workflow_selector=member.row.workflow_selector,
+            decision_coordinates=member.row.decision_coordinates,
+            effective_declaration=member.row.effective_declaration,
+            expected_results=member.expected_results,
+        )
+        for member in snapshot.members
+    )
+    members_by_key = {member.member_key: member for member in snapshot.members}
+    if len(members_by_key) != len(snapshot.members):
+        raise ValidationError("stored specification members are duplicated")
+    for member in snapshot.members:
+        if not member.row.effective_declaration.steps or not member.expected_results:
+            raise ValidationError("stored specification member is incomplete")
+
+    attempts, attempt_members = _read_specification_attempt_projections(
+        conn,
+        snapshot=snapshot,
+        members_by_key=members_by_key,
+    )
+    result_facts = _read_specification_result_facts(
+        conn,
+        snapshot=snapshot,
+        attempt_members=attempt_members,
+    )
+    current_publications = _read_specification_current_publications(
+        conn,
+        snapshot=snapshot,
+        attempt_members=attempt_members,
+        result_facts=result_facts,
+    )
+
+    results: list[SpecificationResultProjection] = []
+    for attempt in attempts:
+        member = attempt_members[attempt.attempt_id]
+        resolved_count = 0
+        for descriptor in member.expected_results:
+            key = (attempt.attempt_id, descriptor.role, descriptor.address)
+            facts = result_facts.get(key)
+            if facts is None:
+                results.append(
+                    SpecificationResultProjection(
+                        attempt_id=attempt.attempt_id,
+                        member_key=attempt.member_key,
+                        role=descriptor.role,
+                        step_name=descriptor.step_name,
+                        output_name=descriptor.output_name,
+                        address=descriptor.address,
+                        artifact_id=None,
+                        producing_run_id=None,
+                        producing_workflow_name=None,
+                        artifact_path=None,
+                        content_digest=None,
+                        output_hash=None,
+                        file_size=None,
+                        extension=None,
+                        request_bundle_digest=None,
+                        current_publication_path=None,
+                    )
+                )
+                continue
+            resolved_count += 1
+            results.append(
+                SpecificationResultProjection(
+                    attempt_id=facts.attempt_id,
+                    member_key=facts.member_key,
+                    role=facts.role,
+                    step_name=facts.step_name,
+                    output_name=facts.output_name,
+                    address=facts.address,
+                    artifact_id=facts.artifact_id,
+                    producing_run_id=facts.producing_run_id,
+                    producing_workflow_name=facts.producing_workflow_name,
+                    artifact_path=facts.artifact_path,
+                    content_digest=facts.content_digest,
+                    output_hash=facts.output_hash,
+                    file_size=facts.file_size,
+                    extension=facts.extension,
+                    request_bundle_digest=facts.request_bundle_digest,
+                    current_publication_path=current_publications.get(key),
+                )
+            )
+        _validate_specification_projection_cardinality(
+            outcome=attempt.outcome,
+            resolved_count=resolved_count,
+            expected_count=len(member.expected_results),
+        )
+
+    result_tuple = tuple(results)
+    return SpecificationSnapshotProjections(
+        snapshot_digest=snapshot.snapshot_digest,
+        context=snapshot.context,
+        members=members,
+        attempts=attempts,
+        results=result_tuple,
+        result_source_basis=_read_specification_result_source_basis(
+            conn,
+            snapshot=snapshot,
+            results=result_tuple,
+        ),
+    )
+
+
+def _read_specification_attempt_projections(
+    conn: sqlite3.Connection,
+    *,
+    snapshot: CanonicalSpecificationSnapshot,
+    members_by_key: dict[str, CanonicalSpecificationMember],
+) -> tuple[
+    tuple[SpecificationAttemptProjection, ...],
+    dict[int, CanonicalSpecificationMember],
+]:
+    rows = conn.execute(
+        """
+        SELECT attempt.attempt_id, attempt.snapshot_digest, attempt.member_key,
+               attempt.started_at, attempt.finished_at, attempt.outcome,
+               attempt.selecting_run_id, attempt.failure_stage,
+               attempt.failure_summary,
+               selecting.run_id AS joined_selecting_run_id,
+               selecting.context AS selecting_context,
+               selecting.workflow_name AS selecting_workflow_name,
+               selecting.selected_step_name AS selecting_step_name,
+               selecting.selected_output_name AS selecting_output_name
+        FROM specification_member_attempts AS attempt
+        LEFT JOIN workflow_runs AS selecting
+          ON selecting.run_id = attempt.selecting_run_id
+        WHERE attempt.snapshot_digest = ?
+        ORDER BY attempt.member_key, attempt.attempt_id
+        """,
+        (snapshot.snapshot_digest,),
+    ).fetchall()
+    projections: list[SpecificationAttemptProjection] = []
+    attempt_members: dict[int, CanonicalSpecificationMember] = {}
+    for row in rows:
+        attempt_id = row["attempt_id"]
+        _validate_positive_id(attempt_id, label="specification attempt id")
+        member_key = _require_specification_projection_text(
+            row["member_key"],
+            label="specification attempt member key",
+        )
+        member = members_by_key.get(member_key)
+        if (
+            member is None
+            or member.disposition != "included"
+            or row["snapshot_digest"] != snapshot.snapshot_digest
+        ):
+            raise ValidationError("stored specification attempt is inconsistent")
+        if attempt_id in attempt_members:
+            raise ValidationError("stored specification attempt is duplicated")
+        _validate_stored_specification_attempt(row)
+
+        selecting_run_id = row["selecting_run_id"]
+        if selecting_run_id is None:
+            if any(
+                row[name] is not None
+                for name in (
+                    "joined_selecting_run_id",
+                    "selecting_context",
+                    "selecting_workflow_name",
+                    "selecting_step_name",
+                    "selecting_output_name",
+                )
+            ):
+                raise ValidationError("stored specification selecting run is malformed")
+        else:
+            _validate_positive_id(
+                selecting_run_id,
+                label="specification selecting run id",
+            )
+            target = member.row.effective_declaration
+            if (
+                row["joined_selecting_run_id"] != selecting_run_id
+                or row["selecting_context"] != snapshot.context
+                or row["selecting_workflow_name"] != member.row.workflow_selector
+                or row["selecting_step_name"] != target.target_step_name
+                or row["selecting_output_name"] != target.target_output_name
+            ):
+                raise ValidationError(
+                    "stored specification selecting run is inconsistent"
+                )
+
+        failure = None
+        if row["outcome"] == "failed":
+            failure = SpecificationFailureDiagnostic(
+                stage=row["failure_stage"],
+                summary=row["failure_summary"],
+            )
+        projection = SpecificationAttemptProjection(
+            attempt_id=attempt_id,
+            member_key=member_key,
+            started_at=row["started_at"],
+            finished_at=row["finished_at"],
+            outcome=row["outcome"],
+            selecting_run_id=selecting_run_id,
+            failure=failure,
+        )
+        projections.append(projection)
+        attempt_members[attempt_id] = member
+    return tuple(projections), attempt_members
+
+
+def _read_specification_result_facts(
+    conn: sqlite3.Connection,
+    *,
+    snapshot: CanonicalSpecificationSnapshot,
+    attempt_members: dict[int, CanonicalSpecificationMember],
+) -> dict[tuple[int, str, str], SpecificationResultProjection]:
+    rows = conn.execute(
+        """
+        SELECT result.attempt_id, result.snapshot_digest, result.member_key,
+               result.role, result.address,
+               attempt.attempt_id AS joined_attempt_id,
+               attempt.snapshot_digest AS joined_attempt_snapshot_digest,
+               attempt.member_key AS joined_attempt_member_key,
+               expected.member_key AS expected_member_key,
+               expected.role AS expected_role,
+               expected.step_name AS expected_step_name,
+               expected.output_name AS expected_output_name,
+               expected.address AS expected_address,
+               result.artifact_id AS selected_artifact_id,
+               artifact.artifact_id AS joined_artifact_id,
+               artifact.origin AS artifact_origin,
+               artifact.run_id AS artifact_run_id,
+               artifact.context AS artifact_context,
+               artifact.workflow_name AS artifact_workflow_name,
+               artifact.step_name AS artifact_step_name,
+               artifact.output_name AS artifact_output_name,
+               artifact.address AS artifact_address,
+               artifact.path AS artifact_path,
+               artifact.is_published AS artifact_is_published,
+               artifact.published_path AS artifact_published_path,
+               artifact.content_digest AS artifact_content_digest,
+               artifact.output_hash AS artifact_output_hash,
+               artifact.file_size AS artifact_file_size,
+               artifact.extension AS artifact_extension,
+               artifact.request_bundle_digest AS artifact_request_bundle_digest,
+               producing.run_id AS joined_producing_run_id,
+               producing.context AS producing_context,
+               producing.workflow_name AS producing_workflow_name
+        FROM specification_attempt_results AS result
+        LEFT JOIN specification_member_attempts AS attempt
+          ON attempt.attempt_id = result.attempt_id
+         AND attempt.snapshot_digest = result.snapshot_digest
+         AND attempt.member_key = result.member_key
+        LEFT JOIN specification_expected_results AS expected
+          ON expected.snapshot_digest = result.snapshot_digest
+         AND expected.member_key = result.member_key
+         AND expected.role = result.role
+         AND expected.address = result.address
+        LEFT JOIN artifacts AS artifact
+          ON artifact.artifact_id = result.artifact_id
+        LEFT JOIN workflow_runs AS producing
+          ON producing.run_id = artifact.run_id
+        WHERE result.snapshot_digest = ?
+        ORDER BY result.member_key, result.attempt_id,
+                 result.role, result.address
+        """,
+        (snapshot.snapshot_digest,),
+    ).fetchall()
+    facts: dict[tuple[int, str, str], SpecificationResultProjection] = {}
+    descriptors_by_member = {
+        member.member_key: {
+            (descriptor.role, descriptor.address): descriptor
+            for descriptor in member.expected_results
+        }
+        for member in attempt_members.values()
+    }
+    for row in rows:
+        attempt_id = row["attempt_id"]
+        member = attempt_members.get(attempt_id)
+        if (
+            member is None
+            or row["member_key"] != member.member_key
+            or row["joined_attempt_id"] != attempt_id
+            or row["joined_attempt_snapshot_digest"] != snapshot.snapshot_digest
+            or row["joined_attempt_member_key"] != member.member_key
+        ):
+            raise ValidationError("stored specification result attempt is inconsistent")
+        role = row["role"]
+        address = row["address"]
+        descriptor = descriptors_by_member[member.member_key].get((role, address))
+        if descriptor is None or (
+            row["snapshot_digest"] != snapshot.snapshot_digest
+            or row["expected_member_key"] != member.member_key
+            or row["expected_role"] != descriptor.role
+            or row["expected_step_name"] != descriptor.step_name
+            or row["expected_output_name"] != descriptor.output_name
+            or row["expected_address"] != descriptor.address
+        ):
+            raise ValidationError("stored specification result descriptor is inconsistent")
+
+        artifact_id = row["selected_artifact_id"]
+        producing_run_id = row["artifact_run_id"]
+        _validate_positive_id(artifact_id, label="specification result artifact id")
+        _validate_positive_id(
+            producing_run_id,
+            label="specification result producing run id",
+        )
+        if (
+            row["joined_artifact_id"] != artifact_id
+            or row["artifact_origin"] != "workflow_output"
+            or row["artifact_context"] != snapshot.context
+            or row["artifact_step_name"] != descriptor.step_name
+            or row["artifact_output_name"] != descriptor.output_name
+            or row["artifact_address"] != descriptor.address
+            or row["artifact_is_published"] != 1
+            or row["artifact_path"] != row["artifact_published_path"]
+            or row["joined_producing_run_id"] != producing_run_id
+            or row["producing_context"] != snapshot.context
+            or row["artifact_workflow_name"] != row["producing_workflow_name"]
+        ):
+            raise ValidationError("stored specification result artifact is inconsistent")
+
+        artifact_path = _require_specification_projection_text(
+            row["artifact_path"],
+            label="specification result artifact path",
+        )
+        producing_workflow_name = _require_specification_projection_text(
+            row["producing_workflow_name"],
+            label="specification result producing workflow",
+        )
+        content_digest = row["artifact_content_digest"]
+        request_bundle_digest = row["artifact_request_bundle_digest"]
+        if not is_valid_digest(content_digest) or not is_valid_digest(
+            request_bundle_digest
+        ):
+            raise ValidationError("stored specification result digest is invalid")
+        try:
+            output_hash = validate_hash_alias(row["artifact_output_hash"])
+        except ValidationError as exc:
+            raise ValidationError(
+                "stored specification result hash is invalid"
+            ) from exc
+        if output_hash != short_hash(content_digest):
+            raise ValidationError("stored specification result hash is inconsistent")
+        file_size = row["artifact_file_size"]
+        if type(file_size) is not int or file_size < 0:
+            raise ValidationError("stored specification result file size is invalid")
+        extension = _require_specification_projection_text(
+            row["artifact_extension"],
+            label="specification result extension",
+        )
+        key = (attempt_id, descriptor.role, descriptor.address)
+        if key in facts:
+            raise ValidationError("stored specification result membership is duplicated")
+        facts[key] = SpecificationResultProjection(
+            attempt_id=attempt_id,
+            member_key=member.member_key,
+            role=descriptor.role,
+            step_name=descriptor.step_name,
+            output_name=descriptor.output_name,
+            address=descriptor.address,
+            artifact_id=artifact_id,
+            producing_run_id=producing_run_id,
+            producing_workflow_name=producing_workflow_name,
+            artifact_path=artifact_path,
+            content_digest=content_digest,
+            output_hash=output_hash,
+            file_size=file_size,
+            extension=extension,
+            request_bundle_digest=request_bundle_digest,
+            current_publication_path=None,
+        )
+    return facts
+
+
+def _read_specification_current_publications(
+    conn: sqlite3.Connection,
+    *,
+    snapshot: CanonicalSpecificationSnapshot,
+    attempt_members: dict[int, CanonicalSpecificationMember],
+    result_facts: dict[tuple[int, str, str], SpecificationResultProjection],
+) -> dict[tuple[int, str, str], str]:
+    rows = conn.execute(
+        """
+        SELECT result.attempt_id, result.role, result.address,
+               result.artifact_id AS selected_artifact_id,
+               publication.context AS publication_context,
+               publication.workflow_name AS publication_workflow_name,
+               publication.step_name AS publication_step_name,
+               publication.output_name AS publication_output_name,
+               publication.address AS publication_address,
+               publication.path AS publication_path,
+               publication.output_digest AS publication_digest,
+               publication.output_hash AS publication_hash,
+               publication.artifact_id AS publication_artifact_id
+        FROM specification_member_attempts AS attempt
+        JOIN specification_attempt_results AS result
+          ON result.attempt_id = attempt.attempt_id
+         AND result.snapshot_digest = attempt.snapshot_digest
+         AND result.member_key = attempt.member_key
+        JOIN specification_expected_results AS expected
+          ON expected.snapshot_digest = result.snapshot_digest
+         AND expected.member_key = result.member_key
+         AND expected.role = result.role
+         AND expected.address = result.address
+        JOIN workflow_runs AS selecting
+          ON selecting.run_id = attempt.selecting_run_id
+        LEFT JOIN published_outputs AS publication
+          ON publication.context = selecting.context
+         AND publication.workflow_name = selecting.workflow_name
+         AND publication.step_name = expected.step_name
+         AND publication.output_name = expected.output_name
+         AND publication.address = expected.address
+         AND publication.artifact_id = result.artifact_id
+        WHERE attempt.snapshot_digest = ?
+        ORDER BY result.attempt_id, result.role, result.address
+        """,
+        (snapshot.snapshot_digest,),
+    ).fetchall()
+    current: dict[tuple[int, str, str], str] = {}
+    for row in rows:
+        key = (row["attempt_id"], row["role"], row["address"])
+        facts = result_facts.get(key)
+        member = attempt_members.get(row["attempt_id"])
+        if facts is None or member is None:
+            raise ValidationError("stored specification publication seed is inconsistent")
+        if row["publication_artifact_id"] is None:
+            continue
+        if (
+            row["publication_context"] != snapshot.context
+            or row["publication_workflow_name"] != member.row.workflow_selector
+            or row["publication_step_name"] != facts.step_name
+            or row["publication_output_name"] != facts.output_name
+            or row["publication_address"] != facts.address
+            or row["selected_artifact_id"] != facts.artifact_id
+            or row["publication_artifact_id"] != facts.artifact_id
+            or row["publication_path"] != facts.artifact_path
+            or row["publication_digest"] != facts.content_digest
+            or row["publication_hash"] != facts.output_hash
+        ):
+            raise ValidationError("stored current specification publication is inconsistent")
+        if key in current:
+            raise ValidationError("stored current specification publication is duplicated")
+        current[key] = _require_specification_projection_text(
+            row["publication_path"],
+            label="specification publication path",
+        )
+    return current
+
+
+def _read_specification_result_source_basis(
+    conn: sqlite3.Connection,
+    *,
+    snapshot: CanonicalSpecificationSnapshot,
+    results: tuple[SpecificationResultProjection, ...],
+) -> tuple[SpecificationResultSourceBasisProjection, ...]:
+    rows = conn.execute(
+        """
+        WITH RECURSIVE reachable(artifact_id) AS (
+            SELECT DISTINCT result.artifact_id
+            FROM specification_member_attempts AS attempt
+            JOIN specification_attempt_results AS result
+              ON result.attempt_id = attempt.attempt_id
+             AND result.snapshot_digest = attempt.snapshot_digest
+             AND result.member_key = attempt.member_key
+            WHERE attempt.snapshot_digest = ?
+            UNION
+            SELECT dependency.source_artifact_id
+            FROM reachable
+            JOIN artifact_dependencies AS dependency
+              ON dependency.dependent_artifact_id = reachable.artifact_id
+        )
+        SELECT dependency.dependent_artifact_id,
+               dependency.source_artifact_id,
+               dependency.source_content_digest,
+               dependency.source_file_size,
+               dependency.source_extension,
+               dependency.source_step_name,
+               dependency.source_output_name,
+               dependency.source_address,
+               dependency.source_scope,
+               dependency.source_name,
+               dependency.source_entity_id,
+               dependency.source_occurrence_path,
+               dependent.artifact_id AS joined_dependent_artifact_id,
+               dependent.origin AS dependent_origin,
+               dependent.context AS dependent_context,
+               source.artifact_id AS joined_source_artifact_id,
+               source.origin AS source_origin,
+               source.context AS source_context,
+               source.step_name AS source_artifact_step_name,
+               source.output_name AS source_artifact_output_name,
+               source.address AS source_artifact_address,
+               source.content_digest AS source_artifact_content_digest,
+               source.file_size AS source_artifact_file_size,
+               source.extension AS source_artifact_extension,
+               source.source_scope AS source_artifact_scope,
+               source.source_name AS source_artifact_name,
+               source.source_entity_id AS source_artifact_entity_id
+        FROM reachable
+        JOIN artifact_dependencies AS dependency
+          ON dependency.dependent_artifact_id = reachable.artifact_id
+        LEFT JOIN artifacts AS dependent
+          ON dependent.artifact_id = dependency.dependent_artifact_id
+        LEFT JOIN artifacts AS source
+          ON source.artifact_id = dependency.source_artifact_id
+        ORDER BY dependency.dependent_artifact_id,
+                 dependency.source_artifact_id,
+                 dependency.input_path,
+                 dependency.binding_name
+        """,
+        (snapshot.snapshot_digest,),
+    ).fetchall()
+
+    adjacency: dict[int, list[tuple[str, sqlite3.Row]]] = {}
+    for row in rows:
+        dependent_id = row["dependent_artifact_id"]
+        source_id = row["source_artifact_id"]
+        _validate_positive_id(dependent_id, label="dependent artifact id")
+        _validate_positive_id(source_id, label="source artifact id")
+        if (
+            row["joined_dependent_artifact_id"] != dependent_id
+            or row["dependent_origin"] != "workflow_output"
+            or row["dependent_context"] != snapshot.context
+            or row["joined_source_artifact_id"] != source_id
+            or row["source_context"] != snapshot.context
+        ):
+            raise ValidationError(
+                "stored specification dependency edge is inconsistent"
+            )
+
+        digest = row["source_content_digest"]
+        file_size = row["source_file_size"]
+        extension = row["source_extension"]
+        if (
+            not is_valid_digest(digest)
+            or type(file_size) is not int
+            or file_size < 0
+            or type(extension) is not str
+            or not extension.strip()
+        ):
+            raise ValidationError(
+                "stored specification dependency snapshot is malformed"
+            )
+
+        workflow_coordinate = (
+            row["source_step_name"],
+            row["source_output_name"],
+            row["source_address"],
+        )
+        source_coordinate = (
+            row["source_scope"],
+            row["source_name"],
+            row["source_entity_id"],
+            row["source_occurrence_path"],
+        )
+        if all(value is None for value in source_coordinate):
+            if not all(
+                type(value) is str and bool(value.strip())
+                for value in workflow_coordinate
+            ):
+                raise ValidationError(
+                    "stored workflow dependency coordinate is malformed"
+                )
+            if (
+                row["source_origin"] != "workflow_output"
+                or row["source_artifact_step_name"] != workflow_coordinate[0]
+                or row["source_artifact_output_name"] != workflow_coordinate[1]
+                or row["source_artifact_address"] != workflow_coordinate[2]
+                or row["source_artifact_content_digest"] != digest
+                or row["source_artifact_file_size"] != file_size
+                or row["source_artifact_extension"] != extension
+            ):
+                raise ValidationError(
+                    "stored workflow dependency snapshot is inconsistent"
+                )
+            edge_kind = "workflow"
+        elif all(value is None for value in workflow_coordinate):
+            scope, name, entity_id, occurrence_path = source_coordinate
+            if (
+                scope not in {"global", "entity"}
+                or type(name) is not str
+                or not name.strip()
+                or type(occurrence_path) is not str
+                or not occurrence_path.strip()
+                or (scope == "global" and entity_id is not None)
+                or (
+                    scope == "entity"
+                    and (type(entity_id) is not str or not entity_id.strip())
+                )
+                or row["source_origin"] != "source"
+                or row["source_artifact_scope"] != scope
+                or row["source_artifact_name"] != name
+                or row["source_artifact_entity_id"] != entity_id
+            ):
+                raise ValidationError(
+                    "stored direct-source dependency snapshot is inconsistent"
+                )
+            edge_kind = "source"
+        else:
+            raise ValidationError("stored specification dependency kind is malformed")
+        adjacency.setdefault(dependent_id, []).append((edge_kind, row))
+
+    basis_rows: list[SpecificationResultSourceBasisProjection] = []
+    basis_by_artifact: dict[
+        int,
+        set[tuple[str, str, str | None, str, str, int, str]],
+    ] = {}
+    for result in results:
+        if result.artifact_id is None:
+            continue
+        identities = basis_by_artifact.get(result.artifact_id)
+        if identities is None:
+            identities = _collect_specification_source_basis(
+                root_artifact_id=result.artifact_id,
+                adjacency=adjacency,
+            )
+            basis_by_artifact[result.artifact_id] = identities
+        for identity in sorted(
+            identities,
+            key=lambda value: (
+                value[0],
+                value[1],
+                value[2] or "",
+                value[3],
+                value[4],
+                value[5],
+                value[6],
+            ),
+        ):
+            (
+                source_scope,
+                source_name,
+                source_entity_id,
+                source_occurrence_path,
+                source_content_digest,
+                source_file_size,
+                source_extension,
+            ) = identity
+            basis_rows.append(
+                SpecificationResultSourceBasisProjection(
+                    attempt_id=result.attempt_id,
+                    member_key=result.member_key,
+                    role=result.role,
+                    address=result.address,
+                    result_artifact_id=result.artifact_id,
+                    source_scope=source_scope,  # type: ignore[arg-type]
+                    source_name=source_name,
+                    source_entity_id=source_entity_id,
+                    source_occurrence_path=source_occurrence_path,
+                    source_content_digest=source_content_digest,
+                    source_file_size=source_file_size,
+                    source_extension=source_extension,
+                )
+            )
+    return tuple(basis_rows)
+
+
+def _collect_specification_source_basis(
+    *,
+    root_artifact_id: int,
+    adjacency: dict[int, list[tuple[str, sqlite3.Row]]],
+) -> set[tuple[str, str, str | None, str, str, int, str]]:
+    identities: set[tuple[str, str, str | None, str, str, int, str]] = set()
+    visiting: set[int] = set()
+    finished: set[int] = set()
+    stack: list[tuple[int, bool]] = [(root_artifact_id, False)]
+    while stack:
+        artifact_id, leaving = stack.pop()
+        if leaving:
+            visiting.remove(artifact_id)
+            finished.add(artifact_id)
+            continue
+        if artifact_id in finished:
+            continue
+        if artifact_id in visiting:
+            raise ValidationError("stored specification dependency graph has a cycle")
+        visiting.add(artifact_id)
+        stack.append((artifact_id, True))
+        for edge_kind, row in reversed(adjacency.get(artifact_id, [])):
+            if edge_kind == "source":
+                identities.add(
+                    (
+                        row["source_scope"],
+                        row["source_name"],
+                        row["source_entity_id"],
+                        row["source_occurrence_path"],
+                        row["source_content_digest"],
+                        row["source_file_size"],
+                        row["source_extension"],
+                    )
+                )
+                continue
+            source_id = row["source_artifact_id"]
+            if source_id in visiting:
+                raise ValidationError(
+                    "stored specification dependency graph has a cycle"
+                )
+            if source_id not in finished:
+                stack.append((source_id, False))
+    return identities
+
+
+def _validate_specification_projection_cardinality(
+    *,
+    outcome: SpecificationAttemptOutcome | None,
+    resolved_count: int,
+    expected_count: int,
+) -> None:
+    if outcome is None or outcome == "failed":
+        valid = resolved_count == 0
+    elif outcome == "partial":
+        valid = 0 < resolved_count < expected_count
+    else:
+        valid = resolved_count == expected_count
+    if not valid:
+        raise ValidationError(
+            "stored specification attempt result count is inconsistent"
+        )
+
+
+def _require_specification_projection_text(value: object, *, label: str) -> str:
+    if type(value) is not str or not value.strip():
+        raise ValidationError(f"stored {label} is malformed")
+    return value
 
 
 def _invoke_specification_snapshot_fault(
