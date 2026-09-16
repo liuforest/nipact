@@ -1442,13 +1442,17 @@ def record_workflow_run(
                             intent=specification_acceptance,
                         )
                     )
-                _delete_current_run_scope(
-                    conn,
-                    context=context,
-                    workflow_name=workflow_name,
-                    selected_step_name=selected_step_name,
-                    selected_output_name=selected_output_name,
-                )
+                # A specification member is one point in a frozen member space,
+                # not a new preferred realization of the declared workflow. It
+                # records lineage without disturbing ordinary membership.
+                if specification_acceptance is None:
+                    _delete_current_run_scope(
+                        conn,
+                        context=context,
+                        workflow_name=workflow_name,
+                        selected_step_name=selected_step_name,
+                        selected_output_name=selected_output_name,
+                    )
                 run_id = _insert_workflow_run(
                     conn,
                     context=context,
@@ -1467,6 +1471,7 @@ def record_workflow_run(
                         environment_observation
                     ),
                     created_at=now,
+                    is_current=specification_acceptance is None,
                 )
                 if specification_acceptance is not None:
                     _invoke_specification_fault(_fault_hook, "after_workflow_run")
@@ -1526,15 +1531,22 @@ def record_workflow_run(
                         run_id=run_id,
                         row=execution_population,
                     )
-                _delete_published_output_coordinates(
-                    conn,
-                    rows=tuple(intent.row for intent in membership_rows),
-                )
-                accepted_memberships = _insert_memberships(
-                    conn,
-                    intents=membership_rows,
-                    artifact_ids=artifact_ids,
-                )
+                if specification_acceptance is None:
+                    _delete_published_output_coordinates(
+                        conn,
+                        rows=tuple(intent.row for intent in membership_rows),
+                    )
+                    accepted_memberships = _insert_memberships(
+                        conn,
+                        intents=membership_rows,
+                        artifact_ids=artifact_ids,
+                    )
+                else:
+                    accepted_memberships = _resolved_membership_artifacts(
+                        conn,
+                        intents=membership_rows,
+                        artifact_ids=artifact_ids,
+                    )
                 conn.execute(
                     "UPDATE workflow_runs SET resolution_summary_json = ? WHERE run_id = ?",
                     (
@@ -3243,6 +3255,7 @@ def _insert_workflow_run(
     resolution_summary_json: str,
     environment_observation_json: str,
     created_at: str,
+    is_current: bool,
 ) -> int:
     cursor = conn.execute(
         """
@@ -3252,7 +3265,7 @@ def _insert_workflow_run(
             resolution_summary_json, environment_observation_json,
             is_current, created_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             context,
@@ -3265,6 +3278,7 @@ def _insert_workflow_run(
             base_workflow_name,
             resolution_summary_json,
             environment_observation_json,
+            1 if is_current else 0,
             created_at,
         ),
     )
@@ -3990,13 +4004,14 @@ def _insert_run_execution_population(
     )
 
 
-def _insert_memberships(
+def _resolved_membership_artifacts(
     conn: sqlite3.Connection,
     *,
     intents: tuple[MembershipIntent, ...],
     artifact_ids: dict[tuple[str, str, str], int],
 ) -> dict[tuple[str, str, str, str, str], int]:
-    accepted: dict[tuple[str, str, str, str, str], int] = {}
+    """Resolve each membership coordinate to its artifact without publishing."""
+    resolved: dict[tuple[str, str, str, str, str], int] = {}
     for intent in intents:
         row = intent.row
         if intent.existing_artifact_id is None:
@@ -4022,6 +4037,31 @@ def _insert_memberships(
                 content_digest=row.output_digest,
                 output_hash=row.output_hash,
             )
+        resolved[
+            (
+                row.context,
+                row.workflow_name,
+                row.step_name,
+                row.output_name,
+                row.address,
+            )
+        ] = artifact_id
+    return resolved
+
+
+def _insert_memberships(
+    conn: sqlite3.Connection,
+    *,
+    intents: tuple[MembershipIntent, ...],
+    artifact_ids: dict[tuple[str, str, str], int],
+) -> dict[tuple[str, str, str, str, str], int]:
+    accepted = _resolved_membership_artifacts(
+        conn,
+        intents=intents,
+        artifact_ids=artifact_ids,
+    )
+    for intent in intents:
+        row = intent.row
         conn.execute(
             """
             INSERT INTO published_outputs (
@@ -4039,18 +4079,17 @@ def _insert_memberships(
                 row.path,
                 row.output_digest,
                 row.output_hash,
-                artifact_id,
+                accepted[
+                    (
+                        row.context,
+                        row.workflow_name,
+                        row.step_name,
+                        row.output_name,
+                        row.address,
+                    )
+                ],
             ),
         )
-        accepted[
-            (
-                row.context,
-                row.workflow_name,
-                row.step_name,
-                row.output_name,
-                row.address,
-            )
-        ] = artifact_id
     return accepted
 
 
