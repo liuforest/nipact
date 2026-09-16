@@ -1,4 +1,4 @@
-"""Inactive fail-fast lock primitive for one mutating runtime invocation."""
+"""Fail-fast lock primitive for one mutating runtime invocation."""
 
 from __future__ import annotations
 
