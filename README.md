@@ -21,10 +21,10 @@ Work in Progress:
 
 ## Installation
 
-The current source-checkout pre-release is `0.0.1a13`. It is locally tagged but has not been published to PyPI. The latest published pre-release remains `0.0.1a12`; install that release in a clean environment with:
+The current source-checkout pre-release is `0.0.1a14`. Install release in a clean environment with:
 
 ```bash
-python -m pip install nipact==0.0.1a12
+python -m pip install nipact==0.0.1a14
 nipact --version
 ```
 
