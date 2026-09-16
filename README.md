@@ -21,10 +21,7 @@ Work in Progress:
 
 ## Installation
 
-The current source-checkout pre-release is `0.0.1a13`. It is locally tagged
-for the CLMS2 code freeze but has not been published to PyPI. The latest
-published pre-release remains `0.0.1a12`; install that release in a clean
-environment with:
+The current source-checkout pre-release is `0.0.1a13`. It is locally tagged but has not been published to PyPI. The latest published pre-release remains `0.0.1a12`; install that release in a clean environment with:
 
 ```bash
 python -m pip install nipact==0.0.1a12
@@ -171,11 +168,11 @@ nipact gui \
 
 `workflow run --address ENTITY_ID` targets one entity of an entity-addressed step:
 
-- The address must be a member of the step's source-population manifest; cohort-addressed steps reject the option. Omitting `--address` keeps the full-population default.
-- The selected step is rebuilt for that entity; valid ancestors remain reuse-eligible. Descendant steps are not automatically rerun.
-- Plan construction stays population-wide; hydration, execution, and publication are scoped to the target's reachable closure. Computing a fresh cohort-fit ancestor can therefore execute and publish other entities' upstream jobs, and `planned_jobs` counts compiled fresh jobs in the generated Snakefile, not jobs guaranteed to execute.
-- A targeted run becomes the latest run for its step/output scope while keeping the original full source-population manifest binding; the published-output table remains a composite of coordinates from multiple runs, not proof of a complete cohort sweep.
-- Concurrent invocations for the same workflow, step, output, and address are unsupported.
+- The address must be a member of the effective workflow's `execution_population`; cohort-addressed steps reject the option. Omitting `--address` keeps the full-population default.
+- The selection requests that result for one entity. An already satisfied exact request remains reuse-eligible and is verified without rebuilding; otherwise NIPACT executes the required fresh closure. Descendant steps are not automatically rerun.
+- Plan construction stays population-wide; reused-input preparation, fresh execution, publication, and recording are scoped to the target's reachable closure. Computing a fresh cohort-fit ancestor can therefore execute and publish other entities' upstream jobs, and `planned_jobs` counts compiled fresh jobs in the generated Snakefile, not jobs guaranteed to execute.
+- A targeted run becomes the latest run for its step/output scope while retaining the complete `execution_population` binding; the published-output table remains a composite of coordinates from multiple runs, not proof of a complete cohort sweep.
+- One mutating invocation is supported per runtime root. A second mutating invocation fails fast on the runtime-root lock; concurrent dry runs that share one deterministic dry-run workspace are unsupported.
 
 Successful workflow outputs are stored under the canonical `runtime/outputs/v1/` layout. Their executable-workspace staging files are temporary and are normally removed after the registry transaction commits, so a recorded `staging_path` is historical and may no longer exist. Real-run summaries report `published_outputs` and `published_bytes`; accepted artifact identity and reuse come from the canonical path and registry facts, not continued staging-file presence.
 
