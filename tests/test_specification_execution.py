@@ -912,7 +912,11 @@ def test_specification_projection_preserves_cross_workflow_reuse_and_lineage(
     assert result.artifact_id == producer_artifact_id
     assert result.producing_run_id == producer_run_id
     assert result.producing_workflow_name == "producer_alias"
-    assert result.current_publication_path == result.artifact_path
+    # The member selected this artifact under `consumer_alias`, which has no
+    # ordinary run and therefore no current publication. The same artifact
+    # being current under `producer_alias` is a different workflow coordinate
+    # and deliberately does not satisfy the member's own coordinate.
+    assert result.current_publication_path is None
     basis = tuple(
         row
         for row in projections.result_source_basis
@@ -926,35 +930,25 @@ def test_specification_projection_preserves_cross_workflow_reuse_and_lineage(
         fixture.runtime_dir / "data/source/entity_001.txt"
     )
 
+    # Running the member left the producer's publication exactly as it was and
+    # claimed no coordinate of its own, so the projection is stable on re-read.
     with sqlite3.connect(fixture.registry_path) as connection:
-        removed = connection.execute(
-            """
-            DELETE FROM published_outputs
-            WHERE context = ? AND workflow_name = 'consumer_alias'
-              AND step_name = 'fixture_analysis'
-              AND output_name = 'summary' AND address = 'cohort'
-            """,
-            (fixture.context,),
-        )
-        assert removed.rowcount == 1
         assert connection.execute(
             """
-            SELECT artifact_id FROM published_outputs
-            WHERE context = ? AND workflow_name = 'producer_alias'
-              AND step_name = 'fixture_analysis'
+            SELECT workflow_name, artifact_id FROM published_outputs
+            WHERE context = ? AND step_name = 'fixture_analysis'
               AND output_name = 'summary' AND address = 'cohort'
             """,
             (fixture.context,),
-        ).fetchone() == (producer_artifact_id,)
+        ).fetchall() == [("producer_alias", producer_artifact_id)]
 
-    after = read_specification_snapshot_projections(
-        fixture.registry_path,
-        context=fixture.context,
-        snapshot_digest=snapshot.snapshot_digest,
-    )
-    assert after == replace(
-        projections,
-        results=(replace(result, current_publication_path=None),),
+    assert (
+        read_specification_snapshot_projections(
+            fixture.registry_path,
+            context=fixture.context,
+            snapshot_digest=snapshot.snapshot_digest,
+        )
+        == projections
     )
 
 

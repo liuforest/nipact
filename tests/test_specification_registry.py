@@ -487,6 +487,57 @@ def _reused_memberships(
     return tuple(selected)
 
 
+def _retained_memberships(
+    database: Path,
+    *,
+    context: str,
+    workflow_name: str,
+    token: str,
+    coordinates: frozenset[tuple[str, str, str]],
+) -> tuple[MembershipIntent, ...]:
+    """Resolve reuse intents from retained artifacts instead of publication.
+
+    Specification members retain and reuse artifacts without publishing them
+    into the declared workflow's coordinate space, so an artifact produced by
+    a member is reachable only through the artifact record itself. The token
+    scopes the read to one recording so a coordinate cannot match a fixture
+    artifact from an earlier run.
+    """
+    with sqlite3.connect(database) as connection:
+        rows = connection.execute(
+            """
+            SELECT step_name, output_name, address, path,
+                   content_digest, output_hash, artifact_id
+            FROM artifacts
+            WHERE origin = 'workflow_output' AND context = ?
+              AND is_published = 1 AND path LIKE ?
+            ORDER BY step_name, output_name, address
+            """,
+            (context, f"outputs/test/{token}/%"),
+        ).fetchall()
+    selected: list[MembershipIntent] = []
+    for step_name, output_name, address, path, digest, output_hash, artifact_id in rows:
+        if (step_name, output_name, address) not in coordinates:
+            continue
+        selected.append(
+            MembershipIntent(
+                row=PublishedOutputRow(
+                    context=context,
+                    workflow_name=workflow_name,
+                    step_name=str(step_name),
+                    output_name=str(output_name),
+                    address=str(address),
+                    path=str(path),
+                    output_digest=str(digest),
+                    output_hash=str(output_hash),
+                ),
+                existing_artifact_id=int(artifact_id),
+            )
+        )
+    assert len(selected) == len(coordinates)
+    return tuple(selected)
+
+
 def _table_rows(
     database: Path,
     *,
@@ -1451,10 +1502,11 @@ def test_reuse_records_exact_artifacts_and_separates_selecting_from_producing_ru
             ("fixture_analysis", "detail", "cohort"),
         }
     )
-    reused = _reused_memberships(
+    reused = _retained_memberships(
         fixture.registry_path,
         context=fixture.context,
         workflow_name="base",
+        token="reuse-producer",
         coordinates=coordinates,
     )
     selected = next(intent for intent in reused if intent.row.output_name == "summary")
@@ -1569,10 +1621,11 @@ def test_partial_uses_only_current_acceptance_not_primary_or_stale_memberships(
     selected_coordinate = frozenset(
         {("fixture_transform", "left", "entity_001")}
     )
-    reused = _reused_memberships(
+    reused = _retained_memberships(
         fixture.registry_path,
         context=fixture.context,
         workflow_name="base",
+        token="full-entity_001",
         coordinates=selected_coordinate,
     )
     artifact_id = reused[0].existing_artifact_id
@@ -1613,17 +1666,20 @@ def test_partial_uses_only_current_acceptance_not_primary_or_stale_memberships(
     assert _attempt_results(fixture.registry_path, second_attempt.attempt_id) == (
         ("left", "entity_001", artifact_id),
     )
+    # The first attempt's three other memberships were resolved and retained but
+    # never published, so they cannot be mistaken for the partial attempt's own
+    # results. The earlier attempt keeps its complete record; the later one
+    # reports only what its own acceptance claimed.
+    assert len(_attempt_results(fixture.registry_path, first_attempt.attempt_id)) == 4
     with sqlite3.connect(fixture.registry_path) as connection:
-        stale_count = connection.execute(
+        assert connection.execute(
             """
             SELECT COUNT(*) FROM published_outputs
             WHERE context = ? AND workflow_name = 'base'
               AND step_name = 'fixture_transform'
-              AND NOT (output_name = 'left' AND address = 'entity_001')
             """,
             (fixture.context,),
-        ).fetchone()[0]
-    assert stale_count == 3
+        ).fetchone() == (0,)
     terminal = _freeze_state(fixture.registry_path)
     assert not fail_specification_member_attempt(
         fixture.registry_path,
@@ -1675,7 +1731,20 @@ def test_upstream_only_acceptance_derives_failed_and_requires_execution_stage(
     assert isinstance(row[6], int)
     assert row[7:] == ("execution", "no requested result survived")
     assert _attempt_results(fixture.registry_path, attempt.attempt_id) == ()
+    # The upstream output the failed attempt did produce is retained and stays
+    # reusable, but a failed member must not leave it standing as the declared
+    # workflow's current answer for that coordinate.
     with sqlite3.connect(fixture.registry_path) as connection:
+        assert connection.execute(
+            """
+            SELECT COUNT(*) FROM artifacts
+            WHERE origin = 'workflow_output' AND context = ?
+              AND step_name = 'fixture_transform'
+              AND output_name = 'left' AND address = 'entity_002'
+              AND is_published = 1
+            """,
+            (fixture.context,),
+        ).fetchone() == (1,)
         assert connection.execute(
             """
             SELECT COUNT(*) FROM published_outputs
@@ -1684,7 +1753,7 @@ def test_upstream_only_acceptance_derives_failed_and_requires_execution_stage(
               AND output_name = 'left' AND address = 'entity_002'
             """,
             (fixture.context,),
-        ).fetchone() == (1,)
+        ).fetchone() == (0,)
     terminal = _freeze_state(fixture.registry_path)
     assert not fail_specification_member_attempt(
         fixture.registry_path,
