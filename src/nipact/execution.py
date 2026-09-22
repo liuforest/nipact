@@ -71,11 +71,12 @@ from .registry import (
     SpecificationFailureStage,
     WorkflowOutputArtifactRow,
     RegisteredSourceAuthority,
+    _open_registry_read_session,
+    _RegistryReadSession,
     reconcile_manifest_and_source_authorities,
     record_workflow_run,
     read_context_runtime_path,
     read_registered_source_authorities,
-    resolve_reusable_artifact_bundle,
 )
 from .runtime_lock import acquire_mutating_runtime_lock
 from .source_authority import (
@@ -1831,27 +1832,31 @@ def _resolve_dry_run_forecast_bundles(
     ] = {}
     for output_ref in run_plan.reused_validation_outputs:
         refs_by_request.setdefault(output_ref.reuse_request, []).append(output_ref)
+    if not refs_by_request:
+        return {}
 
     bundles: dict[
         ReusableArtifactBundleRequest,
         ReusableArtifactBundleCandidate,
     ] = {}
-    for request, output_refs in refs_by_request.items():
-        preferred_artifact_ids = output_refs[0].source_bundle_artifact_ids
-        if any(
-            output_ref.source_bundle_artifact_ids != preferred_artifact_ids
-            for output_ref in output_refs[1:]
-        ):
-            raise ValidationError("reused outputs disagree on their planned bundle")
-        bundle = resolve_reusable_artifact_bundle(
-            run_plan.runtime_root / REGISTRY_DB_PATH,
-            runtime_root=run_plan.runtime_root,
-            request=request,
-            preferred_artifact_ids=preferred_artifact_ids,
-        )
-        if bundle is None:
-            raise ValidationError("reusable artifact bundle is no longer valid")
-        bundles[request] = bundle
+    with _open_registry_read_session(
+        run_plan.runtime_root / REGISTRY_DB_PATH
+    ) as registry_session:
+        for request, output_refs in refs_by_request.items():
+            preferred_artifact_ids = output_refs[0].source_bundle_artifact_ids
+            if any(
+                output_ref.source_bundle_artifact_ids != preferred_artifact_ids
+                for output_ref in output_refs[1:]
+            ):
+                raise ValidationError("reused outputs disagree on their planned bundle")
+            bundle = registry_session.resolve_reusable_artifact_bundle(
+                runtime_root=run_plan.runtime_root,
+                request=request,
+                preferred_artifact_ids=preferred_artifact_ids,
+            )
+            if bundle is None:
+                raise ValidationError("reusable artifact bundle is no longer valid")
+            bundles[request] = bundle
     resolved: dict[int, ReusableArtifactCandidate] = {}
     for request, output_refs in refs_by_request.items():
         planned_artifact_ids = output_refs[0].source_bundle_artifact_ids
@@ -2813,88 +2818,92 @@ def _build_jobs(
         ReusableArtifactBundleCandidate | None,
     ] = {}
     fresh_requests: dict[str, tuple[str, str]] = {}
-    for step in plan.steps:
-        outputs = _validated_step_outputs(step)
-        addresses = _step_addresses(plan, step)
-        for address in addresses:
-            if (step.step_name, address) not in selected_coordinates:
-                continue
-            input_paths, input_records = _job_inputs(
-                loaded,
-                step,
-                run_workspace=run_workspace,
-                address=address,
-                outputs_by_artifact=outputs_by_artifact,
-                source_authorities=source_authorities,
-            )
-            job_outputs = _run_job_outputs(
-                run_workspace=run_workspace,
-                step=step,
-                outputs=outputs,
-                address=address,
-            )
-            projection_plan = _request_projection_plan(
-                context=loaded.context,
-                step=step,
-                address=address,
-                outputs=outputs,
-                input_records=input_records,
-            )
-            projection_state = resolve_request_bundle_projection_plan(
-                projection_plan,
-                source_snapshots=source_snapshots,
-                upstream_states=projection_states_by_output,
-            )
-            job = RunJob(
-                job_id=_job_id(step.step_name, address, outputs),
-                step_name=step.step_name,
-                address=address,
-                execution_role=step.execution_role,
-                callable_ref=step.callable_ref,
-                outputs=job_outputs,
-                inputs=input_paths,
-                input_records=input_records,
-                params=dict(step.params),
-                projection_plan=projection_plan,
-                projection_state=projection_state,
-            )
-            for output_name in outputs:
-                projection_states_by_output[
-                    RequestedOutputCoordinate(
-                        namespace=loaded.context,
-                        step_name=step.step_name,
-                        output_name=output_name,
-                        address=address,
-                    )
-                ] = projection_state
-            reused_refs: dict[str, ReusedRunJobOutputRef] | None = None
-            if isinstance(projection_state, ResolvedRequestBundleProjectionV3):
-                reused_refs = _reusable_output_refs_for_job(
-                    loaded=loaded,
-                    job=job,
-                    resolver_cache=resolver_cache,
+    with _open_registry_read_session(
+        loaded.runtime_root / REGISTRY_DB_PATH
+    ) as registry_session:
+        for step in plan.steps:
+            outputs = _validated_step_outputs(step)
+            addresses = _step_addresses(plan, step)
+            for address in addresses:
+                if (step.step_name, address) not in selected_coordinates:
+                    continue
+                input_paths, input_records = _job_inputs(
+                    loaded,
+                    step,
+                    run_workspace=run_workspace,
+                    address=address,
+                    outputs_by_artifact=outputs_by_artifact,
+                    source_authorities=source_authorities,
                 )
-            if reused_refs is not None:
-                for output_name, output_ref in reused_refs.items():
-                    key = (step.step_name, output_name, address)
-                    outputs_by_artifact[key] = output_ref
-                    reused_outputs_by_artifact[key] = output_ref
-                continue
-            if isinstance(projection_state, ResolvedRequestBundleProjectionV3):
-                digest = projection_state.request_bundle_digest
-                previous = fresh_requests.get(digest)
-                if previous is not None:
-                    raise ValidationError(
-                        "selected plan contains duplicate equal fresh requests: "
-                        f"{previous[0]}[{previous[1]}] and "
-                        f"{step.step_name}[{address}]"
-                    )
-                fresh_requests[digest] = (step.step_name, address)
-            jobs.append(job)
-            for output_name in outputs:
-                outputs_by_artifact[(step.step_name, output_name, address)] = job.output_ref(
-                    output_name
+                job_outputs = _run_job_outputs(
+                    run_workspace=run_workspace,
+                    step=step,
+                    outputs=outputs,
+                    address=address,
                 )
+                projection_plan = _request_projection_plan(
+                    context=loaded.context,
+                    step=step,
+                    address=address,
+                    outputs=outputs,
+                    input_records=input_records,
+                )
+                projection_state = resolve_request_bundle_projection_plan(
+                    projection_plan,
+                    source_snapshots=source_snapshots,
+                    upstream_states=projection_states_by_output,
+                )
+                job = RunJob(
+                    job_id=_job_id(step.step_name, address, outputs),
+                    step_name=step.step_name,
+                    address=address,
+                    execution_role=step.execution_role,
+                    callable_ref=step.callable_ref,
+                    outputs=job_outputs,
+                    inputs=input_paths,
+                    input_records=input_records,
+                    params=dict(step.params),
+                    projection_plan=projection_plan,
+                    projection_state=projection_state,
+                )
+                for output_name in outputs:
+                    projection_states_by_output[
+                        RequestedOutputCoordinate(
+                            namespace=loaded.context,
+                            step_name=step.step_name,
+                            output_name=output_name,
+                            address=address,
+                        )
+                    ] = projection_state
+                reused_refs: dict[str, ReusedRunJobOutputRef] | None = None
+                if isinstance(projection_state, ResolvedRequestBundleProjectionV3):
+                    reused_refs = _reusable_output_refs_for_job(
+                        loaded=loaded,
+                        job=job,
+                        registry_session=registry_session,
+                        resolver_cache=resolver_cache,
+                    )
+                if reused_refs is not None:
+                    for output_name, output_ref in reused_refs.items():
+                        key = (step.step_name, output_name, address)
+                        outputs_by_artifact[key] = output_ref
+                        reused_outputs_by_artifact[key] = output_ref
+                    continue
+                if isinstance(projection_state, ResolvedRequestBundleProjectionV3):
+                    digest = projection_state.request_bundle_digest
+                    previous = fresh_requests.get(digest)
+                    if previous is not None:
+                        raise ValidationError(
+                            "selected plan contains duplicate equal fresh requests: "
+                            f"{previous[0]}[{previous[1]}] and "
+                            f"{step.step_name}[{address}]"
+                        )
+                    fresh_requests[digest] = (step.step_name, address)
+                jobs.append(job)
+                for output_name in outputs:
+                    outputs_by_artifact[(step.step_name, output_name, address)] = job.output_ref(
+                        output_name
+                    )
 
     return tuple(jobs), reused_outputs_by_artifact
 
@@ -3089,6 +3098,7 @@ def _reusable_output_refs_for_job(
     *,
     loaded: LoadedWorkflowProject,
     job: RunJob,
+    registry_session: _RegistryReadSession,
     resolver_cache: dict[
         ReusableArtifactBundleRequest,
         ReusableArtifactBundleCandidate | None,
@@ -3096,7 +3106,6 @@ def _reusable_output_refs_for_job(
 ) -> dict[str, ReusedRunJobOutputRef] | None:
     if not isinstance(job.projection_state, ResolvedRequestBundleProjectionV3):
         return None
-    registry_path = loaded.runtime_root / REGISTRY_DB_PATH
     request = ReusableArtifactBundleRequest(
         context=loaded.context,
         step_name=job.step_name,
@@ -3113,8 +3122,7 @@ def _reusable_output_refs_for_job(
     if request in resolver_cache:
         bundle = resolver_cache[request]
     else:
-        bundle = resolve_reusable_artifact_bundle(
-            registry_path,
+        bundle = registry_session.resolve_reusable_artifact_bundle(
             runtime_root=loaded.runtime_root,
             request=request,
         )

@@ -3605,7 +3605,9 @@ def test_lineage_memo_shares_diamond_across_distinct_session_requests(
         return real_dependencies(conn, artifact_id)
 
     monkeypatch.setattr(
-        registry_module, "_workflow_artifact_dependencies_match_registry", tracking_validate
+        registry_module,
+        "_workflow_artifact_dependencies_match_registry",
+        tracking_validate,
     )
     monkeypatch.setattr(
         registry_module, "_dependencies_for_artifact", counting_dependencies
@@ -3624,6 +3626,213 @@ def test_lineage_memo_shares_diamond_across_distinct_session_requests(
         assert len(recursive_expansions) == len(set(recursive_expansions))
         assert session._lineage_memo.keys() == set(recursive_expansions)
     assert set(recursive_expansions) == {("cache", artifact_id) for artifact_id in ancestor_ids}
+
+
+def test_completed_apply_planning_shares_lineage_per_forecast_and_locked_rebuild(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project_dir, runtime_dir = _completed_apply_workflow(tmp_path, monkeypatch)
+    expected_ids = {
+        address: _latest_workflow_artifact_id(
+            runtime_dir,
+            step_name="apply_transform",
+            output_name="apply_out",
+            address=address,
+        )
+        for address in ("sub_001", "sub_002")
+    }
+    ancestor_ids = {
+        _latest_workflow_artifact_id(
+            runtime_dir,
+            step_name=step_name,
+            output_name=output_name,
+            address=address,
+        )
+        for step_name, output_name, address in (
+            ("a_source", "a_out", "sub_001"),
+            ("a_source", "a_out", "sub_002"),
+            ("b_transform", "b_out", "sub_001"),
+            ("b_transform", "b_out", "sub_002"),
+            ("fit_transform", "fit_out", "cohort"),
+        )
+    }
+    phase = "forecast"
+    sessions: dict[str, list[registry_module._RegistryReadSession]] = {
+        "forecast": [], "locked": []
+    }
+    expansions: dict[str, list[tuple[str, int]]] = {"forecast": [], "locked": []}
+    active_contexts: list[str] = []
+    locked_plans = []
+    real_resolve = (
+        registry_module._RegistryReadSession.resolve_reusable_artifact_bundle
+    )
+    real_validate = registry_module._workflow_artifact_dependencies_match_registry
+    real_dependencies = registry_module._dependencies_for_artifact
+    real_build = execution_module._build_executable_run_plan
+
+    def tracking_resolve(self: registry_module._RegistryReadSession, **kwargs: object):
+        sessions[phase].append(self)
+        return real_resolve(self, **kwargs)
+
+    def tracking_validate(*args: object, **kwargs: object) -> bool:
+        active_contexts.append(kwargs["expected_context"])
+        try:
+            return real_validate(*args, **kwargs)
+        finally:
+            active_contexts.pop()
+
+    def counting_dependencies(conn: sqlite3.Connection, artifact_id: int):
+        if active_contexts:
+            expansions[phase].append((active_contexts[-1], artifact_id))
+        return real_dependencies(conn, artifact_id)
+
+    def capture_build(**kwargs: object):
+        plan = real_build(**kwargs)
+        if phase == "locked":
+            locked_plans.append(plan)
+        return plan
+
+    monkeypatch.setattr(
+        registry_module._RegistryReadSession,
+        "resolve_reusable_artifact_bundle",
+        tracking_resolve,
+    )
+    monkeypatch.setattr(
+        registry_module,
+        "_workflow_artifact_dependencies_match_registry",
+        tracking_validate,
+    )
+    monkeypatch.setattr(
+        registry_module, "_dependencies_for_artifact", counting_dependencies
+    )
+    monkeypatch.setattr(
+        execution_module, "_build_executable_run_plan", capture_build
+    )
+
+    forecast = build_run_plan(
+        project_dir=project_dir,
+        context="cache",
+        workflow_name="apply_flow",
+        step_name="apply_transform",
+    )
+    phase = "locked"
+    outcome = execute_run_plan(forecast, cores=1)
+    assert outcome.all_selected_resolved
+    assert outcome.published_count == 0
+    assert outcome.selected_reused_count == 2
+    assert len(locked_plans) == 1
+    for plan in (forecast, locked_plans[0]):
+        assert plan.jobs == ()
+        assert plan.selected_fresh_output_refs == ()
+        assert plan.reused_outputs == ()
+        assert {
+            ref.address: dict(ref.planned_sibling_artifact_ids)["apply_out"]
+            for ref in plan.selected_reused_output_refs
+        } == expected_ids
+    expected_expansions = {("cache", artifact_id) for artifact_id in ancestor_ids}
+    for operation in ("forecast", "locked"):
+        assert set(expansions[operation]) == expected_expansions
+        assert len(expansions[operation]) == len(expected_expansions)
+        assert len({id(session) for session in sessions[operation]}) == 1
+        with pytest.raises(sqlite3.ProgrammingError):
+            sessions[operation][0]._conn.execute("SELECT 1")
+    assert sessions["forecast"][0] is not sessions["locked"][0]
+
+
+def test_completed_apply_dry_run_revalidates_with_its_own_bounded_session(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project_dir, runtime_dir = _completed_apply_workflow(tmp_path, monkeypatch)
+    ancestor_ids = {
+        _latest_workflow_artifact_id(
+            runtime_dir,
+            step_name=step_name,
+            output_name=output_name,
+            address=address,
+        )
+        for step_name, output_name, address in (
+            ("a_source", "a_out", "sub_001"),
+            ("a_source", "a_out", "sub_002"),
+            ("b_transform", "b_out", "sub_001"),
+            ("b_transform", "b_out", "sub_002"),
+            ("fit_transform", "fit_out", "cohort"),
+        )
+    }
+    phase = "forecast"
+    sessions: dict[str, list[registry_module._RegistryReadSession]] = {
+        "forecast": [], "revalidation": []
+    }
+    expansions: dict[str, list[tuple[str, int]]] = {
+        "forecast": [], "revalidation": []
+    }
+    active_contexts: list[str] = []
+    real_resolve = (
+        registry_module._RegistryReadSession.resolve_reusable_artifact_bundle
+    )
+    real_validate = registry_module._workflow_artifact_dependencies_match_registry
+    real_dependencies = registry_module._dependencies_for_artifact
+
+    def tracking_resolve(self: registry_module._RegistryReadSession, **kwargs: object):
+        sessions[phase].append(self)
+        return real_resolve(self, **kwargs)
+
+    def tracking_validate(*args: object, **kwargs: object) -> bool:
+        active_contexts.append(kwargs["expected_context"])
+        try:
+            return real_validate(*args, **kwargs)
+        finally:
+            active_contexts.pop()
+
+    def counting_dependencies(conn: sqlite3.Connection, artifact_id: int):
+        if active_contexts:
+            expansions[phase].append((active_contexts[-1], artifact_id))
+        return real_dependencies(conn, artifact_id)
+
+    monkeypatch.setattr(
+        registry_module._RegistryReadSession,
+        "resolve_reusable_artifact_bundle",
+        tracking_resolve,
+    )
+    monkeypatch.setattr(
+        registry_module, "_workflow_artifact_dependencies_match_registry", tracking_validate
+    )
+    monkeypatch.setattr(
+        registry_module, "_dependencies_for_artifact", counting_dependencies
+    )
+
+    dry_plan = build_run_plan(
+        project_dir=project_dir,
+        context="cache",
+        workflow_name="apply_flow",
+        step_name="apply_transform",
+        dry_run=True,
+    )
+    assert dry_plan.jobs == ()
+    assert {
+        ref.address: dict(ref.planned_sibling_artifact_ids)["apply_out"]
+        for ref in dry_plan.selected_reused_output_refs
+    } == {
+        address: _latest_workflow_artifact_id(
+            runtime_dir,
+            step_name="apply_transform",
+            output_name="apply_out",
+            address=address,
+        )
+        for address in ("sub_001", "sub_002")
+    }
+    phase = "revalidation"
+    assert execute_run_plan(dry_plan, cores=1).published_count == 0
+    assert len(sessions["revalidation"]) > 1
+    assert len({id(session) for session in sessions["revalidation"]}) == 1
+    assert sessions["forecast"][0] is not sessions["revalidation"][0]
+    expected_expansions = {("cache", artifact_id) for artifact_id in ancestor_ids}
+    for operation in ("forecast", "revalidation"):
+        assert set(expansions[operation]) == expected_expansions
+        assert len(expansions[operation]) == len(expected_expansions)
+        with pytest.raises(sqlite3.ProgrammingError):
+            sessions[operation][0]._conn.execute("SELECT 1")
 
 
 def test_lineage_memo_caches_false_by_context_and_rejects_cycles_before_hits(
@@ -6524,14 +6733,14 @@ def test_real_execution_resolves_once_per_request_before_exact_hydration(
         for output_ref in c_plan.reused_validation_outputs
     }
     resolver_calls: list[object] = []
-    original_resolver = execution_module.resolve_reusable_artifact_bundle
+    original_resolver = registry_module._RegistryReadSession.resolve_reusable_artifact_bundle
 
-    def count_resolution(*args: object, **kwargs: object) -> object:
+    def count_resolution(self: registry_module._RegistryReadSession, **kwargs: object) -> object:
         resolver_calls.append(kwargs["request"])
-        return original_resolver(*args, **kwargs)
+        return original_resolver(self, **kwargs)
 
     monkeypatch.setattr(
-        execution_module,
+        registry_module._RegistryReadSession,
         "resolve_reusable_artifact_bundle",
         count_resolution,
     )
