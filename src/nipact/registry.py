@@ -2330,6 +2330,7 @@ def _resolve_reusable_artifact_bundle_conn(
     request: ReusableArtifactBundleRequest,
     preferred_artifact_ids: tuple[int, ...] | None,
     declared_outputs: dict[str, str],
+    lineage_memo: dict[tuple[str, int], bool],
 ) -> ReusableArtifactBundleCandidate | None:
     try:
         stored_projection = _validated_stored_request_bundle_projection(
@@ -2445,6 +2446,7 @@ def _resolve_reusable_artifact_bundle_conn(
                     context=request.context,
                     dependencies=list(candidate.dependencies),
                     input_records=request.input_records,
+                    lineage_memo=lineage_memo,
                 )
                 for candidate in bundle.outputs
             )
@@ -2518,6 +2520,7 @@ def _dependencies_match_request(
     context: str,
     dependencies: list[RegistryDependency],
     input_records: tuple[ArtifactInputRow, ...],
+    lineage_memo: dict[tuple[str, int], bool],
 ) -> bool:
     if len(dependencies) != len(input_records):
         return False
@@ -2528,6 +2531,7 @@ def _dependencies_match_request(
             context=context,
             dependencies=unused,
             input_record=input_record,
+            lineage_memo=lineage_memo,
         )
         if match_index is None:
             return False
@@ -2541,6 +2545,7 @@ def _find_matching_dependency_index(
     context: str,
     dependencies: list[RegistryDependency],
     input_record: ArtifactInputRow,
+    lineage_memo: dict[tuple[str, int], bool],
 ) -> int | None:
     for index, dependency in enumerate(dependencies):
         if not _dependency_common_fields_match(dependency, input_record):
@@ -2561,6 +2566,7 @@ def _find_matching_dependency_index(
                 dependency=dependency,
                 source=source,
                 input_record=input_record,
+                lineage_memo=lineage_memo,
             ):
                 continue
             return index
@@ -2629,6 +2635,7 @@ def _workflow_dependency_matches_input(
     dependency: RegistryDependency,
     source: RegistryArtifact,
     input_record: ArtifactInputRow,
+    lineage_memo: dict[tuple[str, int], bool],
 ) -> bool:
     if source.origin != "workflow_output":
         return False
@@ -2646,6 +2653,7 @@ def _workflow_dependency_matches_input(
         artifact_id=source.artifact_id,
         expected_context=source.context,
         visited=set(),
+        lineage_memo=lineage_memo,
     ):
         return False
     return (
@@ -2682,47 +2690,56 @@ def _workflow_artifact_dependencies_match_registry(
     artifact_id: int,
     expected_context: str,
     visited: set[int],
+    lineage_memo: dict[tuple[str, int], bool],
 ) -> bool:
     if artifact_id in visited:
         raise ValidationError("registry dependency graph contains a cycle")
+    key = (expected_context, artifact_id)
+    if key in lineage_memo:
+        return lineage_memo[key]
     visited.add(artifact_id)
-    dependencies = _dependencies_for_artifact(conn, artifact_id)
-    if not dependencies:
+    try:
+        dependencies = _dependencies_for_artifact(conn, artifact_id)
+        if not dependencies:
+            artifact = _dependency_source_artifact(conn, artifact_id)
+            result = _artifact_projection_declares_no_bindings(conn, artifact)
+        else:
+            result = True
+            for dependency in dependencies:
+                source = _dependency_source_artifact(conn, dependency.source_artifact_id)
+                if source.context != expected_context:
+                    result = False
+                    break
+                if source.origin == "source":
+                    if (
+                        dependency.source_content_digest != source.content_digest
+                        or dependency.source_file_size != source.file_size
+                        or dependency.source_extension != source.extension
+                    ):
+                        result = False
+                        break
+                    continue
+                if source.origin == "workflow_output":
+                    _validate_workflow_dependency_snapshot(
+                        dependency=dependency,
+                        source=source,
+                    )
+                    if not _workflow_artifact_dependencies_match_registry(
+                        conn,
+                        artifact_id=source.artifact_id,
+                        expected_context=expected_context,
+                        visited=visited,
+                        lineage_memo=lineage_memo,
+                    ):
+                        result = False
+                        break
+                    continue
+                result = False
+                break
+        lineage_memo[key] = result
+        return result
+    finally:
         visited.remove(artifact_id)
-        artifact = _dependency_source_artifact(conn, artifact_id)
-        return _artifact_projection_declares_no_bindings(conn, artifact)
-    for dependency in dependencies:
-        source = _dependency_source_artifact(conn, dependency.source_artifact_id)
-        if source.context != expected_context:
-            visited.remove(artifact_id)
-            return False
-        if source.origin == "source":
-            if (
-                dependency.source_content_digest != source.content_digest
-                or dependency.source_file_size != source.file_size
-                or dependency.source_extension != source.extension
-            ):
-                visited.remove(artifact_id)
-                return False
-            continue
-        if source.origin == "workflow_output":
-            _validate_workflow_dependency_snapshot(
-                dependency=dependency,
-                source=source,
-            )
-            if not _workflow_artifact_dependencies_match_registry(
-                conn,
-                artifact_id=source.artifact_id,
-                expected_context=expected_context,
-                visited=visited,
-            ):
-                visited.remove(artifact_id)
-                return False
-            continue
-        visited.remove(artifact_id)
-        return False
-    visited.remove(artifact_id)
-    return True
 
 
 def _artifact_projection_declares_no_bindings(
@@ -3034,6 +3051,7 @@ class _RegistryReadSession:
 
     def __init__(self, conn: sqlite3.Connection) -> None:
         self._conn = conn
+        self._lineage_memo: dict[tuple[str, int], bool] = {}
 
     def resolve_reusable_artifact_bundle(
         self,
@@ -3049,6 +3067,7 @@ class _RegistryReadSession:
             request=request,
             preferred_artifact_ids=preferred_artifact_ids,
             declared_outputs=declared_outputs,
+            lineage_memo=self._lineage_memo,
         )
 
     def read_artifact_by_id(self, artifact_id: int) -> RegistryArtifact:
@@ -3741,6 +3760,8 @@ def _insert_artifact_dependencies(
     artifact_rows: tuple[WorkflowOutputArtifactRow, ...],
     artifact_ids: dict[tuple[str, str, str], int],
 ) -> None:
+    # Accepted reused ancestors are unchanged while fresh descendant edges are inserted.
+    lineage_memo: dict[tuple[str, int], bool] = {}
     for row in artifact_rows:
         dependent_artifact_id = artifact_ids[(row.step_name, row.output_name, row.address)]
         for input_record in row.input_records:
@@ -3751,6 +3772,7 @@ def _insert_artifact_dependencies(
                 reused_projection_identities=reused_projection_identities,
                 input_record=input_record,
                 artifact_ids=artifact_ids,
+                lineage_memo=lineage_memo,
             )
             if input_record.origin == "source":
                 if (
@@ -3814,6 +3836,7 @@ def _dependency_source_artifact_id(
     ],
     input_record: ArtifactInputRow,
     artifact_ids: dict[tuple[str, str, str], int],
+    lineage_memo: dict[tuple[str, int], bool],
 ) -> int:
     if input_record.origin == "source":
         if (
@@ -3876,6 +3899,7 @@ def _dependency_source_artifact_id(
                 context=context,
                 reused_projection_identities=reused_projection_identities,
                 input_record=input_record,
+                lineage_memo=lineage_memo,
             )
             return input_record.registry_source_artifact_id
         try:
@@ -3901,6 +3925,7 @@ def _validate_reused_dependency_source(
         str,
     ],
     input_record: ArtifactInputRow,
+    lineage_memo: dict[tuple[str, int], bool],
 ) -> None:
     if input_record.registry_source_artifact_id is None:
         raise ValidationError("reused workflow dependency source artifact is missing")
@@ -3968,6 +3993,7 @@ def _validate_reused_dependency_source(
         artifact_id=artifact.artifact_id,
         expected_context=context,
         visited=set(),
+        lineage_memo=lineage_memo,
     ):
         raise ValidationError("reused workflow dependency source lineage is stale")
 
