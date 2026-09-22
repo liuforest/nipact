@@ -2,6 +2,7 @@ import json
 import os
 import sqlite3
 import subprocess
+from contextlib import contextmanager
 from dataclasses import fields, replace
 from pathlib import Path
 
@@ -3452,6 +3453,135 @@ def test_bundle_resolver_treats_missing_projection_as_cache_miss(
         )
         is None
     )
+
+
+def test_bundle_resolution_session_matches_standalone_and_reads_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project_dir, runtime_dir, _log_path = _write_cache_project(
+        tmp_path, monkeypatch, entities=("sub_001", "sub_002")
+    )
+    b_plan = build_run_plan(
+        project_dir=project_dir,
+        context="cache",
+        workflow_name="main",
+        step_name="b_transform",
+    )
+    assert execute_run_plan(b_plan, cores=1).all_selected_resolved
+    c_plan = build_run_plan(
+        project_dir=project_dir,
+        context="cache",
+        workflow_name="main",
+        step_name="c_transform",
+    )
+    refs = c_plan.reused_validation_outputs
+    assert {(ref.step_name, ref.address) for ref in refs} == {
+        (step, address)
+        for step in ("a_source", "b_transform")
+        for address in ("sub_001", "sub_002")
+    }
+    registry_path = runtime_dir / "database/registry.db"
+    expected = {
+        ref.reuse_request: ref.source_bundle_artifact_ids for ref in refs
+    }
+    standalone_bundles = {}
+    miss_request = replace(refs[0].reuse_request, context="other_context")
+    for request, ids in expected.items():
+        bundle = registry_module.resolve_reusable_artifact_bundle(
+            registry_path, runtime_root=runtime_dir, request=request
+        )
+        assert bundle is not None
+        assert tuple(output.artifact_id for output in bundle.outputs) == ids
+        standalone_bundles[request] = bundle
+    assert registry_module.resolve_reusable_artifact_bundle(
+        registry_path, runtime_root=runtime_dir, request=miss_request
+    ) is None
+
+    connections: list[sqlite3.Connection] = []
+    schema_checks: list[bool] = []
+    real_connect = registry_module._connect_readonly_rows
+    real_validate = registry_module._validate_schema_version
+
+    @contextmanager
+    def counting_connect(path: Path):
+        with real_connect(path) as conn:
+            connections.append(conn)
+            yield conn
+
+    def counting_validate(conn: sqlite3.Connection) -> None:
+        schema_checks.append(conn.in_transaction)
+        real_validate(conn)
+
+    monkeypatch.setattr(registry_module, "_connect_readonly_rows", counting_connect)
+    monkeypatch.setattr(registry_module, "_validate_schema_version", counting_validate)
+    with registry_module._open_registry_read_session(registry_path) as session:
+        for _ in range(2):
+            for request, ids in expected.items():
+                bundle = session.resolve_reusable_artifact_bundle(
+                    runtime_root=runtime_dir, request=request
+                )
+                assert bundle is not None
+                assert tuple(output.artifact_id for output in bundle.outputs) == ids
+                assert bundle == standalone_bundles[request]
+        assert session.resolve_reusable_artifact_bundle(
+            runtime_root=runtime_dir, request=miss_request
+        ) is None
+    assert len(connections) == 1
+    assert schema_checks == [True]
+    with pytest.raises(sqlite3.ProgrammingError):
+        connections[0].execute("SELECT 1")
+
+
+def test_bundle_resolution_translates_body_sql_error_and_closes_connection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project_dir, runtime_dir, _log_path = _write_cache_project(tmp_path, monkeypatch)
+    b_plan = build_run_plan(
+        project_dir=project_dir,
+        context="cache",
+        workflow_name="main",
+        step_name="b_transform",
+    )
+    assert execute_run_plan(b_plan, cores=1).all_selected_resolved
+    request = build_run_plan(
+        project_dir=project_dir,
+        context="cache",
+        workflow_name="main",
+        step_name="c_transform",
+    ).reused_outputs[0].reuse_request
+    registry_path = runtime_dir / "database/registry.db"
+    connections: list[sqlite3.Connection] = []
+    real_connect = registry_module._connect_readonly_rows
+
+    @contextmanager
+    def capturing_connect(path: Path):
+        with real_connect(path) as conn:
+            connections.append(conn)
+            yield conn
+
+    def fail_after_setup(*args: object, **kwargs: object) -> None:
+        raise sqlite3.DatabaseError("injected body failure")
+
+    monkeypatch.setattr(registry_module, "_connect_readonly_rows", capturing_connect)
+    monkeypatch.setattr(
+        registry_module, "_validated_stored_request_bundle_projection", fail_after_setup
+    )
+    with pytest.raises(ValidationError, match="registry.db is malformed: injected body failure"):
+        registry_module.resolve_reusable_artifact_bundle(
+            registry_path, runtime_root=runtime_dir, request=request
+        )
+    with registry_module._open_registry_read_session(registry_path) as session:
+        # The method must translate the error before the session exits.
+        with pytest.raises(ValidationError, match="registry.db is malformed: injected body failure"):
+            session.resolve_reusable_artifact_bundle(
+                runtime_root=runtime_dir, request=request
+            )
+    assert len(connections) == 2
+    for conn in connections:
+        with pytest.raises(sqlite3.ProgrammingError):
+            conn.execute("SELECT 1")
 
 
 def test_bundle_resolver_fails_closed_for_malformed_projection_payload(
