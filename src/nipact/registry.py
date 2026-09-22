@@ -2301,6 +2301,18 @@ def resolve_reusable_artifact_bundle(
     preferred_artifact_ids: tuple[int, ...] | None = None,
 ) -> ReusableArtifactBundleCandidate | None:
     """Resolve one coherent reusable bundle independently of workflow membership."""
+    _validate_reusable_bundle_request(request)
+    with _open_registry_read_session(path) as session:
+        return session.resolve_reusable_artifact_bundle(
+            runtime_root=runtime_root,
+            request=request,
+            preferred_artifact_ids=preferred_artifact_ids,
+        )
+
+
+def _validate_reusable_bundle_request(
+    request: ReusableArtifactBundleRequest,
+) -> dict[str, str]:
     validate_stored_request_bundle_projection_v3(
         request_bundle_digest=request.resolved_projection.request_bundle_digest,
         projection_json=request.resolved_projection.canonical_json,
@@ -2308,149 +2320,158 @@ def resolve_reusable_artifact_bundle(
     declared_outputs = dict(request.sibling_outputs)
     if len(declared_outputs) != len(request.sibling_outputs):
         raise ValidationError("reusable bundle request has duplicate sibling outputs")
+    return declared_outputs
+
+
+def _resolve_reusable_artifact_bundle_conn(
+    conn: sqlite3.Connection,
+    *,
+    runtime_root: Path,
+    request: ReusableArtifactBundleRequest,
+    preferred_artifact_ids: tuple[int, ...] | None,
+    declared_outputs: dict[str, str],
+) -> ReusableArtifactBundleCandidate | None:
     try:
-        with _connect_readonly_rows(path) as conn:
-            _validate_schema_version(conn)
-            stored_projection = _validated_stored_request_bundle_projection(
-                conn,
-                request.resolved_projection.request_bundle_digest,
-                missing_ok=True,
+        stored_projection = _validated_stored_request_bundle_projection(
+            conn,
+            request.resolved_projection.request_bundle_digest,
+            missing_ok=True,
+        )
+        if stored_projection is None:
+            return None
+        if (
+            stored_projection.resolved_projection.canonical_json
+            != request.resolved_projection.canonical_json
+        ):
+            raise ValidationError(
+                "request projection digest has conflicting canonical payload"
             )
-            if stored_projection is None:
-                return None
+        rows = conn.execute(
+            """
+            SELECT artifact_id, run_id, path, published_path,
+                   content_digest, output_hash, file_size,
+                   extension, workflow_name, step_name, output_name, address,
+                   request_bundle_digest
+            FROM artifacts
+            WHERE context = ?
+              AND origin = 'workflow_output'
+              AND is_published = 1
+              AND step_name = ?
+              AND address = ?
+              AND request_bundle_digest = ?
+            ORDER BY run_id, artifact_id
+            """,
+            (
+                request.context,
+                request.step_name,
+                request.address,
+                request.resolved_projection.request_bundle_digest,
+            ),
+        ).fetchall()
+        candidates_by_run: dict[int, dict[str, ReusableArtifactCandidate]] = {}
+        for row in rows:
             if (
-                stored_projection.resolved_projection.canonical_json
-                != request.resolved_projection.canonical_json
+                row["run_id"] is None
+                or row["workflow_name"] is None
+                or row["step_name"] is None
+                or row["output_name"] is None
+                or row["address"] is None
+                or row["output_hash"] is None
+                or row["request_bundle_digest"] is None
             ):
+                raise ValidationError("registry reusable artifact row is incomplete")
+            run_id = int(row["run_id"])
+            output_name = str(row["output_name"])
+            run_outputs = candidates_by_run.setdefault(run_id, {})
+            if output_name in run_outputs:
                 raise ValidationError(
-                    "request projection digest has conflicting canonical payload"
+                    "registry reusable artifact bundle has duplicate sibling output: "
+                    f"run_id={run_id}, output={output_name!r}"
                 )
-            rows = conn.execute(
-                """
-                SELECT artifact_id, run_id, path, published_path,
-                       content_digest, output_hash, file_size,
-                       extension, workflow_name, step_name, output_name, address,
-                       request_bundle_digest
-                FROM artifacts
-                WHERE context = ?
-                  AND origin = 'workflow_output'
-                  AND is_published = 1
-                  AND step_name = ?
-                  AND address = ?
-                  AND request_bundle_digest = ?
-                ORDER BY run_id, artifact_id
-                """,
-                (
-                    request.context,
-                    request.step_name,
-                    request.address,
-                    request.resolved_projection.request_bundle_digest,
-                ),
-            ).fetchall()
-            candidates_by_run: dict[int, dict[str, ReusableArtifactCandidate]] = {}
-            for row in rows:
+            artifact_id = int(row["artifact_id"])
+            run_outputs[output_name] = ReusableArtifactCandidate(
+                artifact_id=artifact_id,
+                run_id=run_id,
+                path=str(row["path"]),
+                published_path=row["published_path"],
+                content_digest=str(row["content_digest"]),
+                output_hash=str(row["output_hash"]),
+                file_size=int(row["file_size"]),
+                extension=str(row["extension"]),
+                workflow_name=str(row["workflow_name"]),
+                step_name=str(row["step_name"]),
+                output_name=output_name,
+                address=str(row["address"]),
+                request_bundle_digest=str(row["request_bundle_digest"]),
+                dependencies=tuple(_dependencies_for_artifact(conn, artifact_id)),
+            )
+
+        complete = [
+            ReusableArtifactBundleCandidate(
+                run_id=run_id,
+                outputs=tuple(run_outputs[name] for name in sorted(run_outputs)),
+            )
+            for run_id, run_outputs in candidates_by_run.items()
+            if set(run_outputs) == set(declared_outputs)
+        ]
+        if not complete:
+            return None
+
+        signatures = {
+            tuple(
+                (candidate.output_name, candidate.content_digest)
+                for candidate in bundle.outputs
+            )
+            for bundle in complete
+        }
+        if len(signatures) > 1:
+            conflicts = "; ".join(
+                "run_id="
+                f"{bundle.run_id}, artifact_ids="
+                f"{tuple(candidate.artifact_id for candidate in bundle.outputs)}"
+                for bundle in complete
+            )
+            raise ValidationError(
+                "divergent reusable artifact bundles for one deterministic "
+                f"request: {conflicts}"
+            )
+
+        lineage_compatible = [
+            bundle
+            for bundle in complete
+            if all(
+                _dependencies_match_request(
+                    conn,
+                    context=request.context,
+                    dependencies=list(candidate.dependencies),
+                    input_records=request.input_records,
+                )
+                for candidate in bundle.outputs
+            )
+        ]
+        if not lineage_compatible:
+            return None
+
+        valid: list[ReusableArtifactBundleCandidate] = []
+        invalid_reasons: list[str] = []
+        for bundle in lineage_compatible:
+            reasons = [
+                reason
+                for candidate in bundle.outputs
                 if (
-                    row["run_id"] is None
-                    or row["workflow_name"] is None
-                    or row["step_name"] is None
-                    or row["output_name"] is None
-                    or row["address"] is None
-                    or row["output_hash"] is None
-                    or row["request_bundle_digest"] is None
-                ):
-                    raise ValidationError("registry reusable artifact row is incomplete")
-                run_id = int(row["run_id"])
-                output_name = str(row["output_name"])
-                run_outputs = candidates_by_run.setdefault(run_id, {})
-                if output_name in run_outputs:
-                    raise ValidationError(
-                        "registry reusable artifact bundle has duplicate sibling output: "
-                        f"run_id={run_id}, output={output_name!r}"
-                    )
-                artifact_id = int(row["artifact_id"])
-                run_outputs[output_name] = ReusableArtifactCandidate(
-                    artifact_id=artifact_id,
-                    run_id=run_id,
-                    path=str(row["path"]),
-                    published_path=row["published_path"],
-                    content_digest=str(row["content_digest"]),
-                    output_hash=str(row["output_hash"]),
-                    file_size=int(row["file_size"]),
-                    extension=str(row["extension"]),
-                    workflow_name=str(row["workflow_name"]),
-                    step_name=str(row["step_name"]),
-                    output_name=output_name,
-                    address=str(row["address"]),
-                    request_bundle_digest=str(row["request_bundle_digest"]),
-                    dependencies=tuple(_dependencies_for_artifact(conn, artifact_id)),
-                )
-
-            complete = [
-                ReusableArtifactBundleCandidate(
-                    run_id=run_id,
-                    outputs=tuple(run_outputs[name] for name in sorted(run_outputs)),
-                )
-                for run_id, run_outputs in candidates_by_run.items()
-                if set(run_outputs) == set(declared_outputs)
-            ]
-            if not complete:
-                return None
-
-            signatures = {
-                tuple(
-                    (candidate.output_name, candidate.content_digest)
-                    for candidate in bundle.outputs
-                )
-                for bundle in complete
-            }
-            if len(signatures) > 1:
-                conflicts = "; ".join(
-                    "run_id="
-                    f"{bundle.run_id}, artifact_ids="
-                    f"{tuple(candidate.artifact_id for candidate in bundle.outputs)}"
-                    for bundle in complete
-                )
-                raise ValidationError(
-                    "divergent reusable artifact bundles for one deterministic "
-                    f"request: {conflicts}"
-                )
-
-            lineage_compatible = [
-                bundle
-                for bundle in complete
-                if all(
-                    _dependencies_match_request(
-                        conn,
+                    reason := _reusable_artifact_occurrence_error(
+                        runtime_root=runtime_root,
                         context=request.context,
-                        dependencies=list(candidate.dependencies),
-                        input_records=request.input_records,
+                        candidate=candidate,
+                        declared_extension=declared_outputs[candidate.output_name],
                     )
-                    for candidate in bundle.outputs
                 )
+                is not None
             ]
-            if not lineage_compatible:
-                return None
-
-            valid: list[ReusableArtifactBundleCandidate] = []
-            invalid_reasons: list[str] = []
-            for bundle in lineage_compatible:
-                reasons = [
-                    reason
-                    for candidate in bundle.outputs
-                    if (
-                        reason := _reusable_artifact_occurrence_error(
-                            runtime_root=runtime_root,
-                            context=request.context,
-                            candidate=candidate,
-                            declared_extension=declared_outputs[candidate.output_name],
-                        )
-                    )
-                    is not None
-                ]
-                if reasons:
-                    invalid_reasons.extend(reasons)
-                else:
-                    valid.append(bundle)
+            if reasons:
+                invalid_reasons.extend(reasons)
+            else:
+                valid.append(bundle)
     except sqlite3.Error as exc:
         raise ValidationError(f"registry.db is malformed: {exc}") from exc
     if not valid:
@@ -3005,16 +3026,30 @@ def read_run_execution_population(
 
 
 class _RegistryReadSession:
-    """One read-only snapshot session for a single provenance trace traversal.
+    """One read-only snapshot session for a provenance trace or bundle batch.
 
-    Wraps one open read connection so a traversal can perform many artifact,
-    upstream-dependency, and manifest-binding reads without reopening a
-    connection or revalidating the schema per hop. Kept private and limited to
-    the three trace reads; it does not expose the underlying connection.
+    Wraps one open read connection so trace reads and bundle resolutions can
+    share a snapshot without reopening a connection or revalidating the schema.
     """
 
     def __init__(self, conn: sqlite3.Connection) -> None:
         self._conn = conn
+
+    def resolve_reusable_artifact_bundle(
+        self,
+        *,
+        runtime_root: Path,
+        request: ReusableArtifactBundleRequest,
+        preferred_artifact_ids: tuple[int, ...] | None = None,
+    ) -> ReusableArtifactBundleCandidate | None:
+        declared_outputs = _validate_reusable_bundle_request(request)
+        return _resolve_reusable_artifact_bundle_conn(
+            self._conn,
+            runtime_root=runtime_root,
+            request=request,
+            preferred_artifact_ids=preferred_artifact_ids,
+            declared_outputs=declared_outputs,
+        )
 
     def read_artifact_by_id(self, artifact_id: int) -> RegistryArtifact:
         _validate_positive_id(artifact_id, label="artifact id")
@@ -3057,20 +3092,20 @@ class _RegistryReadSession:
 
 @contextmanager
 def _open_registry_read_session(path: Path) -> Iterator[_RegistryReadSession]:
-    """Open one read-only snapshot session for a provenance trace traversal.
+    """Open one read-only snapshot session for a trace or bundle batch.
 
     Opens a single read-only connection, starts one explicit read transaction so
-    the traversal observes a consistent snapshot, and validates the schema once
+    the operation observes a consistent snapshot, and validates the schema once
     inside that transaction. The connection and transaction are released through
     context-manager cleanup on both success and failure.
     """
-    with _connect_readonly_rows(path) as conn:
-        try:
+    try:
+        with _connect_readonly_rows(path) as conn:
             conn.execute("BEGIN")
             _validate_schema_version(conn)
-        except sqlite3.Error as exc:
-            raise ValidationError(f"registry.db is malformed: {exc}") from exc
-        yield _RegistryReadSession(conn)
+            yield _RegistryReadSession(conn)
+    except sqlite3.Error as exc:
+        raise ValidationError(f"registry.db is malformed: {exc}") from exc
 
 
 def list_manifests(path: Path, *, context: str) -> list[RegistryManifest]:
