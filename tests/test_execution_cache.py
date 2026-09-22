@@ -610,6 +610,28 @@ def _write_sibling_workflow(
     )
 
 
+def _completed_apply_workflow(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[Path, Path]:
+    project_dir, runtime_dir, _log_path = _write_cache_project(
+        tmp_path, monkeypatch, entities=("sub_001", "sub_002")
+    )
+    _write_sibling_workflow(
+        project_dir,
+        workflow_name="apply_flow",
+        step_names=["a_source", "b_transform", "fit_transform", "apply_transform"],
+    )
+    plan = build_run_plan(
+        project_dir=project_dir,
+        context="cache",
+        workflow_name="apply_flow",
+        step_name="apply_transform",
+    )
+    assert execute_run_plan(plan, cores=1).all_selected_resolved
+    return project_dir, runtime_dir
+
+
 def _workflow_input_job(run_plan: object, *, step_name: str) -> object:
     return next(job for job in run_plan.jobs if job.step_name == step_name)
 
@@ -3531,6 +3553,354 @@ def test_bundle_resolution_session_matches_standalone_and_reads_once(
     assert schema_checks == [True]
     with pytest.raises(sqlite3.ProgrammingError):
         connections[0].execute("SELECT 1")
+
+
+def test_lineage_memo_shares_diamond_across_distinct_session_requests(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project_dir, runtime_dir = _completed_apply_workflow(tmp_path, monkeypatch)
+    plan = build_run_plan(
+        project_dir=project_dir,
+        context="cache",
+        workflow_name="apply_flow",
+        step_name="apply_transform",
+    )
+    assert plan.jobs == ()
+    assert plan.selected_fresh_output_refs == ()
+    assert plan.reused_outputs == ()
+    refs = plan.selected_reused_output_refs
+    assert {ref.address for ref in refs} == {"sub_001", "sub_002"}
+    ancestor_ids = {
+        _latest_workflow_artifact_id(
+            runtime_dir,
+            step_name=step_name,
+            output_name=output_name,
+            address=address,
+        )
+        for step_name, output_name, address in (
+            ("a_source", "a_out", "sub_001"),
+            ("a_source", "a_out", "sub_002"),
+            ("b_transform", "b_out", "sub_001"),
+            ("b_transform", "b_out", "sub_002"),
+            ("fit_transform", "fit_out", "cohort"),
+        )
+    }
+
+    recursive_expansions: list[tuple[str, int]] = []
+    active_contexts: list[str] = []
+    real_dependencies = registry_module._dependencies_for_artifact
+    real_validate = registry_module._workflow_artifact_dependencies_match_registry
+
+    def tracking_validate(*args: object, **kwargs: object) -> bool:
+        active_contexts.append(kwargs["expected_context"])
+        try:
+            return real_validate(*args, **kwargs)
+        finally:
+            active_contexts.pop()
+
+    def counting_dependencies(conn: sqlite3.Connection, artifact_id: int):
+        if active_contexts:
+            recursive_expansions.append((active_contexts[-1], artifact_id))
+        return real_dependencies(conn, artifact_id)
+
+    monkeypatch.setattr(
+        registry_module, "_workflow_artifact_dependencies_match_registry", tracking_validate
+    )
+    monkeypatch.setattr(
+        registry_module, "_dependencies_for_artifact", counting_dependencies
+    )
+    with registry_module._open_registry_read_session(
+        runtime_dir / "database/registry.db"
+    ) as session:
+        for ref in refs:
+            bundle = session.resolve_reusable_artifact_bundle(
+                runtime_root=runtime_dir, request=ref.reuse_request
+            )
+            assert bundle is not None
+            assert tuple(output.artifact_id for output in bundle.outputs) == tuple(
+                artifact_id for _name, artifact_id in ref.planned_sibling_artifact_ids
+            )
+        assert len(recursive_expansions) == len(set(recursive_expansions))
+        assert session._lineage_memo.keys() == set(recursive_expansions)
+    assert set(recursive_expansions) == {("cache", artifact_id) for artifact_id in ancestor_ids}
+
+
+def test_lineage_memo_caches_false_by_context_and_rejects_cycles_before_hits(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project_dir, runtime_dir = _completed_apply_workflow(tmp_path, monkeypatch)
+    registry_path = runtime_dir / "database/registry.db"
+    b_id = _latest_workflow_artifact_id(
+        runtime_dir,
+        step_name="b_transform",
+        output_name="b_out",
+        address="sub_001",
+    )
+    apply_id = _latest_workflow_artifact_id(
+        runtime_dir,
+        step_name="apply_transform",
+        output_name="apply_out",
+        address="sub_001",
+    )
+    with registry_module._open_registry_read_session(registry_path) as session:
+        memo = session._lineage_memo
+        visited: set[int] = set()
+        validate = registry_module._workflow_artifact_dependencies_match_registry
+        assert not validate(
+            session._conn,
+            artifact_id=b_id,
+            expected_context="wrong_context",
+            visited=visited,
+            lineage_memo=memo,
+        )
+        assert memo[("wrong_context", b_id)] is False
+        real_dependencies = registry_module._dependencies_for_artifact
+
+        def unexpected_read(conn: sqlite3.Connection, artifact_id: int):
+            raise AssertionError("completed False result was expanded again")
+
+        monkeypatch.setattr(registry_module, "_dependencies_for_artifact", unexpected_read)
+        assert not validate(
+            session._conn,
+            artifact_id=b_id,
+            expected_context="wrong_context",
+            visited=visited,
+            lineage_memo=memo,
+        )
+        monkeypatch.setattr(
+            registry_module, "_dependencies_for_artifact", real_dependencies
+        )
+        assert validate(
+            session._conn,
+            artifact_id=b_id,
+            expected_context="cache",
+            visited=visited,
+            lineage_memo=memo,
+        )
+        assert memo[("cache", b_id)] is True
+        memo[("cache", apply_id)] = True
+        visited.add(apply_id)
+        with pytest.raises(ValidationError, match="dependency graph contains a cycle"):
+            validate(
+                session._conn,
+                artifact_id=apply_id,
+                expected_context="cache",
+                visited=visited,
+                lineage_memo=memo,
+            )
+        assert visited == {apply_id}
+
+    # Make a real apply -> b -> apply cycle, with a coherent edge snapshot so
+    # recursion rather than snapshot validation is what rejects it.
+    with sqlite3.connect(registry_path) as conn:
+        conn.execute(
+            """
+            UPDATE artifact_dependencies
+            SET source_artifact_id = ?,
+                source_content_digest = (SELECT content_digest FROM artifacts WHERE artifact_id = ?),
+                source_file_size = (SELECT file_size FROM artifacts WHERE artifact_id = ?),
+                source_extension = (SELECT extension FROM artifacts WHERE artifact_id = ?)
+            WHERE dependent_artifact_id = ? AND source_artifact_id != ?
+            """,
+            (apply_id, apply_id, apply_id, apply_id, b_id, apply_id),
+        )
+    with registry_module._open_registry_read_session(registry_path) as session:
+        visited = set()
+        with pytest.raises(ValidationError, match="dependency graph contains a cycle"):
+            registry_module._workflow_artifact_dependencies_match_registry(
+                session._conn,
+                artifact_id=apply_id,
+                expected_context="cache",
+                visited=visited,
+                lineage_memo=session._lineage_memo,
+            )
+        assert visited == set()
+        assert ("cache", apply_id) not in session._lineage_memo
+        assert ("cache", b_id) not in session._lineage_memo
+
+
+def test_lineage_memo_discards_unfinished_result_and_new_session_rechecks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project_dir, runtime_dir = _completed_apply_workflow(tmp_path, monkeypatch)
+    plan = build_run_plan(
+        project_dir=project_dir,
+        context="cache",
+        workflow_name="apply_flow",
+        step_name="apply_transform",
+        address="sub_001",
+    )
+    ref = plan.selected_reused_output_refs[0]
+    registry_path = runtime_dir / "database/registry.db"
+    b_id = _latest_workflow_artifact_id(
+        runtime_dir,
+        step_name="b_transform",
+        output_name="b_out",
+        address="sub_001",
+    )
+    real_dependencies = registry_module._dependencies_for_artifact
+    with registry_module._open_registry_read_session(registry_path) as session:
+        visited: set[int] = set()
+
+        def fail_once(conn: sqlite3.Connection, artifact_id: int):
+            raise RuntimeError("injected lineage read failure")
+
+        monkeypatch.setattr(registry_module, "_dependencies_for_artifact", fail_once)
+        with pytest.raises(RuntimeError, match="injected lineage read failure"):
+            registry_module._workflow_artifact_dependencies_match_registry(
+                session._conn,
+                artifact_id=b_id,
+                expected_context="cache",
+                visited=visited,
+                lineage_memo=session._lineage_memo,
+            )
+        assert visited == set()
+        assert ("cache", b_id) not in session._lineage_memo
+        monkeypatch.setattr(
+            registry_module, "_dependencies_for_artifact", real_dependencies
+        )
+        assert session.resolve_reusable_artifact_bundle(
+            runtime_root=runtime_dir, request=ref.reuse_request
+        ) is not None
+
+    with sqlite3.connect(registry_path) as conn:
+        conn.execute(
+            """
+            DELETE FROM artifact_dependencies
+            WHERE dependent_artifact_id = ?
+            """,
+            (b_id,),
+        )
+    with registry_module._open_registry_read_session(registry_path) as session:
+        assert session.resolve_reusable_artifact_bundle(
+            runtime_root=runtime_dir, request=ref.reuse_request
+        ) is None
+        assert session._lineage_memo[("cache", b_id)] is False
+
+
+def test_publication_memo_shares_reused_lineage_and_records_exact_edges(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project_dir, runtime_dir, _log_path = _write_cache_project(
+        tmp_path, monkeypatch, entities=("sub_001", "sub_002")
+    )
+    _write_sibling_workflow(
+        project_dir,
+        workflow_name="apply_flow",
+        step_names=["a_source", "b_transform", "fit_transform", "apply_transform"],
+    )
+    fit_plan = build_run_plan(
+        project_dir=project_dir,
+        context="cache",
+        workflow_name="apply_flow",
+        step_name="fit_transform",
+    )
+    assert execute_run_plan(fit_plan, cores=1).all_selected_resolved
+    fit_id = _latest_workflow_artifact_id(
+        runtime_dir,
+        step_name="fit_transform",
+        output_name="fit_out",
+        address="cohort",
+    )
+    b_ids = {
+        address: _latest_workflow_artifact_id(
+            runtime_dir,
+            step_name="b_transform",
+            output_name="b_out",
+            address=address,
+        )
+        for address in ("sub_001", "sub_002")
+    }
+    a_ids = {
+        _latest_workflow_artifact_id(
+            runtime_dir,
+            step_name="a_source",
+            output_name="a_out",
+            address=address,
+        )
+        for address in ("sub_001", "sub_002")
+    }
+    apply_plan = build_run_plan(
+        project_dir=project_dir,
+        context="cache",
+        workflow_name="apply_flow",
+        step_name="apply_transform",
+    )
+    assert {ref.address for ref in apply_plan.selected_fresh_output_refs} == {
+        "sub_001", "sub_002"
+    }
+    recursive_expansions: list[tuple[str, int]] = []
+    active_contexts: list[str] = []
+    inside_publication = False
+    real_insert = registry_module._insert_artifact_dependencies
+    real_dependencies = registry_module._dependencies_for_artifact
+    real_validate = registry_module._workflow_artifact_dependencies_match_registry
+
+    def counting_insert(*args: object, **kwargs: object) -> None:
+        nonlocal inside_publication
+        inside_publication = True
+        try:
+            real_insert(*args, **kwargs)
+        finally:
+            inside_publication = False
+
+    def tracking_validate(*args: object, **kwargs: object) -> bool:
+        active_contexts.append(kwargs["expected_context"])
+        try:
+            return real_validate(*args, **kwargs)
+        finally:
+            active_contexts.pop()
+
+    def counting_dependencies(conn: sqlite3.Connection, artifact_id: int):
+        if inside_publication and active_contexts:
+            recursive_expansions.append((active_contexts[-1], artifact_id))
+        return real_dependencies(conn, artifact_id)
+
+    monkeypatch.setattr(registry_module, "_insert_artifact_dependencies", counting_insert)
+    monkeypatch.setattr(
+        registry_module, "_workflow_artifact_dependencies_match_registry", tracking_validate
+    )
+    monkeypatch.setattr(
+        registry_module, "_dependencies_for_artifact", counting_dependencies
+    )
+    assert execute_run_plan(apply_plan, cores=1).all_selected_resolved
+    assert len(recursive_expansions) == len(set(recursive_expansions))
+    assert set(recursive_expansions) == {
+        ("cache", artifact_id) for artifact_id in {*a_ids, *b_ids.values(), fit_id}
+    }
+
+    registry_path = runtime_dir / "database/registry.db"
+    with sqlite3.connect(registry_path) as conn:
+        for address, b_id in b_ids.items():
+            apply_id = _latest_workflow_artifact_id(
+                runtime_dir,
+                step_name="apply_transform",
+                output_name="apply_out",
+                address=address,
+            )
+            rows = conn.execute(
+                """
+                SELECT source_artifact_id, source_content_digest,
+                       source_file_size, source_extension
+                FROM artifact_dependencies
+                WHERE dependent_artifact_id = ?
+                """,
+                (apply_id,),
+            ).fetchall()
+            assert len(rows) == 2
+            assert {row[0] for row in rows} == {b_id, fit_id}
+            for source_id, digest, size, extension in rows:
+                assert (digest, size, extension) == conn.execute(
+                    """
+                    SELECT content_digest, file_size, extension
+                    FROM artifacts WHERE artifact_id = ?
+                    """,
+                    (source_id,),
+                ).fetchone()
 
 
 def test_bundle_resolution_translates_body_sql_error_and_closes_connection(
