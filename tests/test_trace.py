@@ -1,5 +1,3 @@
-import json
-import os
 import sqlite3
 from contextlib import contextmanager
 from pathlib import Path
@@ -7,10 +5,7 @@ from pathlib import Path
 import pytest
 
 import nipact.registry as registry
-from nipact.cli import main
 from nipact.errors import ValidationError
-from nipact.execution import build_run_plan, execute_run_plan
-from nipact.execution_evidence import CompletionReceipt, write_completion_receipt_atomic
 from nipact.gui.topology import build_observed_topology
 from nipact.registry import REGISTRY_DB_PATH, list_artifacts
 from nipact.trace import (
@@ -19,109 +14,14 @@ from nipact.trace import (
     build_trace_graph_for_workflow_coordinate,
 )
 
-
-def _run_main_from(cwd: Path, argv: list[str]) -> int:
-    old_cwd = Path.cwd()
-    os.chdir(cwd)
-    try:
-        return main(argv)
-    finally:
-        os.chdir(old_cwd)
-
-
-def _init_demo(
-    tmp_path: Path,
-    capsys: pytest.CaptureFixture[str],
-) -> tuple[Path, Path]:
-    project_dir = tmp_path / "project"
-    runtime_dir = tmp_path / "runtime"
-    assert (
-        _run_main_from(
-            tmp_path,
-            [
-                "init",
-                "--demo",
-                "colors",
-                "--project-dir",
-                "project",
-                "--runtime-dir",
-                "runtime",
-                "--context",
-                "colors",
-            ],
-        )
-        == 0
-    )
-    capsys.readouterr()
-    return project_dir, runtime_dir
-
-
-def _write_all_staged_outputs(run_plan: object) -> None:
-    selected_keys = {
-        (job.step_name, job.output_name, job.address)
-        for job in run_plan.selected_fresh_jobs
-    }
-    for job in run_plan.jobs:
-        job.staging_path.parent.mkdir(parents=True, exist_ok=True)
-        payload = {
-            "job_id": job.job_id,
-            "step_name": job.step_name,
-            "output_name": job.output_name,
-            "address": job.address,
-        }
-        if (job.step_name, job.output_name, job.address) in selected_keys:
-            payload["selected"] = True
-        job.staging_path.write_text(
-            json.dumps(payload, indent=2, sort_keys=True) + "\n",
-            encoding="utf-8",
-        )
-    execution_payload = json.loads(
-        (run_plan.run_workspace / "run_plan.json").read_text(encoding="utf-8")
-    )
-    for job_id, job_payload in execution_payload["jobs"].items():
-        write_completion_receipt_atomic(
-            run_plan.run_workspace / job_payload["completion_receipt_path"],
-            CompletionReceipt(
-                invocation_token=execution_payload["invocation_token"],
-                job_id=job_id,
-                request_bundle_digest=job_payload["request_bundle_digest"],
-                outputs=tuple(job_payload["declared_outputs"]),
-            ),
-        )
-
-
-def _successful_sector_run(
-    tmp_path: Path,
-    capsys: pytest.CaptureFixture[str],
-    monkeypatch: pytest.MonkeyPatch,
-) -> tuple[Path, Path, object]:
-    project_dir, runtime_dir = _init_demo(tmp_path, capsys)
-    run_plan = build_run_plan(
-        project_dir=project_dir,
-        context="colors",
-        workflow_name="base",
-        step_name="color_sector_analysis",
-    )
-
-    def write_staged_outputs(*_args: object, **_kwargs: object) -> int:
-        _write_all_staged_outputs(run_plan)
-        return 0
-
-    monkeypatch.setattr("nipact.execution._run_snakemake", write_staged_outputs)
-    assert execute_run_plan(run_plan, cores=1).published_count == len(run_plan.published_outputs)
-    return project_dir, runtime_dir, run_plan
+from conftest import publish_compact_colors
 
 
 def test_trace_graph_by_artifact_id_includes_sources_and_manifest_bindings(
     tmp_path: Path,
-    capsys: pytest.CaptureFixture[str],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _project_dir, runtime_dir, run_plan = _successful_sector_run(
-        tmp_path,
-        capsys,
-        monkeypatch,
-    )
+    _project_dir, runtime_dir, run_plan = publish_compact_colors(tmp_path, monkeypatch)
     registry_path = runtime_dir / REGISTRY_DB_PATH
     selected = list_artifacts(
         registry_path,
@@ -197,14 +97,9 @@ def test_trace_graph_by_artifact_id_includes_sources_and_manifest_bindings(
 
 def test_trace_graph_payload_shape_is_stable_for_gui_contract(
     tmp_path: Path,
-    capsys: pytest.CaptureFixture[str],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _project_dir, runtime_dir, _run_plan = _successful_sector_run(
-        tmp_path,
-        capsys,
-        monkeypatch,
-    )
+    _project_dir, runtime_dir, _run_plan = publish_compact_colors(tmp_path, monkeypatch)
     registry_path = runtime_dir / REGISTRY_DB_PATH
     selected = list_artifacts(
         registry_path,
@@ -320,21 +215,11 @@ def test_trace_graph_payload_shape_is_stable_for_gui_contract(
     assert selected_node["software_ref"] is None
 
 
-@pytest.mark.parametrize(
-    "path_column",
-    ["path"],
-)
 def test_trace_by_artifact_id_rejects_unsafe_registered_paths(
     tmp_path: Path,
-    capsys: pytest.CaptureFixture[str],
     monkeypatch: pytest.MonkeyPatch,
-    path_column: str,
 ) -> None:
-    _project_dir, runtime_dir, _run_plan = _successful_sector_run(
-        tmp_path,
-        capsys,
-        monkeypatch,
-    )
+    _project_dir, runtime_dir, _run_plan = publish_compact_colors(tmp_path, monkeypatch)
     registry_path = runtime_dir / REGISTRY_DB_PATH
     selected = list_artifacts(
         registry_path,
@@ -348,7 +233,7 @@ def test_trace_by_artifact_id_rejects_unsafe_registered_paths(
 
     with sqlite3.connect(registry_path) as conn:
         conn.execute(
-            f"UPDATE artifacts SET {path_column} = ? WHERE artifact_id = ?",
+            "UPDATE artifacts SET path = ? WHERE artifact_id = ?",
             ("/tmp/leaked-artifact.json", selected.artifact_id),
         )
 
@@ -361,14 +246,9 @@ def test_trace_by_artifact_id_rejects_unsafe_registered_paths(
 
 def test_trace_graph_by_workflow_coordinate_accepts_published_intermediate(
     tmp_path: Path,
-    capsys: pytest.CaptureFixture[str],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _project_dir, runtime_dir, _run_plan = _successful_sector_run(
-        tmp_path,
-        capsys,
-        monkeypatch,
-    )
+    _project_dir, runtime_dir, _run_plan = publish_compact_colors(tmp_path, monkeypatch)
     registry_path = runtime_dir / REGISTRY_DB_PATH
 
     graph = build_trace_graph_for_workflow_coordinate(
@@ -392,8 +272,8 @@ def test_trace_graph_by_workflow_coordinate_accepts_published_intermediate(
         registry_path,
         context="colors",
         workflow_name="base",
-        step_name="color_features",
-        output_name="features",
+        step_name="color_source",
+        output_name="source_color",
         address="color_000",
     )
     intermediate_node = next(
@@ -405,14 +285,9 @@ def test_trace_graph_by_workflow_coordinate_accepts_published_intermediate(
 
 def test_shared_membership_trace_and_gui_keep_generating_workflow_label(
     tmp_path: Path,
-    capsys: pytest.CaptureFixture[str],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _project_dir, runtime_dir, _run_plan = _successful_sector_run(
-        tmp_path,
-        capsys,
-        monkeypatch,
-    )
+    _project_dir, runtime_dir, _run_plan = publish_compact_colors(tmp_path, monkeypatch)
     registry_path = runtime_dir / REGISTRY_DB_PATH
     with sqlite3.connect(registry_path) as conn:
         conn.execute(
@@ -476,14 +351,9 @@ def test_shared_membership_trace_and_gui_keep_generating_workflow_label(
 
 def test_trace_graph_marks_damaged_dependency_as_degraded(
     tmp_path: Path,
-    capsys: pytest.CaptureFixture[str],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _project_dir, runtime_dir, _run_plan = _successful_sector_run(
-        tmp_path,
-        capsys,
-        monkeypatch,
-    )
+    _project_dir, runtime_dir, _run_plan = publish_compact_colors(tmp_path, monkeypatch)
     registry_path = runtime_dir / REGISTRY_DB_PATH
     selected = list_artifacts(
         registry_path,
@@ -521,6 +391,7 @@ def test_trace_graph_marks_damaged_dependency_as_degraded(
     graph = build_trace_graph_for_artifact_id(
         registry_path,
         artifact_id=selected.artifact_id,
+        context="colors",
     )
 
     assert graph["provenance_status"] == "degraded"
@@ -550,30 +421,25 @@ def _selected_sector_counts(registry_path: Path) -> object:
     )[0]
 
 
-def _a_feature_artifact(registry_path: Path) -> object:
+def _a_source_import_artifact(registry_path: Path) -> object:
     return list_artifacts(
         registry_path,
         context="colors",
         origin="workflow_output",
         workflow_name="base",
-        step_name="color_features",
-        output_name="features",
+        step_name="color_source",
+        output_name="source_color",
     )[0]
 
 
 def test_trace_traversal_shares_one_read_session_regardless_of_closure(
     tmp_path: Path,
-    capsys: pytest.CaptureFixture[str],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _project_dir, runtime_dir, _run_plan = _successful_sector_run(
-        tmp_path,
-        capsys,
-        monkeypatch,
-    )
+    _project_dir, runtime_dir, _run_plan = publish_compact_colors(tmp_path, monkeypatch)
     registry_path = runtime_dir / REGISTRY_DB_PATH
     large_root = _selected_sector_counts(registry_path)
-    small_root = _a_feature_artifact(registry_path)
+    small_root = _a_source_import_artifact(registry_path)
 
     real_connect = registry._connect_readonly_rows
     real_validate = registry._validate_schema_version
@@ -623,17 +489,12 @@ def test_trace_traversal_shares_one_read_session_regardless_of_closure(
 
 def test_trace_terminates_on_dependency_cycle(
     tmp_path: Path,
-    capsys: pytest.CaptureFixture[str],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _project_dir, runtime_dir, _run_plan = _successful_sector_run(
-        tmp_path,
-        capsys,
-        monkeypatch,
-    )
+    _project_dir, runtime_dir, _run_plan = publish_compact_colors(tmp_path, monkeypatch)
     registry_path = runtime_dir / REGISTRY_DB_PATH
     selected = _selected_sector_counts(registry_path)
-    feature = _a_feature_artifact(registry_path)
+    source_import = _a_source_import_artifact(registry_path)
 
     with sqlite3.connect(registry_path) as conn:
         conn.execute("PRAGMA foreign_keys = OFF")
@@ -647,7 +508,7 @@ def test_trace_terminates_on_dependency_cycle(
             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
-                feature.artifact_id,
+                source_import.artifact_id,
                 selected.artifact_id,
                 "0" * 64,
                 0,
@@ -666,9 +527,9 @@ def test_trace_terminates_on_dependency_cycle(
 
     artifact_ids = {artifact["artifact_id"] for artifact in graph["artifacts"]}
     assert selected.artifact_id in artifact_ids
-    assert feature.artifact_id in artifact_ids
+    assert source_import.artifact_id in artifact_ids
     assert any(
         dependency["source_artifact_id"] == selected.artifact_id
-        and dependency["dependent_artifact_id"] == feature.artifact_id
+        and dependency["dependent_artifact_id"] == source_import.artifact_id
         for dependency in graph["dependencies"]
     )

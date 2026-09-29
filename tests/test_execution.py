@@ -45,6 +45,8 @@ from nipact.runtime_lock import (
 )
 from nipact.trace import build_trace_graph_for_workflow_coordinate
 
+from conftest import write_all_staged_outputs, write_compact_colors_project
+
 
 def _run_main_from(cwd: Path, argv: list[str]) -> int:
     old_cwd = Path.cwd()
@@ -53,51 +55,6 @@ def _run_main_from(cwd: Path, argv: list[str]) -> int:
         return main(argv)
     finally:
         os.chdir(old_cwd)
-
-
-def _write_all_staged_outputs(
-    run_plan: object,
-    *,
-    marker: str = "run",
-    selected_payload: dict[str, object] | None = None,
-) -> None:
-    selected_keys = {
-        (job.step_name, job.output_name, job.address)
-        for job in run_plan.selected_fresh_jobs
-    }
-    for job in run_plan.jobs:
-        job.staging_path.parent.mkdir(parents=True, exist_ok=True)
-        payload = {
-            "job_id": job.job_id,
-            "step_name": job.step_name,
-            "output_name": job.output_name,
-            "address": job.address,
-            "marker": marker,
-        }
-        if (
-            selected_payload is not None
-            and (job.step_name, job.output_name, job.address) in selected_keys
-        ):
-            payload = dict(selected_payload)
-            payload["marker"] = marker
-        job.staging_path.write_text(
-            json.dumps(payload, indent=2, sort_keys=True) + "\n",
-            encoding="utf-8",
-        )
-    run_plan_payload = json.loads(
-        (run_plan.run_workspace / "run_plan.json").read_text(encoding="utf-8")
-    )
-    for job_id, job_payload in run_plan_payload["jobs"].items():
-        receipt = CompletionReceipt(
-            invocation_token=run_plan_payload["invocation_token"],
-            job_id=job_id,
-            request_bundle_digest=job_payload["request_bundle_digest"],
-            outputs=tuple(job_payload["declared_outputs"]),
-        )
-        write_completion_receipt_atomic(
-            run_plan.run_workspace / job_payload["completion_receipt_path"],
-            receipt,
-        )
 
 
 def _init_demo(
@@ -1316,7 +1273,7 @@ def test_execute_run_plan_publishes_selected_outputs_without_real_snakemake(
     capsys: pytest.CaptureFixture[str],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    project_dir, runtime_dir = _init_demo(tmp_path, capsys)
+    project_dir, runtime_dir = write_compact_colors_project(tmp_path)
     run_plan = build_run_plan(
         project_dir=project_dir,
         context="colors",
@@ -1325,18 +1282,7 @@ def test_execute_run_plan_publishes_selected_outputs_without_real_snakemake(
     )
 
     def write_staged_outputs(*_args: object, **_kwargs: object) -> int:
-        _write_all_staged_outputs(
-            run_plan,
-            selected_payload={
-                "analysis_manifest_digest": "0" * 64,
-                "entity_count": 200,
-                "red_arc_count": 8,
-                "green_arc_count": 56,
-                "blue_arc_count": 11,
-                "other_count": 125,
-                "red_minus_green": -48,
-            },
-        )
+        write_all_staged_outputs(run_plan)
         return 0
 
     monkeypatch.setattr("nipact.execution._run_snakemake", write_staged_outputs)
@@ -1455,7 +1401,7 @@ def test_execute_run_plan_publishes_selected_outputs_without_real_snakemake(
         "workflow_artifacts": len(run_plan.jobs),
         "dependencies": sum(len(job.input_records) for job in run_plan.jobs),
         "manifest_bindings": len(run_plan.manifest_bindings),
-        "source_edges": 200,
+        "source_edges": run_plan.execution_population.entity_count,
     }
     assert selected_artifact == (
         "workflow_output",
