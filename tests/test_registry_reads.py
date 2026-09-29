@@ -11,8 +11,6 @@ import nipact.registry as registry
 from nipact.artifacts import canonical_output_path
 from nipact.cli import main
 from nipact.errors import ValidationError
-from nipact.execution import build_run_plan, execute_run_plan
-from nipact.execution_evidence import CompletionReceipt, write_completion_receipt_atomic
 from nipact.manifest import build_manifest
 from nipact.registry import (
     EnvironmentObservationV1,
@@ -44,6 +42,9 @@ from nipact.source_authority import (
     SourceDeclaration,
     observe_source_authority,
 )
+from nipact.workflow import load_workflow_project
+
+from conftest import publish_compact_colors
 
 
 def _run_main_from(cwd: Path, argv: list[str]) -> int:
@@ -103,40 +104,6 @@ def _reconcile_colors_source(runtime_dir: Path) -> None:
             ),
         ),
     )
-
-
-def _write_all_staged_outputs(run_plan: object) -> None:
-    selected_keys = {
-        (job.step_name, job.output_name, job.address)
-        for job in run_plan.selected_fresh_jobs
-    }
-    for job in run_plan.jobs:
-        job.staging_path.parent.mkdir(parents=True, exist_ok=True)
-        payload = {
-            "job_id": job.job_id,
-            "step_name": job.step_name,
-            "output_name": job.output_name,
-            "address": job.address,
-        }
-        if (job.step_name, job.output_name, job.address) in selected_keys:
-            payload["selected"] = True
-        job.staging_path.write_text(
-            json.dumps(payload, indent=2, sort_keys=True) + "\n",
-            encoding="utf-8",
-        )
-    execution_payload = json.loads(
-        (run_plan.run_workspace / "run_plan.json").read_text(encoding="utf-8")
-    )
-    for job_id, job_payload in execution_payload["jobs"].items():
-        write_completion_receipt_atomic(
-            run_plan.run_workspace / job_payload["completion_receipt_path"],
-            CompletionReceipt(
-                invocation_token=execution_payload["invocation_token"],
-                job_id=job_id,
-                request_bundle_digest=job_payload["request_bundle_digest"],
-                outputs=tuple(job_payload["declared_outputs"]),
-            ),
-        )
 
 
 def test_manifest_and_source_authority_reconciliation_rolls_back_together(
@@ -229,28 +196,6 @@ def test_manifest_and_source_authority_reconciliation_rolls_back_together(
     assert current_reference == (old_schema, old_digest)
     assert changed_value_count == 0
     assert source_path == "data/color_source.json"
-
-
-def _successful_sector_run(
-    tmp_path: Path,
-    capsys: pytest.CaptureFixture[str],
-    monkeypatch: pytest.MonkeyPatch,
-) -> tuple[Path, Path, object]:
-    project_dir, runtime_dir = _init_demo(tmp_path, capsys)
-    run_plan = build_run_plan(
-        project_dir=project_dir,
-        context="colors",
-        workflow_name="base",
-        step_name="color_sector_analysis",
-    )
-
-    def write_staged_outputs(*_args: object, **_kwargs: object) -> int:
-        _write_all_staged_outputs(run_plan)
-        return 0
-
-    monkeypatch.setattr("nipact.execution._run_snakemake", write_staged_outputs)
-    assert execute_run_plan(run_plan, cores=1).published_count == len(run_plan.published_outputs)
-    return project_dir, runtime_dir, run_plan
 
 
 def test_registry_reads_reconciled_source_artifact(
@@ -554,15 +499,15 @@ def test_registry_path_lookup_rejects_duplicate_rows(
 
 def test_registry_reads_workflow_output_and_neighbors(
     tmp_path: Path,
-    capsys: pytest.CaptureFixture[str],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _project_dir, runtime_dir, run_plan = _successful_sector_run(
-        tmp_path,
-        capsys,
-        monkeypatch,
-    )
+    project_dir, runtime_dir, run_plan = publish_compact_colors(tmp_path, monkeypatch)
     registry_path = runtime_dir / REGISTRY_DB_PATH
+    declared_params = load_workflow_project(
+        project_dir=project_dir,
+        context="colors",
+    ).steps["color_sector_analysis"].params
+    (selected_job,) = run_plan.selected_fresh_jobs
 
     selected = read_current_published_artifact(
         registry_path,
@@ -580,7 +525,8 @@ def test_registry_reads_workflow_output_and_neighbors(
     assert selected.parameters_json is not None
     assert selected.request_bundle_digest is not None
     assert len(selected.request_bundle_digest) == 64
-    assert set(json.loads(selected.parameters_json)) == {"arc_half_width", "min_radius"}
+    assert declared_params
+    assert set(json.loads(selected.parameters_json)) == set(declared_params)
     assert read_artifact_by_id(registry_path, selected.artifact_id) == selected
     assert (
         read_artifact_by_path(
@@ -631,22 +577,19 @@ def test_registry_reads_workflow_output_and_neighbors(
     assert len(workflow_artifacts) == len(run_plan.jobs)
     assert selected in published_artifacts
     assert len(published_artifacts) == len(run_plan.published_outputs)
-    assert len(upstream_edges) == 200
-    assert {edge.binding_name for edge in upstream_edges} == {"sector_label"}
+    assert len(upstream_edges) == run_plan.execution_population.entity_count
+    assert {edge.binding_name for edge in upstream_edges} == {
+        record.binding_name for record in selected_job.input_records
+    }
     assert len(manifest_bindings) == len(run_plan.manifest_bindings)
     assert {binding.context for binding in manifest_bindings} == {"colors"}
 
 
 def test_project_validation_accepts_cross_workflow_membership_path(
     tmp_path: Path,
-    capsys: pytest.CaptureFixture[str],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    project_dir, runtime_dir, _run_plan = _successful_sector_run(
-        tmp_path,
-        capsys,
-        monkeypatch,
-    )
+    project_dir, runtime_dir, _run_plan = publish_compact_colors(tmp_path, monkeypatch)
     registry_path = runtime_dir / REGISTRY_DB_PATH
     with sqlite3.connect(registry_path) as conn:
         shared_path = conn.execute(
@@ -825,15 +768,10 @@ def test_accepted_artifact_validation_checks_size_and_extension(
 @pytest.mark.parametrize("artifact_state", ["intact", "missing", "corrupt"])
 def test_project_validation_covers_accepted_artifact_without_membership(
     tmp_path: Path,
-    capsys: pytest.CaptureFixture[str],
     monkeypatch: pytest.MonkeyPatch,
     artifact_state: str,
 ) -> None:
-    project_dir, runtime_dir, run_plan = _successful_sector_run(
-        tmp_path,
-        capsys,
-        monkeypatch,
-    )
+    project_dir, runtime_dir, run_plan = publish_compact_colors(tmp_path, monkeypatch)
     registry_path = runtime_dir / REGISTRY_DB_PATH
     with sqlite3.connect(registry_path) as conn:
         artifact_id, relative_path = conn.execute(
@@ -929,14 +867,9 @@ def test_selected_resolution_membership_invariant_covers_all_outcomes() -> None:
 
 def test_existing_membership_rejects_artifact_hash_inconsistent_with_digest(
     tmp_path: Path,
-    capsys: pytest.CaptureFixture[str],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _project_dir, runtime_dir, _run_plan = _successful_sector_run(
-        tmp_path,
-        capsys,
-        monkeypatch,
-    )
+    _project_dir, runtime_dir, _run_plan = publish_compact_colors(tmp_path, monkeypatch)
     registry_path = runtime_dir / REGISTRY_DB_PATH
     with sqlite3.connect(registry_path) as conn:
         artifact_id, path, digest = conn.execute(
@@ -981,14 +914,9 @@ def test_existing_membership_rejects_artifact_hash_inconsistent_with_digest(
 
 def test_list_artifact_group_counts_matches_list_artifacts(
     tmp_path: Path,
-    capsys: pytest.CaptureFixture[str],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _project_dir, runtime_dir, _run_plan = _successful_sector_run(
-        tmp_path,
-        capsys,
-        monkeypatch,
-    )
+    _project_dir, runtime_dir, _run_plan = publish_compact_colors(tmp_path, monkeypatch)
     registry_path = runtime_dir / REGISTRY_DB_PATH
 
     groups = list_artifact_group_counts(registry_path, context="colors")
@@ -1076,14 +1004,9 @@ def test_registry_context_safe_artifact_lookup_hides_foreign_contexts(
 
 def test_current_published_artifact_rejects_membership_hash_mismatch(
     tmp_path: Path,
-    capsys: pytest.CaptureFixture[str],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _project_dir, runtime_dir, _run_plan = _successful_sector_run(
-        tmp_path,
-        capsys,
-        monkeypatch,
-    )
+    _project_dir, runtime_dir, _run_plan = publish_compact_colors(tmp_path, monkeypatch)
     registry_path = runtime_dir / REGISTRY_DB_PATH
     with sqlite3.connect(registry_path) as conn:
         conn.execute(

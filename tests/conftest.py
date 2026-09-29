@@ -16,14 +16,17 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
+import yaml
 
 from nipact.cli import main
 from nipact.execution import build_run_plan, execute_run_plan
 from nipact.execution_evidence import CompletionReceipt, write_completion_receipt_atomic
+from nipact.manifest import load_manifest
 from nipact.registry import (
     REGISTRY_DB_PATH,
     REGISTRY_SCHEMA_VERSION,
     REGISTRY_V18_BACKUP_FILENAME,
+    initialize_prepared_demo_registry_db,
     list_artifacts,
     migrate_registry_db,
 )
@@ -275,7 +278,7 @@ def _run_main_from(cwd: Path, argv: list[str]) -> int:
         os.chdir(old_cwd)
 
 
-def _write_all_staged_outputs(run_plan: object) -> None:
+def write_all_staged_outputs(run_plan: object) -> None:
     selected_keys = {
         (job.step_name, job.output_name, job.address)
         for job in run_plan.selected_fresh_jobs
@@ -307,6 +310,125 @@ def _write_all_staged_outputs(run_plan: object) -> None:
                 outputs=tuple(job_payload["declared_outputs"]),
             ),
         )
+
+
+def write_compact_colors_project(tmp_path: Path) -> tuple[Path, Path]:
+    """Write a test-only, Colors-shaped project and initialize its registry.
+
+    Three entities, one global source imported per entity, and one cohort
+    analysis over the ``init`` execution population, plus a derived workflow.
+    It is not an executable demo: the callables are referenced only to pass
+    the loader, so it does not exercise scientific callable output.
+    """
+    project_dir = tmp_path / "project"
+    runtime_dir = tmp_path / "runtime"
+    entities = ["color_000", "color_001", "color_002"]
+    runtime = "nipact.examples.colors_processing_demo.runtime"
+    declarations = {
+        "nipact.yaml": {
+            "context": "colors",
+            "paths": {"runtime": "../runtime"},
+            "sources": {"index": "sources.yaml"},
+            "manifests": {"init": "manifests/init.yaml"},
+            "steps": {"directory": "steps"},
+            "workflows": {
+                "base": "workflows/base.yaml",
+                "red-qc-target": "workflows/red-qc-target.yaml",
+            },
+        },
+        "sources.yaml": {"global": {"colors_source": "data/color_source.json"}},
+        "manifests/init.yaml": {
+            "description": "Compact test population",
+            "entities": entities,
+        },
+        "steps/color_source.yaml": {
+            "step_name": "color_source",
+            "step_contract_version": "1",
+            "pattern_kind": "pattern_a",
+            "execution_role": "source_import",
+            "address_scope": "entity",
+            "callable": f"{runtime}:import_color_source_file",
+            "source_inputs": ["colors_source"],
+            "outputs": {
+                "source_color": {"extension": ".json", "address_scope": "entity"}
+            },
+        },
+        "steps/color_sector_analysis.yaml": {
+            "step_name": "color_sector_analysis",
+            "step_contract_version": "1",
+            "pattern_kind": "analysis",
+            "execution_role": "analysis",
+            "address_scope": "cohort",
+            "callable": f"{runtime}:color_sector_analysis_file",
+            "manifest_binding": {"role": "analysis_cohort", "manifest": "init"},
+            "inputs": {
+                "source_color": {
+                    "artifact": "color_source.source_color",
+                    "dependency_role": "analysis_input",
+                }
+            },
+            "params": {"arc_half_width": 0.5, "min_radius": 0.35},
+            "outputs": {
+                "sector_counts": {"extension": ".json", "address_scope": "cohort"}
+            },
+        },
+        "workflows/base.yaml": {
+            "workflow_name": "base",
+            "execution_population": "init",
+            "steps": [
+                {"step_name": "color_source"},
+                {"step_name": "color_sector_analysis", "output_name": "sector_counts"},
+            ],
+        },
+        "workflows/red-qc-target.yaml": {
+            "workflow_name": "red-qc-target",
+            "base_workflow": "base",
+            "step_overrides": {},
+        },
+    }
+    for relative_path, payload in declarations.items():
+        path = project_dir / relative_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")
+    source_path = runtime_dir / "data/color_source.json"
+    source_path.parent.mkdir(parents=True)
+    (runtime_dir / "database").mkdir()
+    source_path.write_text(
+        json.dumps({"records": [{"entity_id": entity} for entity in entities]}) + "\n",
+        encoding="utf-8",
+    )
+    initialize_prepared_demo_registry_db(
+        runtime_dir / REGISTRY_DB_PATH,
+        context="colors",
+        runtime_root=runtime_dir,
+        manifests={"init": load_manifest(project_dir / "manifests/init.yaml")},
+        manifest_paths={"init": "manifests/init.yaml"},
+    )
+    return project_dir, runtime_dir
+
+
+def publish_compact_colors(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[Path, Path, object]:
+    """Publish the compact project's ``base`` analysis with stubbed Snakemake only."""
+    project_dir, runtime_dir = write_compact_colors_project(tmp_path)
+    run_plan = build_run_plan(
+        project_dir=project_dir,
+        context="colors",
+        workflow_name="base",
+        step_name="color_sector_analysis",
+    )
+
+    def write_staged_outputs(*_args: object, **_kwargs: object) -> int:
+        write_all_staged_outputs(run_plan)
+        return 0
+
+    monkeypatch.setattr("nipact.execution._run_snakemake", write_staged_outputs)
+    assert execute_run_plan(run_plan, cores=1).published_count == len(
+        run_plan.published_outputs
+    )
+    return project_dir, runtime_dir, run_plan
 
 
 @pytest.fixture
@@ -341,7 +463,7 @@ def colors_registry(
         step_name="color_sector_analysis",
     )
     def write_staged_outputs(*_args: object, **_kwargs: object) -> int:
-        _write_all_staged_outputs(run_plan)
+        write_all_staged_outputs(run_plan)
         return 0
 
     monkeypatch.setattr("nipact.execution._run_snakemake", write_staged_outputs)
