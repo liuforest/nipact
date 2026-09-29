@@ -7,9 +7,9 @@ from pathlib import Path
 import pytest
 
 from nipact.cli import main
-from nipact.execution import build_run_plan, execute_run_plan
-from nipact.execution_evidence import CompletionReceipt, write_completion_receipt_atomic
-from nipact.registry import REGISTRY_DB_PATH, RegistryArtifact, list_artifacts
+from nipact.registry import read_artifact_by_id
+
+from conftest import ColorsRegistry
 
 
 def _run_main_from(cwd: Path, argv: list[str]) -> int:
@@ -48,72 +48,6 @@ def _init_demo(
     return project_dir, runtime_dir
 
 
-def _write_all_staged_outputs(run_plan: object) -> None:
-    selected_keys = {
-        (job.step_name, job.output_name, job.address)
-        for job in run_plan.selected_fresh_jobs
-    }
-    for job in run_plan.jobs:
-        job.staging_path.parent.mkdir(parents=True, exist_ok=True)
-        payload = {
-            "job_id": job.job_id,
-            "step_name": job.step_name,
-            "output_name": job.output_name,
-            "address": job.address,
-        }
-        if (job.step_name, job.output_name, job.address) in selected_keys:
-            payload["selected"] = True
-        job.staging_path.write_text(
-            json.dumps(payload, indent=2, sort_keys=True) + "\n",
-            encoding="utf-8",
-        )
-    execution_payload = json.loads(
-        (run_plan.run_workspace / "run_plan.json").read_text(encoding="utf-8")
-    )
-    for job_id, job_payload in execution_payload["jobs"].items():
-        write_completion_receipt_atomic(
-            run_plan.run_workspace / job_payload["completion_receipt_path"],
-            CompletionReceipt(
-                invocation_token=execution_payload["invocation_token"],
-                job_id=job_id,
-                request_bundle_digest=job_payload["request_bundle_digest"],
-                outputs=tuple(job_payload["declared_outputs"]),
-            ),
-        )
-
-
-def _successful_sector_run(
-    tmp_path: Path,
-    capsys: pytest.CaptureFixture[str],
-    monkeypatch: pytest.MonkeyPatch,
-) -> tuple[Path, Path, RegistryArtifact]:
-    project_dir, runtime_dir = _init_demo(tmp_path, capsys)
-    run_plan = build_run_plan(
-        project_dir=project_dir,
-        context="colors",
-        workflow_name="base",
-        step_name="color_sector_analysis",
-    )
-
-    def write_staged_outputs(*_args: object, **_kwargs: object) -> int:
-        _write_all_staged_outputs(run_plan)
-        return 0
-
-    monkeypatch.setattr("nipact.execution._run_snakemake", write_staged_outputs)
-    assert execute_run_plan(run_plan, cores=1).published_count == len(run_plan.published_outputs)
-    registry_path = runtime_dir / REGISTRY_DB_PATH
-    selected = list_artifacts(
-        registry_path,
-        context="colors",
-        origin="workflow_output",
-        workflow_name="base",
-        step_name="color_sector_analysis",
-        output_name="sector_counts",
-        is_published=True,
-    )[0]
-    return project_dir, runtime_dir, selected
-
-
 def _trace_base_args(project_dir: Path) -> list[str]:
     return [
         "--project-dir",
@@ -127,7 +61,7 @@ def _insert_foreign_source_dependency(
     *,
     registry_path: Path,
     runtime_dir: Path,
-    selected: RegistryArtifact,
+    dependent_artifact_id: int,
 ) -> int:
     with sqlite3.connect(registry_path) as conn:
         conn.execute("PRAGMA foreign_keys = ON")
@@ -168,7 +102,7 @@ def _insert_foreign_source_dependency(
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'global', 'foreign_source', ?)
             """,
             (
-                selected.artifact_id,
+                dependent_artifact_id,
                 foreign_artifact_id,
                 "c" * 64,
                 1,
@@ -183,23 +117,18 @@ def _insert_foreign_source_dependency(
 
 
 def test_trace_command_prints_text_summary_for_artifact_id(
-    tmp_path: Path,
+    colors_registry: ColorsRegistry,
     capsys: pytest.CaptureFixture[str],
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    project_dir, _runtime_dir, selected = _successful_sector_run(
-        tmp_path,
-        capsys,
-        monkeypatch,
-    )
+    artifact_id = colors_registry.root_artifact_id
 
     assert (
         main(
             [
                 "trace",
-                *_trace_base_args(project_dir),
+                *_trace_base_args(colors_registry.project_dir),
                 "--artifact-id",
-                str(selected.artifact_id),
+                str(artifact_id),
             ]
         )
         == 0
@@ -208,7 +137,7 @@ def test_trace_command_prints_text_summary_for_artifact_id(
     captured = capsys.readouterr()
     assert captured.err == ""
     lines = captured.out.splitlines()
-    assert lines[0] == f"artifact_id={selected.artifact_id}"
+    assert lines[0] == f"artifact_id={artifact_id}"
     assert "origin=workflow_output" in lines
     assert "is_published=true" in lines
     assert "workflow=base" in lines
@@ -223,57 +152,44 @@ def test_trace_command_prints_text_summary_for_artifact_id(
 
 
 def test_trace_command_does_not_mutate_registry_db(
-    tmp_path: Path,
-    capsys: pytest.CaptureFixture[str],
-    monkeypatch: pytest.MonkeyPatch,
+    colors_registry: ColorsRegistry,
 ) -> None:
-    project_dir, runtime_dir, selected = _successful_sector_run(
-        tmp_path,
-        capsys,
-        monkeypatch,
-    )
-    registry_path = runtime_dir / REGISTRY_DB_PATH
+    registry_path = colors_registry.registry_path
     before_digest = hashlib.sha256(registry_path.read_bytes()).hexdigest()
 
     assert (
         main(
             [
                 "trace",
-                *_trace_base_args(project_dir),
+                *_trace_base_args(colors_registry.project_dir),
                 "--artifact-id",
-                str(selected.artifact_id),
+                str(colors_registry.root_artifact_id),
             ]
         )
         == 0
     )
 
-    capsys.readouterr()
     after_digest = hashlib.sha256(registry_path.read_bytes()).hexdigest()
     assert after_digest == before_digest
 
 
 def test_trace_command_context_guards_non_artifact_id_selectors(
-    tmp_path: Path,
+    colors_registry: ColorsRegistry,
     capsys: pytest.CaptureFixture[str],
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    project_dir, runtime_dir, selected = _successful_sector_run(
-        tmp_path,
-        capsys,
-        monkeypatch,
-    )
-    registry_path = runtime_dir / REGISTRY_DB_PATH
+    registry_path = colors_registry.registry_path
+    selected = read_artifact_by_id(registry_path, colors_registry.root_artifact_id)
     foreign_artifact_id = _insert_foreign_source_dependency(
         registry_path=registry_path,
-        runtime_dir=runtime_dir,
-        selected=selected,
+        runtime_dir=colors_registry.runtime_dir,
+        dependent_artifact_id=selected.artifact_id,
     )
 
     assert (
         main(
             [
                 "trace",
-                *_trace_base_args(project_dir),
+                *_trace_base_args(colors_registry.project_dir),
                 "--file-path",
                 selected.path,
                 "--json",

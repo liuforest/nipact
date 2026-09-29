@@ -8,6 +8,7 @@ contract enforced by ``_reject_unsupported_query_params``.
 
 from __future__ import annotations
 
+import pytest
 from fastapi.testclient import TestClient
 
 from nipact.gui.app import create_gui_app
@@ -69,11 +70,17 @@ def test_artifacts_route_step_filter_narrows_population(
     assert {row["step_name"] for row in filtered} == {"color_sector_analysis"}
 
 
-def test_artifacts_route_rejects_unsupported_filter(
+@pytest.mark.parametrize(
+    "route",
+    ["/api/artifacts", "/api/artifacts/groups"],
+    ids=["artifacts", "groups"],
+)
+def test_artifact_routes_reject_unsupported_filter(
     colors_registry: ColorsRegistry,
+    route: str,
 ) -> None:
     client = _client(colors_registry)
-    response = client.get("/api/artifacts", params={"bogus": "1"})
+    response = client.get(route, params={"bogus": "1"})
     assert response.status_code == 422
     body = response.json()
     assert body["code"] == "unsupported_filter"
@@ -115,14 +122,3 @@ def test_artifact_groups_route_step_filter_narrows_groups(
     assert {group["step_name"] for group in filtered} == {"color_sector_analysis"}
     filtered_total = sum(group["artifact_count"] for group in filtered)
     assert 0 < filtered_total < sum(group["artifact_count"] for group in full)
-
-
-def test_artifact_groups_route_rejects_unsupported_filter(
-    colors_registry: ColorsRegistry,
-) -> None:
-    client = _client(colors_registry)
-    response = client.get("/api/artifacts/groups", params={"bogus": "1"})
-    assert response.status_code == 422
-    body = response.json()
-    assert body["code"] == "unsupported_filter"
-    assert body["details"]["filters"] == ["bogus"]
