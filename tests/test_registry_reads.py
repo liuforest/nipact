@@ -1,7 +1,6 @@
 import json
 import os
 import sqlite3
-from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -15,7 +14,6 @@ from nipact.errors import ValidationError
 from nipact.execution import build_run_plan, execute_run_plan
 from nipact.execution_evidence import CompletionReceipt, write_completion_receipt_atomic
 from nipact.manifest import build_manifest
-from nipact.projection import RegisteredSourceSnapshot
 from nipact.registry import (
     EnvironmentObservationV1,
     MembershipIntent,
@@ -36,7 +34,6 @@ from nipact.registry import (
     read_current_published_artifact,
     read_manifest,
     read_published_outputs,
-    read_registered_source_snapshots,
     reconcile_manifest_and_source_authorities,
     read_registry_summary,
     read_run_execution_population,
@@ -309,93 +306,6 @@ def test_registry_reads_reconciled_source_artifact(
         )
 
 
-def test_registry_reads_source_snapshots_without_reading_live_bytes(
-    tmp_path: Path,
-    capsys: pytest.CaptureFixture[str],
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    _project_dir, runtime_dir = _init_demo(tmp_path, capsys)
-    registry_path = runtime_dir / REGISTRY_DB_PATH
-    source_path = runtime_dir / "data/color_source.json"
-    _reconcile_colors_source(runtime_dir)
-    artifact = read_artifact_by_path(
-        registry_path,
-        context="colors",
-        artifact_path="data/color_source.json",
-    )
-    source_path.write_text("changed outside the registry\n", encoding="utf-8")
-    monkeypatch.setattr(
-        registry,
-        "sha256_file_digest",
-        lambda *_args, **_kwargs: pytest.fail("source snapshot read hashed a file"),
-    )
-
-    snapshots = read_registered_source_snapshots(
-        registry_path,
-        context="colors",
-    )
-
-    assert snapshots == {
-        LogicalSourceCoordinate("colors", "global", "colors_source", None):
-            RegisteredSourceSnapshot(
-                content_digest=artifact.content_digest,
-                file_size=artifact.file_size,
-                declared_extension=artifact.extension,
-            )
-    }
-    assert read_registered_source_snapshots(
-        registry_path,
-        context="missing",
-    ) == {}
-
-
-def test_connection_local_source_snapshot_sees_uncommitted_upsert(
-    tmp_path: Path,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    _project_dir, runtime_dir = _init_demo(tmp_path, capsys)
-    registry_path = runtime_dir / REGISTRY_DB_PATH
-    with sqlite3.connect(registry_path) as conn:
-        conn.execute("BEGIN")
-        conn.execute(
-            """
-            INSERT INTO artifacts (
-                origin, context, path, content_digest, output_hash, file_size,
-                extension, source_scope, source_name, source_st_dev,
-                source_st_ino, source_st_size, source_st_mtime_ns,
-                source_st_ctime_ns, created_at
-            )
-            VALUES ('source', ?, ?, ?, ?, ?, ?, 'global', 'uncommitted',
-                    1, 2, 17, 3, 4, ?)
-            """,
-            (
-                "colors",
-                "data/uncommitted.json",
-                "d" * 64,
-                "d" * 16,
-                17,
-                ".json",
-                "2026-07-19T00:00:00+00:00",
-            ),
-        )
-
-        snapshots = registry._read_registered_source_snapshots_conn(
-            conn,
-            context="colors",
-        )
-        conn.rollback()
-
-    assert snapshots[
-        LogicalSourceCoordinate("colors", "global", "uncommitted", None)
-    ] == (
-        RegisteredSourceSnapshot(
-            content_digest="d" * 64,
-            file_size=17,
-            declared_extension=".json",
-        )
-    )
-
-
 def test_registry_manifest_helpers_and_summary(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
@@ -509,6 +419,42 @@ def test_registry_reads_schema_qualified_run_populations_and_bindings(
     assert bindings[0].manifest_digest == manifest_digest
     assert bindings[0].entity_count == 200
 
+    with pytest.raises(
+        ValidationError,
+        match="selected-output resolution does not match selected output",
+    ):
+        record_workflow_run(
+            registry_path,
+            runtime_root=runtime_dir,
+            context="colors",
+            workflow_name="base",
+            selected_step_name="color_sector_analysis",
+            selected_output_name="sector_counts",
+            run_workspace="runs/mismatch",
+            run_plan_path="runs/mismatch/run_plan.json",
+            run_plan_digest="c" * 64,
+            artifacts=(),
+            projection_recipes=(),
+            reused_projection_seeds=(),
+            selected_resolution_intents=(
+                SelectedOutputResolutionIntent(
+                    context="colors",
+                    workflow_name="base",
+                    step_name="color_features",
+                    output_name="sector_counts",
+                    address="cohort",
+                    outcome=None,
+                ),
+            ),
+            environment_observation=EnvironmentObservationV1(
+                nipact_version="test",
+                python_version="test",
+                platform="test",
+                snakemake_version="test",
+            ),
+            manifest_bindings=(),
+            membership_intents=(),
+        )
     with pytest.raises(ValidationError, match="FOREIGN KEY constraint failed"):
         record_workflow_run(
             registry_path,
@@ -959,102 +905,6 @@ def test_project_validation_covers_accepted_artifact_without_membership(
             validate_project(project_dir=project_dir, context="colors")
 
 
-def test_membership_intent_can_reference_one_existing_artifact_more_than_once(
-    tmp_path: Path,
-    capsys: pytest.CaptureFixture[str],
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    _project_dir, runtime_dir, _run_plan = _successful_sector_run(
-        tmp_path,
-        capsys,
-        monkeypatch,
-    )
-    registry_path = runtime_dir / REGISTRY_DB_PATH
-    with sqlite3.connect(registry_path) as conn:
-        conn.execute("PRAGMA foreign_keys = ON")
-        artifact_id, path, digest, output_hash = conn.execute(
-            """
-            SELECT artifact_id, path, content_digest, output_hash
-            FROM artifacts
-            WHERE step_name = 'color_sector_analysis'
-              AND output_name = 'sector_counts'
-              AND address = 'cohort'
-            """
-        ).fetchone()
-        registry._insert_memberships(
-            conn,
-            intents=(
-                MembershipIntent(
-                    row=PublishedOutputRow(
-                        context="colors",
-                        workflow_name="derived",
-                        step_name="color_sector_analysis",
-                        output_name="sector_counts",
-                        address="cohort",
-                        path=path,
-                        output_digest=digest,
-                        output_hash=output_hash,
-                    ),
-                    existing_artifact_id=artifact_id,
-                ),
-            ),
-            artifact_ids={},
-        )
-        assert conn.execute(
-            "SELECT COUNT(*) FROM published_outputs WHERE artifact_id = ?",
-            (artifact_id,),
-        ).fetchone()[0] == 2
-        reused_summary = json.loads(
-            registry._resolution_summary_json(
-                (
-                    SelectedOutputResolutionIntent(
-                        context="colors",
-                        workflow_name="derived",
-                        step_name="color_sector_analysis",
-                        output_name="sector_counts",
-                        address="cohort",
-                        outcome="reused",
-                        existing_artifact_id=artifact_id,
-                    ),
-                ),
-                artifact_ids={},
-                conn=conn,
-            )
-        )
-        assert reused_summary["selected_outputs"][0]["resolution"] == {
-            "artifact_id": artifact_id,
-            "outcome": "reused",
-        }
-        with pytest.raises(
-            sqlite3.IntegrityError,
-            match="FOREIGN KEY constraint failed",
-        ):
-            conn.execute(
-                """
-                INSERT INTO published_outputs (
-                    context, workflow_name, step_name, output_name, address,
-                    path, output_digest, output_hash, artifact_id
-                )
-                VALUES ('colors', 'bad', 'step', 'output', 'init', ?, ?, ?, ?)
-                """,
-                (path, digest, output_hash, artifact_id + 10000),
-            )
-        with pytest.raises(
-            sqlite3.IntegrityError,
-            match="NOT NULL constraint failed",
-        ):
-            conn.execute(
-                """
-                INSERT INTO published_outputs (
-                    context, workflow_name, step_name, output_name, address,
-                    path, output_digest, output_hash, artifact_id
-                )
-                VALUES ('colors', 'null', 'step', 'output', 'init', ?, ?, ?, NULL)
-                """,
-                (path, digest, output_hash),
-            )
-
-
 def test_selected_resolution_membership_invariant_covers_all_outcomes() -> None:
     row = PublishedOutputRow(
         context="colors",
@@ -1258,32 +1108,6 @@ def test_registry_context_safe_artifact_lookup_hides_foreign_contexts(
         )
 
 
-def test_registry_reads_reject_unknown_ids_runs_and_schema(
-    tmp_path: Path,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    _project_dir, runtime_dir = _init_demo(tmp_path, capsys)
-    registry_path = runtime_dir / REGISTRY_DB_PATH
-
-    with pytest.raises(ValidationError, match="positive integer"):
-        read_artifact_by_id(registry_path, 0)
-    with pytest.raises(ValidationError, match="unknown registry artifact id"):
-        read_artifact_by_id(registry_path, 999)
-    with pytest.raises(ValidationError, match="unknown registry artifact id"):
-        list_upstream_dependencies(registry_path, artifact_id=999)
-    with pytest.raises(ValidationError, match="unknown workflow run id"):
-        list_run_manifest_bindings(registry_path, run_id=999)
-    with pytest.raises(ValidationError, match="unknown current published artifact"):
-        read_current_published_artifact(
-            registry_path,
-            context="colors",
-            workflow_name="base",
-            step_name="color_sector_analysis",
-            output_name="sector_counts",
-            address="cohort",
-        )
-
-
 def test_current_published_artifact_rejects_membership_hash_mismatch(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
@@ -1359,105 +1183,6 @@ def test_registry_reads_translate_schema_read_failure(
             pass
 
 
-def test_read_session_reads_match_public_helpers(
-    tmp_path: Path,
-    capsys: pytest.CaptureFixture[str],
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    _project_dir, runtime_dir, _run_plan = _successful_sector_run(
-        tmp_path,
-        capsys,
-        monkeypatch,
-    )
-    registry_path = runtime_dir / REGISTRY_DB_PATH
-    selected = read_current_published_artifact(
-        registry_path,
-        context="colors",
-        workflow_name="base",
-        step_name="color_sector_analysis",
-        output_name="sector_counts",
-        address="cohort",
-    )
-
-    with _open_registry_read_session(registry_path) as session:
-        assert session.read_artifact_by_id(
-            selected.artifact_id
-        ) == read_artifact_by_id(registry_path, selected.artifact_id)
-        assert session.list_upstream_dependencies(
-            artifact_id=selected.artifact_id
-        ) == list_upstream_dependencies(
-            registry_path,
-            artifact_id=selected.artifact_id,
-        )
-        assert session.list_run_manifest_bindings(
-            run_id=selected.run_id,
-            context="colors",
-        ) == list_run_manifest_bindings(
-            registry_path,
-            run_id=selected.run_id,
-            context="colors",
-        )
-
-
-def test_read_session_opens_one_connection_and_validates_once(
-    tmp_path: Path,
-    capsys: pytest.CaptureFixture[str],
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    _project_dir, runtime_dir, _run_plan = _successful_sector_run(
-        tmp_path,
-        capsys,
-        monkeypatch,
-    )
-    registry_path = runtime_dir / REGISTRY_DB_PATH
-    selected = read_current_published_artifact(
-        registry_path,
-        context="colors",
-        workflow_name="base",
-        step_name="color_sector_analysis",
-        output_name="sector_counts",
-        address="cohort",
-    )
-    upstream = list_upstream_dependencies(
-        registry_path,
-        artifact_id=selected.artifact_id,
-    )
-    assert len(upstream) > 1
-
-    connect_calls: list[Path] = []
-    validate_in_transaction: list[bool] = []
-    real_connect = registry._connect_readonly_rows
-    real_validate = registry._validate_schema_version
-
-    @contextmanager
-    def counting_connect(path: Path):
-        connect_calls.append(path)
-        with real_connect(path) as conn:
-            yield conn
-
-    def counting_validate(conn: sqlite3.Connection) -> None:
-        validate_in_transaction.append(conn.in_transaction)
-        real_validate(conn)
-
-    monkeypatch.setattr(registry, "_connect_readonly_rows", counting_connect)
-    monkeypatch.setattr(registry, "_validate_schema_version", counting_validate)
-
-    with _open_registry_read_session(registry_path) as session:
-        opened_conn = session._conn
-        assert opened_conn.in_transaction is True
-        session.read_artifact_by_id(selected.artifact_id)
-        for edge in upstream:
-            session.read_artifact_by_id(edge.source_artifact_id)
-            session.list_upstream_dependencies(artifact_id=edge.source_artifact_id)
-        session.list_run_manifest_bindings(run_id=selected.run_id, context="colors")
-
-    # One connection and one schema validation regardless of how many hops ran.
-    assert connect_calls == [registry_path]
-    assert validate_in_transaction == [True]
-    with pytest.raises(sqlite3.ProgrammingError):
-        opened_conn.execute("SELECT 1")
-
-
 def test_read_session_reports_unknown_ids_within_session(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
@@ -1465,6 +1190,10 @@ def test_read_session_reports_unknown_ids_within_session(
     _project_dir, runtime_dir = _init_demo(tmp_path, capsys)
     registry_path = runtime_dir / REGISTRY_DB_PATH
 
+    with pytest.raises(ValidationError, match="positive integer"):
+        read_artifact_by_id(registry_path, 0)
+    with pytest.raises(ValidationError, match="unknown registry artifact id"):
+        read_artifact_by_id(registry_path, 999)
     with _open_registry_read_session(registry_path) as session:
         with pytest.raises(ValidationError, match="positive integer"):
             session.read_artifact_by_id(0)

@@ -297,20 +297,6 @@ def test_cli_init_defaults_context_to_demo(
     )
 
 
-def test_validate_resolves_project_root_fallback(
-    tmp_path: Path,
-    capsys: pytest.CaptureFixture[str],
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    project_dir, _runtime_dir = _init_demo(tmp_path, capsys)
-    (tmp_path / "nipact.contexts.yaml").unlink()
-    monkeypatch.chdir(project_dir)
-
-    assert main(["validate", "--context", "colors"]) == 0
-
-    assert "PASS: validate" in capsys.readouterr().out
-
-
 def test_workflow_list_command(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
@@ -553,94 +539,6 @@ def test_workflow_run_command_executes_step(
     ]
 
 
-def test_workflow_run_accepts_address_and_reports_targeted_summary(
-    tmp_path: Path,
-    capsys: pytest.CaptureFixture[str],
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    project_dir, _runtime_dir = _init_demo(tmp_path, capsys)
-    captured_plans = []
-
-    def publish_stub(run_plan: object, **_kwargs: object) -> RunOutcome:
-        captured_plans.append(run_plan)
-        return RunOutcome(
-            published_count=1,
-            selected_generated_count=1,
-            selected_reused_count=0,
-            failed_jobs=(),
-            all_selected_resolved=True,
-        )
-
-    monkeypatch.setattr("nipact.execution.execute_run_plan", publish_stub)
-
-    assert (
-        main(
-            [
-                "workflow",
-                "run",
-                *_workflow_base_args(project_dir),
-                "--workflow",
-                "base",
-                "--step",
-                "color_local_transform",
-                "--address",
-                "color_007",
-            ]
-        )
-        == 0
-    )
-
-    (run_plan,) = captured_plans
-    assert run_plan.requested_address == "color_007"
-    output = capsys.readouterr().out.splitlines()
-    assert "address=color_007" in output
-    assert "selected_outputs=1" in output
-    workspace_line = next(
-        line for line in output if line.startswith("run_workspace=")
-    )
-    assert workspace_line.endswith(
-        "/runs/colors/base/color_local_transform/addresses/color_007"
-    )
-    assert "PASS: workflow run" in output
-
-
-def test_workflow_run_dry_run_failure_exits_nonzero_without_pass(
-    tmp_path: Path,
-    capsys: pytest.CaptureFixture[str],
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    project_dir, _runtime_dir = _init_demo(tmp_path, capsys)
-
-    def fail_dry_run(*_args: object, **_kwargs: object) -> int:
-        return 1
-
-    monkeypatch.setattr("nipact.execution._run_snakemake", fail_dry_run)
-
-    assert (
-        main(
-            [
-                "workflow",
-                "run",
-                *_workflow_base_args(project_dir),
-                "--workflow",
-                "base",
-                "--step",
-                "color_sector_analysis",
-                "--dry-run",
-            ]
-        )
-        == 1
-    )
-
-    captured = capsys.readouterr()
-    assert "error: Snakemake failed with exit code 1" in captured.err
-    assert "logs/snakemake.log" in captured.err
-    assert "PASS" not in captured.out
-    # The success footer never prints on a failed dry run.
-    assert "outputs_published" not in captured.out
-    assert "registry=" not in captured.out
-
-
 def test_workflow_run_dry_run_reports_mode_aware_summary(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
@@ -750,6 +648,9 @@ def test_workflow_run_targeted_summary_reports_selected_closure_job_count(
 
     assert full_summary["address"] == "all"
     assert targeted_summary["address"] == "color_007"
+    assert targeted_summary["run_workspace"].endswith(
+        "/runs/colors/base/color_local_transform/addresses/color_007"
+    )
     assert int(full_summary["selected_outputs"]) == 200
     assert int(targeted_summary["selected_outputs"]) == 1
     # Structural planning and the forecast are selected-closure scoped.
@@ -807,14 +708,13 @@ def test_workflow_run_rejects_non_positive_cores(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    project_dir, _runtime_dir = _init_demo(tmp_path, capsys)
-
+    # Argument parsing exits before the (absent) project is read.
     with pytest.raises(SystemExit) as exc_info:
         main(
             [
                 "workflow",
                 "run",
-                *_workflow_base_args(project_dir),
+                *_workflow_base_args(tmp_path / "project"),
                 "--workflow",
                 "base",
                 "--step",

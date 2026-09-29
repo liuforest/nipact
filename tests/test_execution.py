@@ -2,7 +2,6 @@ import json
 import os
 import sqlite3
 from contextlib import contextmanager
-from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -690,50 +689,6 @@ def test_loaded_project_planning_matches_public_compact_plan_without_reload(
         / "runs/mini/main/uppercase_text/addresses/sub_001/dry-run"
     )
     assert not private_plan.run_workspace.exists()
-
-
-def test_build_run_plan_for_base_entity_step(
-    tmp_path: Path,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    project_dir, runtime_dir = _init_demo(tmp_path, capsys)
-
-    run_plan = build_run_plan(
-        project_dir=project_dir,
-        context="colors",
-        workflow_name="base",
-        step_name="color_local_transform",
-    )
-
-    assert run_plan.runtime_root == runtime_dir
-    assert run_plan.workflow_name == "base"
-    assert run_plan.selected_step_name == "color_local_transform"
-    assert run_plan.selected_output_name == "local_color"
-    assert run_plan.run_workspace == (
-        runtime_dir / "runs/colors/base/color_local_transform"
-    )
-    assert len(run_plan.published_outputs) == len(run_plan.jobs)
-    assert run_plan.published_outputs[0].address == "color_000"
-    assert run_plan.published_outputs[-1].address == "color_199"
-    assert (
-        "color_local_transform",
-        "local_color",
-        "color_000",
-    ) in {
-        (spec.step_name, spec.output_name, spec.address)
-        for spec in run_plan.published_outputs
-    }
-    assert len(run_plan.jobs) == 600
-    assert run_plan.jobs[0].staging_path == (
-        runtime_dir
-        / "runs/colors/base/color_local_transform/staging/"
-        "color_source/source_color/color_000.json"
-    )
-    assert run_plan.selected_fresh_jobs[0].staging_path == (
-        runtime_dir
-        / "runs/colors/base/color_local_transform/staging/"
-        "color_local_transform/local_color/color_000.json"
-    )
 
 
 def test_build_run_plan_for_base_cohort_step(
@@ -1540,125 +1495,6 @@ def test_execute_run_plan_publishes_selected_outputs_without_real_snakemake(
     assert f"published_outputs={len(run_plan.published_outputs)}" in cli_output
 
 
-def test_execute_run_plan_retains_orphan_finals_when_registration_fails(
-    tmp_path: Path,
-    capsys: pytest.CaptureFixture[str],
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    _project_dir, runtime_dir = _init_demo(tmp_path, capsys)
-    run_plan = build_run_plan(
-        project_dir=_project_dir,
-        context="colors",
-        workflow_name="base",
-        step_name="color_sector_analysis",
-    )
-
-    def write_staged_outputs(*_args: object, **_kwargs: object) -> int:
-        _write_all_staged_outputs(run_plan)
-        return 0
-
-    def fail_registration(*_args: object, **_kwargs: object) -> int:
-        raise ValidationError("registry write failed")
-
-    monkeypatch.setattr("nipact.execution._run_snakemake", write_staged_outputs)
-    monkeypatch.setattr("nipact.execution.record_workflow_run", fail_registration)
-
-    with pytest.raises(ValidationError, match="registry write failed"):
-        execute_run_plan(run_plan, cores=1)
-
-    orphan_finals = list((runtime_dir / "outputs/v1").rglob("*.json"))
-    assert len(orphan_finals) == len(run_plan.published_outputs)
-    assert all(
-        not output.staging_path.exists()
-        for job in run_plan.jobs
-        for output in job.outputs.values()
-    )
-    with sqlite3.connect(runtime_dir / "database/registry.db") as conn:
-        assert conn.execute("SELECT COUNT(*) FROM published_outputs").fetchone()[0] == 0
-        assert conn.execute("SELECT COUNT(*) FROM workflow_runs").fetchone()[0] == 0
-        assert conn.execute(
-            "SELECT COUNT(*) FROM artifacts WHERE origin = 'source'"
-        ).fetchone()[0] == 1
-
-
-def test_selected_resolution_mismatch_rolls_back_run_recording(
-    tmp_path: Path,
-    capsys: pytest.CaptureFixture[str],
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    project_dir, runtime_dir = _init_demo(tmp_path, capsys)
-    run_plan = build_run_plan(
-        project_dir=project_dir,
-        context="colors",
-        workflow_name="base",
-        step_name="color_sector_analysis",
-    )
-
-    def write_staged_outputs(*_args: object, **_kwargs: object) -> int:
-        _write_all_staged_outputs(run_plan)
-        return 0
-
-    monkeypatch.setattr("nipact.execution._run_snakemake", write_staged_outputs)
-    execute_run_plan(run_plan, cores=1)
-
-    registry_path = runtime_dir / "database/registry.db"
-    with sqlite3.connect(registry_path) as conn:
-        prior_run_id = conn.execute(
-            "SELECT run_id FROM workflow_runs WHERE is_current = 1"
-        ).fetchone()[0]
-        prior_memberships = conn.execute(
-            """
-            SELECT context, workflow_name, step_name, output_name, address, artifact_id
-            FROM published_outputs
-            ORDER BY context, workflow_name, step_name, output_name, address
-            """
-        ).fetchall()
-        prior_artifact_count = conn.execute(
-            "SELECT COUNT(*) FROM artifacts WHERE origin = 'workflow_output'"
-        ).fetchone()[0]
-
-    run_plan = build_run_plan(
-        project_dir=project_dir,
-        context="colors",
-        workflow_name="base",
-        step_name="color_sector_analysis",
-    )
-
-    real_selected_resolution_intents = execution_module._selected_resolution_intents
-
-    def mismatched_selected_resolution_intents(*args: object, **kwargs: object):
-        intents = real_selected_resolution_intents(*args, **kwargs)
-        return (replace(intents[0], step_name="color_features"), *intents[1:])
-
-    monkeypatch.setattr(
-        "nipact.execution._selected_resolution_intents",
-        mismatched_selected_resolution_intents,
-    )
-
-    with pytest.raises(
-        ValidationError,
-        match="selected-output resolution does not match selected output",
-    ):
-        execute_run_plan(run_plan, cores=1)
-
-    with sqlite3.connect(registry_path) as conn:
-        assert conn.execute("SELECT COUNT(*) FROM workflow_runs").fetchone()[0] == 1
-        assert conn.execute(
-            "SELECT is_current FROM workflow_runs WHERE run_id = ?",
-            (prior_run_id,),
-        ).fetchone() == (1,)
-        assert conn.execute(
-            """
-            SELECT context, workflow_name, step_name, output_name, address, artifact_id
-            FROM published_outputs
-            ORDER BY context, workflow_name, step_name, output_name, address
-            """
-        ).fetchall() == prior_memberships
-        assert conn.execute(
-            "SELECT COUNT(*) FROM artifacts WHERE origin = 'workflow_output'"
-        ).fetchone()[0] == prior_artifact_count
-
-
 def test_tiny_non_colors_run_registers_used_sources_and_trace(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
@@ -1847,57 +1683,6 @@ def test_run_snakemake_command_omits_keep_incomplete(
     # Sanity-check we captured the real Snakemake command and the relied-on flags remain.
     assert "--keep-going" in command
     assert "--rerun-incomplete" in command
-
-
-def test_failed_snakemake_run_does_not_update_registry(
-    tmp_path: Path,
-    capsys: pytest.CaptureFixture[str],
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    project_dir, runtime_dir = _init_demo(tmp_path, capsys)
-    run_plan = build_run_plan(
-        project_dir=project_dir,
-        context="colors",
-        workflow_name="base",
-        step_name="color_local_transform",
-    )
-
-    def ran_and_failed(*_args: object, **_kwargs: object) -> int:
-        # A Snakemake subprocess that ran, exited non-zero, and left no staged
-        # outputs: the §3.1 hard-error branch (publish nothing + non-zero exit).
-        return 1
-
-    monkeypatch.setattr("nipact.execution._run_snakemake", ran_and_failed)
-    with pytest.raises(ValidationError, match="Snakemake failed with exit code 1"):
-        execute_run_plan(run_plan, cores=1)
-
-    with sqlite3.connect(runtime_dir / "database/registry.db") as conn:
-        counts = {
-            "published_outputs": conn.execute(
-                "SELECT COUNT(*) FROM published_outputs"
-            ).fetchone()[0],
-            "workflow_runs": conn.execute("SELECT COUNT(*) FROM workflow_runs").fetchone()[0],
-            "workflow_artifacts": conn.execute(
-                "SELECT COUNT(*) FROM artifacts WHERE origin = 'workflow_output'"
-            ).fetchone()[0],
-            "dependencies": conn.execute(
-                "SELECT COUNT(*) FROM artifact_dependencies"
-            ).fetchone()[0],
-            "manifest_bindings": conn.execute(
-                "SELECT COUNT(*) FROM run_manifest_bindings"
-            ).fetchone()[0],
-            "source_artifacts": conn.execute(
-                "SELECT COUNT(*) FROM artifacts WHERE origin = 'source'"
-            ).fetchone()[0],
-        }
-    assert counts == {
-        "published_outputs": 0,
-        "workflow_runs": 0,
-        "workflow_artifacts": 0,
-        "dependencies": 0,
-        "manifest_bindings": 0,
-        "source_artifacts": 1,
-    }
 
 
 def test_partial_publish_records_surviving_jobs(

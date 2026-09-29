@@ -222,38 +222,6 @@ def test_trace_command_prints_text_summary_for_artifact_id(
     assert lines[-1] == "PASS: trace"
 
 
-def test_trace_command_json_output_is_json_only_for_file_path(
-    tmp_path: Path,
-    capsys: pytest.CaptureFixture[str],
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    project_dir, _runtime_dir, selected = _successful_sector_run(
-        tmp_path,
-        capsys,
-        monkeypatch,
-    )
-
-    assert (
-        main(
-            [
-                "trace",
-                *_trace_base_args(project_dir),
-                "--file-path",
-                selected.path,
-                "--json",
-            ]
-        )
-        == 0
-    )
-
-    captured = capsys.readouterr()
-    assert captured.err == ""
-    assert "PASS:" not in captured.out
-    graph = json.loads(captured.out)
-    assert graph["selected_artifact_id"] == selected.artifact_id
-    assert graph["provenance_status"] == "complete"
-
-
 def test_trace_command_does_not_mutate_registry_db(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
@@ -284,17 +252,10 @@ def test_trace_command_does_not_mutate_registry_db(
     assert after_digest == before_digest
 
 
-@pytest.mark.parametrize(
-    "selector",
-    [
-        "file_path",
-    ],
-)
 def test_trace_command_context_guards_non_artifact_id_selectors(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
     monkeypatch: pytest.MonkeyPatch,
-    selector: str,
 ) -> None:
     project_dir, runtime_dir, selected = _successful_sector_run(
         tmp_path,
@@ -307,26 +268,14 @@ def test_trace_command_context_guards_non_artifact_id_selectors(
         runtime_dir=runtime_dir,
         selected=selected,
     )
-    if selector == "file_path":
-        selector_args = ["--file-path", selected.path]
-    else:
-        selector_args = [
-            "--workflow",
-            "base",
-            "--step",
-            "color_sector_analysis",
-            "--output",
-            "sector_counts",
-            "--address",
-            "cohort",
-        ]
 
     assert (
         main(
             [
                 "trace",
                 *_trace_base_args(project_dir),
-                *selector_args,
+                "--file-path",
+                selected.path,
                 "--json",
             ]
         )
@@ -336,6 +285,7 @@ def test_trace_command_context_guards_non_artifact_id_selectors(
     captured = capsys.readouterr()
     assert captured.err == ""
     graph = json.loads(captured.out)
+    assert graph["selected_artifact_id"] == selected.artifact_id
     assert graph["provenance_status"] == "degraded"
     assert {
         "warning_type": "cross_context_dependency",
