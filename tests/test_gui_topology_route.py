@@ -48,6 +48,9 @@ def test_topology_route_returns_observed_projection(
     assert topology.root_node_id in {node.node_id for node in topology.nodes}
     assert topology.summary.node_count == len(topology.nodes)
     assert topology.summary.edge_count == len(topology.edges)
+    assert len(topology.execution_populations) == 1
+    # Non-empty guard: the root's closure reaches the source through a step.
+    assert any(node.kind == "source_input" for node in topology.nodes)
 
 
 def test_topology_route_unknown_artifact_returns_404(

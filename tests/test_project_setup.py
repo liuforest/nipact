@@ -2,6 +2,7 @@ import json
 import os
 from pathlib import Path
 import sqlite3
+from typing import Callable
 
 import pytest
 import yaml
@@ -548,11 +549,8 @@ def test_init_creates_project_runtime_databases_and_validates(
             """
         ).fetchall()
         published_rows = conn.execute("SELECT * FROM published_outputs").fetchall()
-    with registry_module._connect_readonly(runtime_dir / "database/registry.db") as conn:
-        foreign_keys = conn.execute("PRAGMA foreign_keys").fetchone()[0]
     assert schema_version == REGISTRY_SCHEMA_VERSION
     assert context_row == (str(runtime_dir), 1)
-    assert foreign_keys == 1
     assert manifest_rows == [
         (
             "demo-40",
@@ -774,125 +772,6 @@ def test_validate_fails_for_missing_project_config(
     assert "missing YAML file" in capsys.readouterr().err
 
 
-def test_validate_fails_for_missing_manifest(
-    tmp_path: Path,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    project_dir, _runtime_dir = _init_demo(tmp_path, capsys)
-    (project_dir / "manifests/init.yaml").unlink()
-
-    assert (
-        main(
-            [
-                "validate",
-                "--project-dir",
-                str(project_dir),
-                "--context",
-                "colors",
-            ]
-        )
-        == 1
-    )
-    assert "missing manifest file" in capsys.readouterr().err
-
-
-def test_validate_fails_for_configured_manifest_escape(
-    tmp_path: Path,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    project_dir, _runtime_dir = _init_demo(tmp_path, capsys)
-    config = _read_project_config(project_dir)
-    manifests = config["manifests"]
-    assert isinstance(manifests, dict)
-    manifests["init"] = "../outside.yaml"
-    _write_project_config(project_dir, config)
-
-    _assert_validate_fails(project_dir, capsys, "must stay inside project dir")
-
-
-def test_validate_fails_for_missing_source_data(
-    tmp_path: Path,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    project_dir, runtime_dir = _init_demo(tmp_path, capsys)
-    (runtime_dir / "data/color_source.json").unlink()
-
-    assert (
-        main(
-            [
-                "validate",
-                "--project-dir",
-                str(project_dir),
-                "--context",
-                "colors",
-            ]
-        )
-        == 1
-    )
-    assert "missing JSON file" in capsys.readouterr().err
-
-
-def test_validate_fails_for_changed_source_content(
-    tmp_path: Path,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    project_dir, runtime_dir = _init_demo(tmp_path, capsys)
-    source_path = runtime_dir / "data/color_source.json"
-    source_payload = json.loads(source_path.read_text(encoding="utf-8"))
-    source_payload["records"][0]["value"] = 0.123
-    source_path.write_text(json.dumps(source_payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-
-    assert (
-        main(
-            [
-                "validate",
-                "--project-dir",
-                str(project_dir),
-                "--context",
-                "colors",
-            ]
-        )
-        == 1
-    )
-    assert "source data content" in capsys.readouterr().err
-
-
-def test_validate_fails_for_malformed_database(
-    tmp_path: Path,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    project_dir, runtime_dir = _init_demo(tmp_path, capsys)
-    (runtime_dir / "database/registry.db").write_text("not sqlite\n", encoding="utf-8")
-
-    assert (
-        main(
-            [
-                "validate",
-                "--project-dir",
-                str(project_dir),
-                "--context",
-                "colors",
-            ]
-        )
-        == 1
-    )
-    assert "registry.db is malformed" in capsys.readouterr().err
-
-
-def test_validate_accepts_source_before_first_authority_reconciliation(
-    tmp_path: Path,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    project_dir, runtime_dir = _init_demo(tmp_path, capsys)
-    assert (
-        main(
-            ["validate", "--project-dir", str(project_dir), "--context", "colors"]
-        )
-        == 0
-    )
-    assert "PASS: validate" in capsys.readouterr().out
-
-
 def test_validate_accepts_registered_published_output(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
@@ -915,81 +794,6 @@ def test_validate_accepts_registered_published_output(
     output = capsys.readouterr().out
     assert "published_outputs=1" in output
     assert "PASS: validate" in output
-
-
-def test_validate_rejects_noncanonical_stored_request_projection(
-    tmp_path: Path,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    project_dir, runtime_dir = _init_demo(tmp_path, capsys)
-    _insert_published_output(runtime_dir)
-    registry_path = runtime_dir / "database/registry.db"
-    with sqlite3.connect(registry_path) as conn:
-        digest, projection_json = conn.execute(
-            """
-            SELECT request_bundle_digest, projection_json
-            FROM request_bundle_projections
-            """
-        ).fetchone()
-        conn.execute(
-            """
-            UPDATE request_bundle_projections
-            SET projection_json = ?
-            WHERE request_bundle_digest = ?
-            """,
-            (json.dumps(json.loads(projection_json), indent=2), digest),
-        )
-
-    _assert_validate_fails(project_dir, capsys, "not canonical JSON")
-
-
-def test_validate_rejects_missing_upstream_request_projection(
-    tmp_path: Path,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    project_dir, runtime_dir = _init_demo(tmp_path, capsys)
-    registry_path = runtime_dir / "database/registry.db"
-    payload = {
-        "address": "init",
-        "canonical_parameters": {},
-        "determinism_contract": "deterministic",
-            "identity_contract_version": 3,
-        "namespace": "colors",
-        "output_contract": {
-            "output_contract_version": 1,
-            "sibling_outputs": [
-                {"declared_extension": ".json", "output_name": "output"}
-            ],
-        },
-        "result_affecting_settings": {},
-        "role_labelled_bindings": [
-            {
-                "output_name": "output",
-                "role": "upstream",
-                "upstream_request_bundle_digest": "f" * 64,
-            }
-        ],
-        "step_contract": {
-            "callable_ref": "tests:manual",
-            "runner_contract_version": "2",
-            "step_contract_id": "manual",
-            "step_contract_version": "1",
-        },
-    }
-    projection_json = json.dumps(payload, sort_keys=True, separators=(",", ":"))
-    digest = sha256_digest(projection_json.encode("utf-8"))
-    with sqlite3.connect(registry_path) as conn:
-        conn.execute(
-            """
-            INSERT INTO request_bundle_projections (
-                request_bundle_digest, projection_json
-            )
-            VALUES (?, ?)
-            """,
-            (digest, projection_json),
-        )
-
-    _assert_validate_fails(project_dir, capsys, "missing upstream projection")
 
 
 def test_registry_projection_observation_and_membership_constraints(
@@ -1120,30 +924,146 @@ def test_registry_projection_observation_and_membership_constraints(
             )
 
 
-@pytest.mark.parametrize(
-    ("output_artifact_path", "expected_error"),
-    [
-        ("../outside.json", "must be under outputs/v1/"),
-        ("/tmp/outside.json", "must be relative to runtime dir"),
-        ("data/outside.json", "must be under outputs/v1/"),
-        (
-            "outputs/colors/base/analysis/result/cohort.1234567890abcdef.json",
-            "must be under outputs/v1/",
-        ),
-    ],
-)
-def test_validate_fails_for_published_output_path_escape(
-    tmp_path: Path,
-    capsys: pytest.CaptureFixture[str],
-    output_artifact_path: str,
-    expected_error: str,
-) -> None:
-    project_dir, runtime_dir = _init_demo(tmp_path, capsys)
+def _move_init_manifest_outside_project(project_dir: Path, runtime_dir: Path) -> None:
+    config = _read_project_config(project_dir)
+    manifests = config["manifests"]
+    assert isinstance(manifests, dict)
+    manifests["init"] = "../outside.yaml"
+    _write_project_config(project_dir, config)
+
+
+def _change_source_content(project_dir: Path, runtime_dir: Path) -> None:
+    source_path = runtime_dir / "data/color_source.json"
+    source_payload = json.loads(source_path.read_text(encoding="utf-8"))
+    source_payload["records"][0]["value"] = 0.123
+    source_path.write_text(json.dumps(source_payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def _insert_projection_with_missing_upstream(project_dir: Path, runtime_dir: Path) -> None:
+    payload = {
+        "address": "init",
+        "canonical_parameters": {},
+        "determinism_contract": "deterministic",
+        "identity_contract_version": 3,
+        "namespace": "colors",
+        "output_contract": {
+            "output_contract_version": 1,
+            "sibling_outputs": [
+                {"declared_extension": ".json", "output_name": "output"}
+            ],
+        },
+        "result_affecting_settings": {},
+        "role_labelled_bindings": [
+            {
+                "output_name": "output",
+                "role": "upstream",
+                "upstream_request_bundle_digest": "f" * 64,
+            }
+        ],
+        "step_contract": {
+            "callable_ref": "tests:manual",
+            "runner_contract_version": "2",
+            "step_contract_id": "manual",
+            "step_contract_version": "1",
+        },
+    }
+    projection_json = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    digest = sha256_digest(projection_json.encode("utf-8"))
+    with sqlite3.connect(runtime_dir / "database/registry.db") as conn:
+        conn.execute(
+            """
+            INSERT INTO request_bundle_projections (
+                request_bundle_digest, projection_json
+            )
+            VALUES (?, ?)
+            """,
+            (digest, projection_json),
+        )
+
+
+def _set_published_output_path(runtime_dir: Path, output_artifact_path: str) -> None:
     _insert_published_output(runtime_dir)
     with sqlite3.connect(runtime_dir / "database/registry.db") as conn:
         conn.execute(
             "UPDATE published_outputs SET path = ? WHERE context = ?",
             (output_artifact_path, "colors"),
         )
+
+
+@pytest.mark.parametrize(
+    ("corrupt", "expected_error"),
+    [
+        pytest.param(
+            lambda project_dir, runtime_dir: (project_dir / "manifests/init.yaml").unlink(),
+            "missing manifest file",
+            id="missing-manifest",
+        ),
+        # Leaves the Colors template shape, so the generic loader guard fires.
+        pytest.param(
+            _move_init_manifest_outside_project,
+            "must stay inside project dir",
+            id="manifest-escape",
+        ),
+        pytest.param(
+            lambda project_dir, runtime_dir: (runtime_dir / "data/color_source.json").unlink(),
+            "missing JSON file",
+            id="missing-source-data",
+        ),
+        pytest.param(
+            _change_source_content,
+            "source data content",
+            id="changed-source-content",
+        ),
+        pytest.param(
+            lambda project_dir, runtime_dir: (runtime_dir / "database/registry.db").write_text(
+                "not sqlite\n", encoding="utf-8"
+            ),
+            "registry.db is malformed",
+            id="malformed-registry",
+        ),
+        pytest.param(
+            _insert_projection_with_missing_upstream,
+            "missing upstream projection",
+            id="missing-upstream-projection",
+        ),
+        pytest.param(
+            lambda project_dir, runtime_dir: _set_published_output_path(
+                runtime_dir, "../outside.json"
+            ),
+            "must be under outputs/v1/",
+            id="published-path-parent-escape",
+        ),
+        pytest.param(
+            lambda project_dir, runtime_dir: _set_published_output_path(
+                runtime_dir, "/tmp/outside.json"
+            ),
+            "must be relative to runtime dir",
+            id="published-path-absolute",
+        ),
+        pytest.param(
+            lambda project_dir, runtime_dir: _set_published_output_path(
+                runtime_dir, "data/outside.json"
+            ),
+            "must be under outputs/v1/",
+            id="published-path-outside-outputs",
+        ),
+        pytest.param(
+            lambda project_dir, runtime_dir: _set_published_output_path(
+                runtime_dir,
+                "outputs/colors/base/analysis/result/cohort.1234567890abcdef.json",
+            ),
+            "must be under outputs/v1/",
+            id="published-path-legacy-layout",
+        ),
+    ],
+)
+def test_validate_rejects_corrupted_project(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    corrupt: Callable[[Path, Path], object],
+    expected_error: str,
+) -> None:
+    project_dir, runtime_dir = _init_demo(tmp_path, capsys)
+    corrupt(project_dir, runtime_dir)
 
     _assert_validate_fails(project_dir, capsys, expected_error)

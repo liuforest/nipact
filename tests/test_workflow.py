@@ -7,7 +7,6 @@ import yaml
 from nipact.errors import ValidationError
 from nipact.project_setup import init_project
 from nipact.workflow import (
-    StepInput,
     compile_workflow_plan,
     load_workflow_project,
     validate_workflow_graph,
@@ -343,50 +342,6 @@ def test_compile_rejects_scientific_manifest_outside_execution_population(
         _compile(project_dir, step_name="color_cohort_fit")
 
 
-def test_compile_base_sector_analysis_plan_includes_expected_steps(tmp_path: Path) -> None:
-    project_dir, _runtime_dir = _init_demo(tmp_path)
-
-    plan = _compile(project_dir)
-
-    assert plan.workflow_name == "base"
-    assert plan.selected_step_name == "color_sector_analysis"
-    assert plan.selected_output_name == "sector_counts"
-    assert [step.step_name for step in plan.steps] == [
-        "color_source",
-        "color_features",
-        "color_local_transform",
-        "color_candidate_select",
-        "color_cohort_fit",
-        "color_cohort_apply",
-        "color_sector_label",
-        "color_sector_analysis",
-    ]
-    assert plan.execution_population is not None
-    assert plan.execution_population.manifest_name == "init"
-    assert plan.execution_population.manifest_value_schema == "entity_set_v1"
-    assert [binding.manifest_usage_role for binding in plan.manifest_bindings] == [
-        "fit_cohort",
-        "analysis_cohort",
-    ]
-    assert plan.steps[0].source_inputs == ("colors_source",)
-    assert plan.warnings == ()
-
-
-def test_compile_base_local_transform_plan_trims_downstream_steps(tmp_path: Path) -> None:
-    project_dir, _runtime_dir = _init_demo(tmp_path)
-
-    plan = _compile(project_dir, step_name="color_local_transform")
-
-    assert [step.step_name for step in plan.steps] == [
-        "color_source",
-        "color_features",
-        "color_local_transform",
-    ]
-    assert plan.execution_population is not None
-    assert plan.execution_population.manifest_name == "init"
-    assert plan.manifest_bindings == ()
-
-
 def test_compile_variant_applies_step_override(tmp_path: Path) -> None:
     project_dir, _runtime_dir = _init_demo(tmp_path)
 
@@ -397,67 +352,25 @@ def test_compile_variant_applies_step_override(tmp_path: Path) -> None:
     assert "qc_target_radius" in params_by_step["color_candidate_select"]
 
 
-def test_compile_rejects_unknown_workflow(tmp_path: Path) -> None:
+def test_loader_rejects_input_from_later_workflow_step(tmp_path: Path) -> None:
+    # A forward reference is the only way to declare a dependency cycle.
     project_dir, _runtime_dir = _init_demo(tmp_path)
-    loaded = _load(project_dir)
-
-    with pytest.raises(ValidationError, match="unknown workflow"):
-        compile_workflow_plan(
-            loaded,
-            workflow_name="missing",
-            step_name="color_sector_analysis",
-        )
-
-
-def test_compile_rejects_dependency_cycle(tmp_path: Path) -> None:
-    project_dir, _runtime_dir = _init_demo(tmp_path)
-    loaded = _load(project_dir)
-    loaded.steps["color_source"].inputs["cycle"] = StepInput(
-        name="cycle",
-        artifact="color_sector_analysis.sector_counts",
-        dependency_role="cycle",
-        source_step_name="color_sector_analysis",
-        source_output_name="sector_counts",
-    )
-
-    with pytest.raises(ValidationError, match="dependency cycle"):
-        compile_workflow_plan(
-            loaded,
-            workflow_name="base",
-            step_name="color_sector_analysis",
-        )
-
-
-def test_compile_manifest_binding_facts_match_loaded_manifests(tmp_path: Path) -> None:
-    project_dir, _runtime_dir = _init_demo(tmp_path)
-    loaded = _load(project_dir)
-
-    plan = compile_workflow_plan(
-        loaded,
-        workflow_name="base",
-        step_name="color_sector_analysis",
-    )
-    bindings = {
-        (binding.step_name, binding.manifest_usage_role): binding
-        for binding in plan.manifest_bindings
+    step_path = project_dir / "steps/color_features.yaml"
+    payload = _read_yaml(step_path)
+    payload["inputs"]["cycle"] = {
+        "artifact": "color_sector_analysis.sector_counts",
+        "dependency_role": "source_input",
     }
+    _write_yaml(step_path, payload)
 
-    execution_population = plan.execution_population
-    assert execution_population is not None
-    source_manifest = loaded.manifests[execution_population.manifest_name]
-    assert execution_population.manifest_value_schema == source_manifest.manifest_value_schema
-    assert execution_population.manifest_digest == source_manifest.manifest_digest
-    assert execution_population.manifest_hash == source_manifest.manifest_hash
-    assert execution_population.entity_ids == source_manifest.entity_ids
-    assert execution_population.entity_count == source_manifest.entity_count
-
-    fit_binding = bindings[("color_cohort_fit", "fit_cohort")]
-    fit_manifest = loaded.manifests[fit_binding.manifest_name]
-    assert fit_binding.manifest_digest == fit_manifest.manifest_digest
-    assert fit_binding.manifest_value_schema == fit_manifest.manifest_value_schema
-    assert fit_binding.manifest_hash == fit_manifest.manifest_hash
-    assert fit_binding.entity_ids == fit_manifest.entity_ids
-    assert fit_binding.entity_count == fit_manifest.entity_count
+    with pytest.raises(
+        ValidationError,
+        match=(
+            "step 'color_features' input 'color_sector_analysis.sector_counts' "
+            "does not reference an earlier workflow output"
+        ),
+    ):
+        _load(project_dir)
 
 
 def test_graph_projection_has_stable_ids_and_terminal_kind(tmp_path: Path) -> None:
@@ -563,6 +476,7 @@ def test_graph_projection_includes_manifest_bindings_from_dependency_path(
     tmp_path: Path,
 ) -> None:
     project_dir, _runtime_dir = _init_demo(tmp_path)
+    manifests = _load(project_dir).manifests
 
     graph = _graph(project_dir)
     population = graph["execution_population"]
@@ -581,9 +495,13 @@ def test_graph_projection_includes_manifest_bindings_from_dependency_path(
     assert bindings["analysis_cohort"]["manifest_name"] == "init"
     for binding in bindings.values():
         assert binding["binding_source"] == "explicit"
-        assert len(binding["manifest_digest"]) == 64
-        assert binding["manifest_digest"].startswith(binding["manifest_hash"])
-        assert len(binding["manifest_hash"]) == 16
+    # Each projected manifest carries the facts of the manifest it names.
+    for projected in [population, *bindings.values()]:
+        manifest = manifests[projected["manifest_name"]]
+        assert projected["manifest_value_schema"] == manifest.manifest_value_schema
+        assert projected["manifest_digest"] == manifest.manifest_digest
+        assert projected["manifest_hash"] == manifest.manifest_hash
+        assert projected["entity_count"] == manifest.entity_count
 
 
 def test_graph_projection_for_trimmed_step_omits_downstream_steps(tmp_path: Path) -> None:

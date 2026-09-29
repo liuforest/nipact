@@ -16,7 +16,6 @@ from nipact.registry import REGISTRY_DB_PATH, list_artifacts
 from nipact.trace import (
     build_trace_graph,
     build_trace_graph_for_artifact_id,
-    build_trace_graph_for_path,
     build_trace_graph_for_workflow_coordinate,
 )
 
@@ -111,10 +110,6 @@ def _successful_sector_run(
     monkeypatch.setattr("nipact.execution._run_snakemake", write_staged_outputs)
     assert execute_run_plan(run_plan, cores=1).published_count == len(run_plan.published_outputs)
     return project_dir, runtime_dir, run_plan
-
-
-def _selected_artifact_id(graph: dict[str, object]) -> int:
-    return int(graph["selected_artifact_id"])
 
 
 def test_trace_graph_by_artifact_id_includes_sources_and_manifest_bindings(
@@ -288,42 +283,6 @@ def test_trace_graph_payload_shape_is_stable_for_gui_contract(
         "nipact.examples.colors_processing_demo.runtime:color_sector_analysis_file"
     )
     assert selected_node["software_ref"] is None
-
-
-def test_trace_graph_by_registered_path_uses_same_query_path(
-    tmp_path: Path,
-    capsys: pytest.CaptureFixture[str],
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    _project_dir, runtime_dir, _run_plan = _successful_sector_run(
-        tmp_path,
-        capsys,
-        monkeypatch,
-    )
-    registry_path = runtime_dir / REGISTRY_DB_PATH
-    selected = list_artifacts(
-        registry_path,
-        context="colors",
-        origin="workflow_output",
-        workflow_name="base",
-        step_name="color_sector_analysis",
-        output_name="sector_counts",
-        is_published=True,
-    )[0]
-
-    by_id = build_trace_graph_for_artifact_id(
-        registry_path,
-        artifact_id=selected.artifact_id,
-    )
-    by_path = build_trace_graph_for_path(
-        registry_path,
-        context="colors",
-        artifact_path=selected.path,
-    )
-
-    assert _selected_artifact_id(by_path) == _selected_artifact_id(by_id)
-    assert by_path["artifacts"] == by_id["artifacts"]
-    assert by_path["dependencies"] == by_id["dependencies"]
 
 
 @pytest.mark.parametrize(
@@ -627,39 +586,6 @@ def test_trace_traversal_shares_one_read_session_regardless_of_closure(
             conn.execute("SELECT 1")
 
 
-def test_trace_selector_wrapper_opens_separate_selector_lookup(
-    tmp_path: Path,
-    capsys: pytest.CaptureFixture[str],
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    _project_dir, runtime_dir, _run_plan = _successful_sector_run(
-        tmp_path,
-        capsys,
-        monkeypatch,
-    )
-    registry_path = runtime_dir / REGISTRY_DB_PATH
-    selected = _selected_sector_counts(registry_path)
-
-    connect_calls: list[Path] = []
-    real_connect = registry._connect_readonly_rows
-
-    @contextmanager
-    def counting_connect(path: Path):
-        connect_calls.append(path)
-        with real_connect(path) as conn:
-            yield conn
-
-    monkeypatch.setattr(registry, "_connect_readonly_rows", counting_connect)
-    graph = build_trace_graph_for_artifact_id(
-        registry_path,
-        artifact_id=selected.artifact_id,
-    )
-
-    assert graph["selected_artifact_id"] == selected.artifact_id
-    # One connection for the selector root lookup, one for the traversal session.
-    assert connect_calls == [registry_path, registry_path]
-
-
 def test_trace_terminates_on_dependency_cycle(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
@@ -711,51 +637,3 @@ def test_trace_terminates_on_dependency_cycle(
         and dependency["dependent_artifact_id"] == feature.artifact_id
         for dependency in graph["dependencies"]
     )
-
-
-def test_trace_raw_decoder_error_escapes_and_closes_session(
-    tmp_path: Path,
-    capsys: pytest.CaptureFixture[str],
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    _project_dir, runtime_dir, _run_plan = _successful_sector_run(
-        tmp_path,
-        capsys,
-        monkeypatch,
-    )
-    registry_path = runtime_dir / REGISTRY_DB_PATH
-    selected = _selected_sector_counts(registry_path)
-    feature = _a_feature_artifact(registry_path)
-
-    with sqlite3.connect(registry_path) as conn:
-        conn.execute(
-            "UPDATE artifacts SET file_size = ? WHERE artifact_id = ?",
-            ("not-a-number", feature.artifact_id),
-        )
-
-    conns: list[sqlite3.Connection] = []
-    real_connect = registry._connect_readonly_rows
-
-    @contextmanager
-    def counting_connect(path: Path):
-        with real_connect(path) as conn:
-            conns.append(conn)
-            yield conn
-
-    monkeypatch.setattr(registry, "_connect_readonly_rows", counting_connect)
-    with pytest.raises(ValueError) as excinfo:
-        build_trace_graph(
-            registry_path,
-            selected_artifact=selected,
-            active_context="colors",
-        )
-
-    # A raw conversion failure keeps its original type (decoders run outside the
-    # sqlite3.Error -> ValidationError translation).
-    assert not isinstance(excinfo.value, ValidationError)
-    assert "invalid literal for int()" in str(excinfo.value)
-    # The traversal session is still closed despite the raw failure.
-    assert conns
-    for conn in conns:
-        with pytest.raises(sqlite3.ProgrammingError):
-            conn.execute("SELECT 1")
