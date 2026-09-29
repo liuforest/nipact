@@ -40,3 +40,6 @@ src/nipact/gui/frontend/node_modules/
 # repo-local scratch files, etc.
 /.local/
 /.vscode/
+
+# agent scratch artifacts
+/tmp/
