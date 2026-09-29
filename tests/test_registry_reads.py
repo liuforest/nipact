@@ -33,10 +33,8 @@ from nipact.registry import (
     read_artifact_by_path,
     read_current_published_artifact,
     read_manifest,
-    read_published_outputs,
     reconcile_manifest_and_source_authorities,
     read_registry_summary,
-    read_run_execution_population,
     record_workflow_run,
     resolve_registered_artifact_path,
 )
@@ -396,29 +394,6 @@ def test_registry_reads_schema_qualified_run_populations_and_bindings(
     with sqlite3.connect(registry_path) as conn:
         run_id = conn.execute("SELECT MAX(run_id) FROM workflow_runs").fetchone()[0]
 
-    execution_population = read_run_execution_population(
-        registry_path,
-        run_id=int(run_id),
-        context="colors",
-    )
-    assert execution_population is not None
-    assert execution_population.manifest_name == "init"
-    assert execution_population.manifest_value_schema == "entity_set_v1"
-    assert execution_population.manifest_digest == manifest_digest
-    assert execution_population.entity_count == 200
-
-    bindings = list_run_manifest_bindings(
-        registry_path,
-        run_id=int(run_id),
-        context="colors",
-    )
-    assert len(bindings) == 1
-    assert bindings[0].manifest_usage_role == "fit_cohort"
-    assert bindings[0].manifest_name == "init"
-    assert bindings[0].manifest_value_schema == "entity_set_v1"
-    assert bindings[0].manifest_digest == manifest_digest
-    assert bindings[0].entity_count == 200
-
     with pytest.raises(
         ValidationError,
         match="selected-output resolution does not match selected output",
@@ -632,13 +607,6 @@ def test_registry_reads_workflow_output_and_neighbors(
         == selected
     )
 
-    published_lookup = read_published_outputs(
-        runtime_dir,
-        context="colors",
-        workflow_name="base",
-        step_name="color_sector_analysis",
-        output_name="sector_counts",
-    )
     workflow_artifacts = list_artifacts(
         registry_path,
         context="colors",
@@ -660,8 +628,6 @@ def test_registry_reads_workflow_output_and_neighbors(
         run_id=selected.run_id,
     )
 
-    assert {row["address"] for row in published_lookup} == {"cohort"}
-    assert published_lookup[0]["path"] == selected.published_path
     assert len(workflow_artifacts) == len(run_plan.jobs)
     assert selected in published_artifacts
     assert len(published_artifacts) == len(run_plan.published_outputs)
@@ -1141,21 +1107,6 @@ def test_current_published_artifact_rejects_membership_hash_mismatch(
             step_name="color_sector_analysis",
             output_name="sector_counts",
             address="cohort",
-        )
-
-    incompatible_runtime = tmp_path / "incompatible"
-    (incompatible_runtime / "database").mkdir(parents=True)
-    incompatible_path = incompatible_runtime / REGISTRY_DB_PATH
-    with sqlite3.connect(incompatible_path) as conn:
-        conn.execute("PRAGMA user_version = 15")
-
-    with pytest.raises(ValidationError, match="schema version is incompatible"):
-        read_published_outputs(
-            incompatible_runtime,
-            context="colors",
-            workflow_name="base",
-            step_name="step",
-            output_name="out",
         )
 
 

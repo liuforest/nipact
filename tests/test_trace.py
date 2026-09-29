@@ -156,8 +156,43 @@ def test_trace_graph_by_artifact_id_includes_sources_and_manifest_bindings(
     assert source_artifacts[0]["workflow_artifact_ref"] is None
     assert len(artifacts) == len(run_plan.jobs) + 1
     assert len(dependencies) == sum(len(job.input_records) for job in run_plan.jobs)
-    assert len(graph["execution_populations"]) == 1
-    assert len(graph["manifest_bindings"]) == len(run_plan.manifest_bindings)
+    population = run_plan.execution_population
+    assert population is not None
+    assert population.manifest_value_schema == "entity_set_v1"
+    assert graph["execution_populations"] == [
+        {
+            "run_id": selected.run_id,
+            "workflow_name": run_plan.workflow_name,
+            "manifest_name": population.manifest_name,
+            "manifest_value_schema": population.manifest_value_schema,
+            "manifest_digest": population.manifest_digest,
+            "manifest_hash": population.manifest_hash,
+            "entity_count": population.entity_count,
+        }
+    ]
+    expected_bindings = sorted(
+        (
+            binding.step_name,
+            binding.manifest_usage_role,
+            binding.manifest_name,
+            binding.manifest_value_schema,
+            binding.manifest_digest,
+            binding.entity_count,
+        )
+        for binding in run_plan.manifest_bindings
+    )
+    assert expected_bindings
+    assert sorted(
+        (
+            binding["step_name"],
+            binding["manifest_usage_role"],
+            binding["manifest_name"],
+            binding["manifest_value_schema"],
+            binding["manifest_digest"],
+            binding["entity_count"],
+        )
+        for binding in graph["manifest_bindings"]
+    ) == expected_bindings
 
 
 def test_trace_graph_payload_shape_is_stable_for_gui_contract(
