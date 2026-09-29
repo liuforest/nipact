@@ -1,0 +1,48 @@
+{
+  "baseline_commit": "c4ae3b2467a9e99cc6c25f20ebbc3c9081e73743",
+  "member_key": "member-000001",
+  "ordinary_generated_selected": 0,
+  "packages": {
+    "nipact": "0.0.1a15",
+    "pytest": "7.4.4",
+    "snakemake": "9.14.6"
+  },
+  "python": "3.12.7 | packaged by Anaconda, Inc. | (main, Oct  4 2024, 13:27:36) [GCC 11.2.0]",
+  "sha256": {
+    "project/compatibility.yaml": "9be71edbb143c83b24686f941c6b3b8a51e71e0d5f9d8f6fd8de6c3df4e8d7a0",
+    "project/manifests/cohort.yaml": "d9f1035c9392346781fc534eb2bfb7dd0c0411bdcd8bdca96a84061b3b395799",
+    "project/nipact.yaml": "2f14d038520861b4114fdab65ad60bafdc41371026a8b382beea415f4c0f5c96",
+    "project/sources.yaml": "c70c953cc67d0415e66cb835cfa89ca37cc45b5dc88f7836105204977a497868",
+    "project/steps/fixture_analysis.yaml": "150faa46428f3938b0cc982674e0427dc527ed7285a21deef29e1827c37c448a",
+    "project/steps/fixture_source.yaml": "ae2c30444a9a4a9abd7577622ab57aa0a9d03cd8f4cf7038f387d5c956a00ef4",
+    "project/steps/fixture_transform.yaml": "8d77df71451b7d653246d4c7d888834506f50e14291753db87d81a02fb2468e5",
+    "project/workflows/base.yaml": "459eaa01e7011c9da0860e58a09460959e73564c08da3ec0a9b0c956e2ecf09b",
+    "project/workflows/parameter-variant.yaml": "cc5042c948ad5ad1135b4754139487149ca582047593938d4602663d58c9848d",
+    "runtime/data/source/entity_001.txt": "45e8f93b1f72302e7d14f405c7a101472a47af2aa307248b1710afdb348bfef9",
+    "runtime/outputs/v1/v18_fixture/fixture_source/entity_001/2b3714abf567a946566f2a695895b7b8ed3112ddd7bf17455770c97413357902/source_value/entity_001.887dedd0914cb8d4.json": "887dedd0914cb8d46bf9ae1e6f37da8c2e611f9eabccfd9d55f5c58b399319d8",
+    "runtime/outputs/v1/v18_fixture/fixture_transform/entity_001/31835e798e67b2943737f4b0df1c60bc00a30253a20ffaffaf170076ff1b5df2/left/entity_001.8167bac79d7f1a3e.json": "8167bac79d7f1a3e14b1778b583adfe20bcfc9f44a202144ac194313d3b74fed",
+    "runtime/outputs/v1/v18_fixture/fixture_transform/entity_001/31835e798e67b2943737f4b0df1c60bc00a30253a20ffaffaf170076ff1b5df2/right/entity_001.ae27d728c8e2eb89.json": "ae27d728c8e2eb89f88d0e84f7984de963fca681b9252c67847ee59b8d711c07"
+  },
+  "snapshot_digest": "ce8a9390ee6d47a07d2ea62b137a84eff6c875500f09645169cef659819cb27d",
+  "snapshot_generated_selected": 1,
+  "snapshot_outcome": "complete",
+  "table_row_counts": {
+    "artifact_dependencies": 3,
+    "artifacts": 4,
+    "contexts": 1,
+    "manifest_declarations": 1,
+    "manifest_values": 1,
+    "parameters": 2,
+    "published_outputs": 3,
+    "request_bundle_projections": 2,
+    "run_execution_population": 2,
+    "run_manifest_bindings": 0,
+    "specification_attempt_results": 2,
+    "specification_expected_results": 4,
+    "specification_member_attempts": 1,
+    "specification_members": 2,
+    "specification_snapshot_manifest_values": 1,
+    "specification_snapshots": 1,
+    "workflow_runs": 2
+  }
+}

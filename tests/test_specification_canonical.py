@@ -5,6 +5,7 @@ from dataclasses import replace
 import hashlib
 import json
 import math
+import sqlite3
 from pathlib import Path
 from typing import Any
 
@@ -12,6 +13,7 @@ import pytest
 
 from nipact.errors import ValidationError
 from nipact.manifest import build_manifest
+from nipact.projection import validate_stored_request_bundle_projection_v3
 from nipact.specification_canonical import (
     ROW_SCHEMA,
     SNAPSHOT_SCHEMA,
@@ -740,3 +742,178 @@ def test_replay_compares_effective_values_after_writes_and_ignores_paths() -> No
             snapshot=snapshot,
             member_key="member-a",
         )
+
+
+def _directory_project() -> LoadedWorkflowProject:
+    loaded = _project()
+    tree_source = replace(
+        loaded.steps["source"],
+        name="tree_source",
+        outputs={"raw": StepOutput("raw", None, "entity", "directory")},
+    )
+    model = loaded.steps["model"]
+    return replace(
+        loaded,
+        steps={
+            **loaded.steps,
+            "tree_source": tree_source,
+            "model": replace(
+                model,
+                inputs={
+                    "raw": replace(
+                        model.inputs["raw"],
+                        artifact="tree_source.raw",
+                        source_step_name="tree_source",
+                    )
+                },
+            ),
+        },
+        workflows={
+            **loaded.workflows,
+            "base": replace(
+                loaded.workflows["base"],
+                steps=("tree_source", "model"),
+                step_outputs={"tree_source": "raw", "model": "estimate"},
+            ),
+        },
+    )
+
+
+def test_directory_closure_versions_affected_rows_and_replays_exact_kinds() -> None:
+    compilation = _compilation(
+        _member("tree", 1.0), _member("file", 2.0, workflow="alternative")
+    )
+    legacy = canonicalize_specification_snapshot(
+        loaded=_project(), compilation=compilation
+    )
+    expected = _snapshot_payload(legacy)
+    expected["schema"] = "nipact/specification-snapshot/v2"
+    tree_member = next(
+        member for member in expected["members"] if member["member_key"] == "tree"
+    )
+    tree_row = tree_member["row"]
+    tree_row["schema"] = "nipact/specification-row/v2"
+    steps = tree_row["effective_declaration"]["steps"]
+    steps[0]["step_name"] = "tree_source"
+    steps[0]["outputs"] = [
+        {"name": "raw", "kind": "directory", "address_scope": "entity"}
+    ]
+    steps[1]["inputs"][0]["source_step_name"] = "tree_source"
+    for output in steps[1]["outputs"]:
+        output["kind"] = "file"
+    tree_member["row_digest"] = hashlib.sha256(
+        b"nipact.specification.row.v2\0" + _canonical_bytes(tree_row)
+    ).hexdigest()
+    expected_bytes = _canonical_bytes(expected)
+
+    loaded = _directory_project()
+    snapshot = canonicalize_specification_snapshot(
+        loaded=loaded, compilation=compilation
+    )
+    assert snapshot.canonical_bytes == expected_bytes
+    assert (
+        snapshot.snapshot_digest
+        == hashlib.sha256(
+            b"nipact.specification.snapshot.v2\0" + expected_bytes
+        ).hexdigest()
+    )
+    assert (
+        snapshot.members[0].row.canonical_bytes == legacy.members[0].row.canonical_bytes
+    )
+    assert snapshot.members[0].row.row_digest == legacy.members[0].row.row_digest
+    assert (
+        decode_specification_snapshot(expected_bytes).canonical_bytes == expected_bytes
+    )
+    assert (
+        decode_specification_row(_canonical_bytes(tree_row)).row_digest
+        == tree_member["row_digest"]
+    )
+    replay_specification_member(loaded=loaded, snapshot=snapshot, member_key="tree")
+    changed_source = replace(
+        loaded.steps["tree_source"],
+        outputs={"raw": StepOutput("raw", ".json", "entity")},
+    )
+    with pytest.raises(ValidationError, match="does not match frozen"):
+        replay_specification_member(
+            loaded=replace(
+                loaded, steps={**loaded.steps, "tree_source": changed_source}
+            ),
+            snapshot=snapshot,
+            member_key="tree",
+        )
+
+
+@pytest.mark.parametrize(
+    "invalid",
+    [
+        "v1_row_with_directory",
+        "v2_row_without_directory",
+        "unknown_row_version",
+        "directory_extension",
+        "missing_file_extension",
+        "unknown_kind",
+        "v1_snapshot_with_v2_row",
+        "v2_snapshot_without_v2_row",
+        "unknown_snapshot_version",
+    ],
+)
+def test_directory_specification_strict_version_and_shape(invalid: str) -> None:
+    directory = canonicalize_specification_snapshot(
+        loaded=_directory_project(), compilation=_compilation(_member("tree", 1.0))
+    )
+    payload = _snapshot_payload(directory)
+    row = payload["members"][0]["row"]
+    outputs = row["effective_declaration"]["steps"][0]["outputs"]
+    if invalid == "v1_row_with_directory":
+        row["schema"] = ROW_SCHEMA
+    elif invalid == "v2_row_without_directory":
+        outputs[0].update(kind="file", extension=".json")
+    elif invalid == "unknown_row_version":
+        row["schema"] = "nipact/specification-row/v99"
+    elif invalid == "directory_extension":
+        outputs[0]["extension"] = None
+    elif invalid == "missing_file_extension":
+        del row["effective_declaration"]["steps"][1]["outputs"][0]["extension"]
+    elif invalid == "unknown_kind":
+        outputs[0]["kind"] = "unknown"
+    elif invalid == "v1_snapshot_with_v2_row":
+        payload["schema"] = SNAPSHOT_SCHEMA
+    elif invalid == "v2_snapshot_without_v2_row":
+        payload = _snapshot_payload(
+            canonicalize_specification_snapshot(
+                loaded=_project(), compilation=_compilation(_member("file", 1.0))
+            )
+        )
+        payload["schema"] = "nipact/specification-snapshot/v2"
+    else:
+        payload["schema"] = "nipact/specification-snapshot/v99"
+    with pytest.raises(ValidationError, match="(schema|unknown|missing|kind)"):
+        if "snapshot" in invalid:
+            decode_specification_snapshot(_canonical_bytes(payload))
+        else:
+            decode_specification_row(_canonical_bytes(row))
+
+
+def test_pre_directory_executed_v19_values_keep_exact_canonical_bytes() -> None:
+    fixture = Path(__file__).parent / "fixtures/registry_v19"
+    evidence = json.loads((fixture / "evidence.json").read_text())
+    with sqlite3.connect(":memory:") as connection:
+        connection.executescript((fixture / "populated-registry.sql").read_text())
+        snapshots = connection.execute(
+            "SELECT snapshot_digest, canonical_bytes FROM specification_snapshots"
+        ).fetchall()
+        assert len(snapshots) == 1
+        for digest, data in snapshots:
+            decoded = decode_specification_snapshot(data)
+            assert decoded.snapshot_digest == digest == evidence["snapshot_digest"]
+            assert decoded.canonical_bytes == data
+        projections = connection.execute(
+            "SELECT request_bundle_digest, projection_json FROM request_bundle_projections"
+        ).fetchall()
+        assert len(projections) == 2
+        for digest, data in projections:
+            decoded = validate_stored_request_bundle_projection_v3(
+                request_bundle_digest=digest, projection_json=data
+            )
+            assert decoded.resolved_projection.canonical_json == data
+            assert decoded.resolved_projection.request_bundle_digest == digest
