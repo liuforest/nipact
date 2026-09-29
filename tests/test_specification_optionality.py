@@ -11,7 +11,7 @@ import yaml
 from fastapi.testclient import TestClient
 
 import nipact.execution as execution_module
-from conftest import RegistryV19Fixture
+from conftest import RegistryV20Fixture
 from nipact.cli import main
 from nipact.execution import build_run_plan, execute_run_plan
 from nipact.gui.app import create_gui_app
@@ -72,10 +72,15 @@ def _ordinary_scientific_state(database: Path) -> dict[str, tuple[tuple[object, 
                 "request_bundle_projections",
             )
         }
+        columns = ", ".join(
+            f'"{row[1]}"'
+            for row in connection.execute("PRAGMA table_info(artifacts)")
+            if row[1] != "created_at"
+        )
         artifacts = connection.execute(
-            "SELECT * FROM artifacts ORDER BY artifact_id"
+            f"SELECT {columns} FROM artifacts ORDER BY artifact_id"
         ).fetchall()
-    state["artifact_identities"] = tuple(row[:-1] for row in artifacts)
+    state["artifact_identities"] = tuple(artifacts)
     return state
 
 
@@ -145,11 +150,11 @@ def _guard_registered_targets(
 
 
 def test_dormant_specification_registrations_do_not_affect_ordinary_surfaces(
-    registry_v19_fixture: RegistryV19Fixture,
+    synthesized_v20_fixture: RegistryV20Fixture,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    fixture = registry_v19_fixture
+    fixture = synthesized_v20_fixture
     loaded_before = load_workflow_project(
         project_dir=fixture.project_dir,
         context=fixture.context,

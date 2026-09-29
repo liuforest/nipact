@@ -45,7 +45,7 @@ from test_specification_execution import _run_jobs_in_process
 from test_specification_registry import (
     _specification_payload,
     configure_specification_project,
-    prepare_v19,
+    prepare_v20,
 )
 
 
@@ -408,11 +408,11 @@ def test_preview_on_static_v18_is_complete_and_runtime_non_mutating(
     assert not (fixture.runtime_dir / ".nipact-mutating.lock").exists()
 
 
-def test_valid_v18_freeze_requires_migration_without_any_runtime_change(
-    registry_v18_fixture: RegistryV18Fixture,
+def test_valid_v19_freeze_requires_migration_without_any_runtime_change(
+    registry_v19_fixture: RegistryV18Fixture,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    fixture = registry_v18_fixture
+    fixture = registry_v19_fixture
     configure_specification_project(fixture)
     before = _runtime_inventory(fixture.runtime_dir)
 
@@ -431,7 +431,7 @@ def test_valid_v18_freeze_requires_migration_without_any_runtime_change(
     captured = capsys.readouterr()
     assert captured.out == ""
     assert captured.err == (
-        "error: registry.db schema version 18 requires explicit migration; run "
+        "error: registry.db schema version 19 requires explicit migration; run "
         "'nipact registry migrate --context CONTEXT --project-dir PROJECT_DIR'\n"
     )
     assert _runtime_inventory(fixture.runtime_dir) == before
@@ -946,7 +946,7 @@ def test_compact_cli_preview_freeze_run_member_results_smoke(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     fixture = registry_v18_fixture
-    prepare_v19(fixture, route="fresh")
+    prepare_v20(fixture, route="fresh")
     payload = _specification_payload()
     fixed = payload["fixed"]
     assert isinstance(fixed, dict)

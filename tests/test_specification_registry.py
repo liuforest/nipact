@@ -11,7 +11,7 @@ from typing import Callable
 import pytest
 import yaml
 
-from conftest import RegistryV18Fixture
+from conftest import RegistryV18Fixture, synthesize_v19_with_v18_science
 import nipact.registry as registry
 from nipact.errors import ValidationError
 from nipact.hashing import sha256_digest, short_hash
@@ -62,7 +62,7 @@ _SPECIFICATION_TABLES = (
     "specification_member_attempts",
     "specification_attempt_results",
 )
-_MIGRATION_GUIDANCE = "requires explicit migration"
+_MIGRATION_GUIDANCE = "requires the pre-directory release"
 
 
 def _specification_payload() -> dict[str, object]:
@@ -153,7 +153,7 @@ def configure_specification_project(fixture: RegistryV18Fixture) -> Path:
     return specification_path
 
 
-def prepare_v19(
+def prepare_v20(
     fixture: RegistryV18Fixture,
     *,
     route: str,
@@ -175,6 +175,7 @@ def prepare_v19(
             },
         )
     elif route == "migrated":
+        synthesize_v19_with_v18_science(fixture)
         migrate_registry_db(
             fixture.registry_path,
             context=fixture.context,
@@ -243,7 +244,7 @@ def _prepare_snapshot(
     route: str = "fresh",
     entity_target: bool = False,
 ) -> tuple[CanonicalSpecificationSnapshot, CanonicalSpecificationMember]:
-    snapshot = prepare_v19(fixture, route=route)
+    snapshot = prepare_v20(fixture, route=route)
     if entity_target:
         snapshot = build_entity_snapshot(fixture)
     return snapshot, _persist_snapshot(fixture, snapshot)
@@ -685,7 +686,7 @@ def test_primary_persistence_is_exact_and_changes_only_manifest_value_authority(
     route: str,
 ) -> None:
     fixture = registry_v18_fixture
-    snapshot = prepare_v19(fixture, route=route)
+    snapshot = prepare_v20(fixture, route=route)
     before_ordinary = _ordinary_state(fixture.registry_path)
     before_values = _manifest_values(fixture.registry_path)
     before_runtime = _runtime_without_database(fixture.runtime_dir)
@@ -780,7 +781,7 @@ def test_nested_json_values_decode_and_round_trip_through_snapshot_registry(
     registry_v18_fixture: RegistryV18Fixture,
 ) -> None:
     fixture = registry_v18_fixture
-    prepare_v19(fixture, route="fresh")
+    prepare_v20(fixture, route="fresh")
     nested_value = {
         "labels": ["baseline", {"thresholds": [0.1, 0.2]}],
     }
@@ -839,7 +840,7 @@ def test_every_insertion_checkpoint_rolls_back_the_whole_aggregate(
     checkpoint: str,
 ) -> None:
     fixture = registry_v18_fixture
-    snapshot = prepare_v19(fixture, route="fresh")
+    snapshot = prepare_v20(fixture, route="fresh")
     before = _freeze_state(fixture.registry_path)
 
     def fail_at_checkpoint(current: str) -> None:
@@ -876,7 +877,7 @@ def test_reader_and_replay_reject_corrupt_aggregate_without_repair(
     corruption: str,
 ) -> None:
     fixture = registry_v18_fixture
-    snapshot = prepare_v19(fixture, route="fresh")
+    snapshot = prepare_v20(fixture, route="fresh")
     assert insert_or_verify_specification_snapshot(
         fixture.registry_path,
         runtime_root=fixture.runtime_dir,
@@ -989,7 +990,7 @@ def test_ownership_and_schema_boundaries_fail_before_snapshot_mutation(
         configure_specification_project(fixture)
         snapshot = build_snapshot(fixture)
     else:
-        snapshot = prepare_v19(fixture, route="fresh")
+        snapshot = prepare_v20(fixture, route="fresh")
 
     if case == "wrong-context":
         assert insert_or_verify_specification_snapshot(
@@ -2063,7 +2064,7 @@ def test_specification_projections_preserve_denominator_attempts_and_missing_res
     registry_v18_fixture: RegistryV18Fixture,
 ) -> None:
     fixture = registry_v18_fixture
-    prepare_v19(fixture, route="fresh")
+    prepare_v20(fixture, route="fresh")
     payload = _specification_payload()
     dimensions = payload["dimensions"]
     assert isinstance(dimensions, dict)
@@ -2268,7 +2269,7 @@ def test_specification_projections_preserve_denominator_attempts_and_missing_res
     )
 
 
-def test_specification_projection_reader_is_read_only_bounded_and_v19_only(
+def test_specification_projection_reader_is_read_only_bounded_and_v20_only(
     registry_v18_fixture: RegistryV18Fixture,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2280,7 +2281,7 @@ def test_specification_projection_reader_is_read_only_bounded_and_v19_only(
             snapshot_digest="0" * 64,
         )
 
-    prepare_v19(fixture, route="migrated")
+    prepare_v20(fixture, route="migrated")
     payload = _specification_payload()
     fixed = payload["fixed"]
     assert isinstance(fixed, dict)
@@ -2410,7 +2411,7 @@ def test_specification_projection_reader_rejects_contradictory_state(
 ) -> None:
     fixture = registry_v18_fixture
     route = "migrated" if case == "cycle" else "fresh"
-    prepare_v19(fixture, route=route)
+    prepare_v20(fixture, route=route)
     payload = _specification_payload()
     fixed = payload["fixed"]
     assert isinstance(fixed, dict)

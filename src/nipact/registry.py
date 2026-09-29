@@ -17,7 +17,13 @@ from .artifacts import (
     canonical_output_path,
 )
 from .errors import ValidationError
-from .hashing import is_valid_digest, sha256_digest, sha256_file_digest, short_hash
+from .hashing import (
+    DIRECTORY_DIGEST_SCHEME,
+    is_valid_digest,
+    sha256_digest,
+    sha256_file_digest,
+    short_hash,
+)
 from .identity import validate_hash_alias, validate_path_token
 from .manifest import Manifest, ManifestValue
 from .projection import (
@@ -47,13 +53,35 @@ from .specification_canonical import (
 from .specification_compiler import DecisionCoordinate
 
 REGISTRY_DB_PATH = "database/registry.db"
-REGISTRY_SCHEMA_VERSION = 19
-REGISTRY_MIGRATION_SOURCE_VERSION = 18
-REGISTRY_V18_BACKUP_FILENAME = "registry.v18-before-v19.db"
-REGISTRY_V18_SCHEMA_SIGNATURE_SHA256 = (
-    "a9f4e68f21602814326580dab4f5efa3d0bf053feb9d5e7eb50436516a9c0069"
+REGISTRY_SCHEMA_VERSION = 20
+REGISTRY_MIGRATION_SOURCE_VERSION = 19
+REGISTRY_V19_BACKUP_FILENAME = "registry.v19-before-v20.db"
+REGISTRY_V19_SCHEMA_SIGNATURE_SHA256 = (
+    "1921260bec90357e938a59cf9bca1ad3ce62c426c02e6cfd711ae6f46cae1919"
+)
+_V18_UPGRADE_GUIDANCE = (
+    "registry.db schema version 18 requires the pre-directory release at commit "
+    "c4ae3b2467a9e99cc6c25f20ebbc3c9081e73743: run "
+    "'nipact registry migrate --context CONTEXT --project-dir PROJECT_DIR' "
+    "with that binary for 18 to 19, then with this release for 19 to 20"
 )
 PARAMETER_HASH_VERSION = 1
+
+
+def _validate_artifact_content_facts(
+    kind: str,
+    digest_scheme: str,
+    extension: str | None,
+) -> None:
+    if (
+        kind == "file" and digest_scheme == "sha256" and isinstance(extension, str)
+    ) or (
+        kind == "directory"
+        and digest_scheme == DIRECTORY_DIGEST_SCHEME
+        and extension is None
+    ):
+        return
+    raise ValidationError("invalid artifact kind, digest scheme, or extension")
 
 
 @dataclass(frozen=True)
@@ -117,12 +145,17 @@ class WorkflowOutputArtifactRow:
     content_digest: str
     output_hash: str
     file_size: int
-    extension: str
+    extension: str | None
     parameters_json: str
     callable_ref: str
     is_selected_output: bool
     is_published: bool
     input_records: tuple[ArtifactInputRow, ...]
+    kind: str = "file"
+    digest_scheme: str = "sha256"
+
+    def __post_init__(self) -> None:
+        _validate_artifact_content_facts(self.kind, self.digest_scheme, self.extension)
 
 
 @dataclass(frozen=True)
@@ -305,7 +338,7 @@ class RegistryArtifact:
     content_digest: str
     output_hash: str | None
     file_size: int
-    extension: str
+    extension: str | None
     subject_id: str | None
     session_id: str | None
     task_name: str | None
@@ -320,6 +353,13 @@ class RegistryArtifact:
     source_scope: str | None = None
     source_name: str | None = None
     source_entity_id: str | None = None
+    kind: str = "file"
+    digest_scheme: str = "sha256"
+
+    def __post_init__(self) -> None:
+        _validate_artifact_content_facts(self.kind, self.digest_scheme, self.extension)
+        if self.origin == "source" and self.kind != "file":
+            raise ValidationError("source artifacts must be files")
 
 
 @dataclass(frozen=True)
@@ -328,7 +368,7 @@ class RegistryDependency:
     source_artifact_id: int
     source_content_digest: str
     source_file_size: int
-    source_extension: str
+    source_extension: str | None
     input_path: str
     binding_name: str
     dependency_role: str
@@ -370,13 +410,18 @@ class ReusableArtifactCandidate:
     content_digest: str
     output_hash: str
     file_size: int
-    extension: str
+    extension: str | None
     workflow_name: str
     step_name: str
     output_name: str
     address: str
     request_bundle_digest: str
     dependencies: tuple[RegistryDependency, ...]
+    kind: str = "file"
+    digest_scheme: str = "sha256"
+
+    def __post_init__(self) -> None:
+        _validate_artifact_content_facts(self.kind, self.digest_scheme, self.extension)
 
 
 @dataclass(frozen=True)
@@ -468,6 +513,8 @@ _ARTIFACT_SELECT_COLUMNS = """
     a.output_hash,
     a.file_size,
     a.extension,
+    a.kind,
+    a.digest_scheme,
     a.subject_id,
     a.session_id,
     a.task_name,
@@ -2295,7 +2342,8 @@ def _resolve_reusable_artifact_bundle_conn(
             """
             SELECT artifact_id, run_id, path, published_path,
                    content_digest, output_hash, file_size,
-                   extension, workflow_name, step_name, output_name, address,
+                   extension, kind, digest_scheme,
+                   workflow_name, step_name, output_name, address,
                    request_bundle_digest
             FROM artifacts
             WHERE context = ?
@@ -2342,7 +2390,9 @@ def _resolve_reusable_artifact_bundle_conn(
                 content_digest=str(row["content_digest"]),
                 output_hash=str(row["output_hash"]),
                 file_size=int(row["file_size"]),
-                extension=str(row["extension"]),
+                extension=row["extension"],
+                kind=row["kind"],
+                digest_scheme=row["digest_scheme"],
                 workflow_name=str(row["workflow_name"]),
                 step_name=str(row["step_name"]),
                 output_name=output_name,
@@ -3335,11 +3385,11 @@ def _insert_workflow_output_artifacts(
                 address, job_id, parameter_id, path, is_selected_output,
                 is_published, published_path, staging_path, content_digest,
                 output_hash, file_size, extension, callable_ref,
-                request_bundle_digest, created_at
+                request_bundle_digest, created_at, kind, digest_scheme
             )
             VALUES (
                 'workflow_output', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                ?, ?, ?, ?, ?
+                ?, ?, ?, ?, ?, ?, ?
             )
             """,
             (
@@ -3363,6 +3413,8 @@ def _insert_workflow_output_artifacts(
                 row.callable_ref,
                 projection.request_bundle_digest,
                 created_at,
+                row.kind,
+                row.digest_scheme,
             ),
         )
         artifact_ids[(row.step_name, row.output_name, row.address)] = int(
@@ -3593,11 +3645,13 @@ def _finalize_retained_job_projections(
             projection_cache=projection_cache,
         )
 
-    artifact_outputs_by_job: dict[tuple[str, str], set[str]] = {}
+    artifact_outputs_by_job: dict[
+        tuple[str, str], dict[str, WorkflowOutputArtifactRow]
+    ] = {}
     for row in artifact_rows:
-        artifact_outputs_by_job.setdefault((row.step_name, row.address), set()).add(
+        artifact_outputs_by_job.setdefault((row.step_name, row.address), {})[
             row.output_name
-        )
+        ] = row
 
     finalized: dict[tuple[str, str], ResolvedRequestBundleProjectionV3] = {}
     for recipe in projection_recipes:
@@ -3619,10 +3673,19 @@ def _finalize_retained_job_projections(
         ):
             raise ValidationError("retained projection recipe identity is inconsistent")
         actual_outputs = artifact_outputs_by_job.get(job_key)
-        if actual_outputs is None or actual_outputs != set(recipe.output_names):
+        if actual_outputs is None or set(actual_outputs) != set(recipe.output_names):
             raise ValidationError(
                 "retained projection recipe does not match complete sibling artifacts"
             )
+        for sibling in recipe.projection_plan.output_contract.sibling_outputs:
+            artifact = actual_outputs[sibling.output_name]
+            if (artifact.kind, artifact.extension) != (
+                sibling.kind,
+                sibling.declared_extension,
+            ):
+                raise ValidationError(
+                    "artifact kind/extension does not match output contract"
+                )
         projection_state = resolve_request_bundle_projection_plan(
             recipe.projection_plan,
             source_snapshots=source_snapshots,
@@ -3925,7 +3988,7 @@ def _validate_reused_dependency_source(
 def _source_artifact_snapshot(
     conn: sqlite3.Connection,
     artifact_id: int,
-) -> tuple[str, int, str]:
+) -> tuple[str, int, str | None]:
     row = conn.execute(
         """
         SELECT content_digest, file_size, extension
@@ -3936,7 +3999,7 @@ def _source_artifact_snapshot(
     ).fetchone()
     if row is None:
         raise ValidationError("registry.db missing dependency source artifact")
-    return str(row[0]), int(row[1]), str(row[2])
+    return str(row[0]), int(row[1]), row[2]
 
 
 def _insert_run_manifest_bindings(
@@ -4934,6 +4997,282 @@ _V19_ADDITIVE_SCHEMA_STATEMENTS = (
 )
 
 
+_V20_REBUILD_STATEMENTS = (
+    """
+    CREATE TABLE artifacts_v20 (
+        artifact_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        origin TEXT NOT NULL CHECK(origin IN ('source', 'workflow_output')),
+        run_id INTEGER REFERENCES workflow_runs(run_id) ON DELETE CASCADE,
+        context TEXT NOT NULL REFERENCES contexts(context) ON DELETE CASCADE,
+        workflow_name TEXT,
+        step_name TEXT,
+        output_name TEXT,
+        address TEXT,
+        job_id TEXT,
+        artifact_set_id TEXT,
+        parameter_id INTEGER REFERENCES parameters(parameter_id),
+        path TEXT NOT NULL,
+        is_selected_output INTEGER NOT NULL DEFAULT 0
+            CHECK(is_selected_output IN (0, 1)),
+        is_published INTEGER NOT NULL DEFAULT 0 CHECK(is_published IN (0, 1)),
+        published_path TEXT,
+        staging_path TEXT,
+        content_digest TEXT NOT NULL,
+        output_hash TEXT,
+        file_size INTEGER NOT NULL CHECK(file_size >= 0),
+        extension TEXT,
+        subject_id TEXT,
+        session_id TEXT,
+        task_name TEXT,
+        run_label TEXT,
+        datatype TEXT,
+        suffix TEXT,
+        source_metadata_json TEXT,
+        callable_ref TEXT,
+        software_ref TEXT,
+        source_scope TEXT CHECK(
+            source_scope IS NULL OR source_scope IN ('global', 'entity')
+        ),
+        source_name TEXT,
+        source_entity_id TEXT,
+        source_st_dev INTEGER CHECK(source_st_dev IS NULL OR source_st_dev >= 0),
+        source_st_ino INTEGER CHECK(source_st_ino IS NULL OR source_st_ino >= 0),
+        source_st_size INTEGER CHECK(source_st_size IS NULL OR source_st_size >= 0),
+        source_st_mtime_ns INTEGER CHECK(
+            source_st_mtime_ns IS NULL OR source_st_mtime_ns >= 0
+        ),
+        source_st_ctime_ns INTEGER CHECK(
+            source_st_ctime_ns IS NULL OR source_st_ctime_ns >= 0
+        ),
+        request_bundle_digest TEXT
+            REFERENCES request_bundle_projections(request_bundle_digest)
+            ON DELETE RESTRICT,
+        created_at TEXT NOT NULL,
+        kind TEXT NOT NULL DEFAULT 'file',
+        digest_scheme TEXT NOT NULL DEFAULT 'sha256',
+        CHECK (
+            (kind = 'file' AND digest_scheme = 'sha256' AND extension IS NOT NULL)
+            OR (kind = 'directory'
+                AND digest_scheme = 'nipact-directory-tree-sha256-v1'
+                AND extension IS NULL)
+        ),
+        CHECK (origin != 'source' OR kind = 'file'),
+        CHECK (
+            (
+                origin = 'workflow_output'
+                AND request_bundle_digest IS NOT NULL
+            )
+            OR (
+                origin = 'source'
+                AND request_bundle_digest IS NULL
+            )
+        ),
+        CHECK (
+            origin != 'source'
+            OR (
+                run_id IS NULL
+                AND workflow_name IS NULL
+                AND step_name IS NULL
+                AND output_name IS NULL
+                AND address IS NULL
+                AND parameter_id IS NULL
+                AND is_selected_output = 0
+                AND is_published = 0
+                AND published_path IS NULL
+                AND staging_path IS NULL
+                AND source_scope IS NOT NULL
+                AND source_name IS NOT NULL
+                AND (
+                    (source_scope = 'global' AND source_entity_id IS NULL)
+                    OR
+                    (source_scope = 'entity' AND source_entity_id IS NOT NULL)
+                )
+                AND source_st_dev IS NOT NULL
+                AND source_st_ino IS NOT NULL
+                AND source_st_size IS NOT NULL
+                AND source_st_mtime_ns IS NOT NULL
+                AND source_st_ctime_ns IS NOT NULL
+            )
+        ),
+        CHECK (
+            origin = 'source'
+            OR (
+                source_scope IS NULL
+                AND source_name IS NULL
+                AND source_entity_id IS NULL
+                AND source_st_dev IS NULL
+                AND source_st_ino IS NULL
+                AND source_st_size IS NULL
+                AND source_st_mtime_ns IS NULL
+                AND source_st_ctime_ns IS NULL
+            )
+        )
+    )
+    """,
+    """
+    CREATE TABLE artifact_dependencies_v20 (
+        dependent_artifact_id INTEGER NOT NULL
+            REFERENCES artifacts(artifact_id) ON DELETE CASCADE,
+        source_artifact_id INTEGER NOT NULL
+            REFERENCES artifacts(artifact_id) ON DELETE RESTRICT,
+        source_content_digest TEXT NOT NULL,
+        source_file_size INTEGER NOT NULL CHECK(source_file_size >= 0),
+        source_extension TEXT,
+        input_path TEXT NOT NULL,
+        binding_name TEXT NOT NULL,
+        dependency_role TEXT NOT NULL,
+        source_step_name TEXT,
+        source_output_name TEXT,
+        source_address TEXT,
+        source_scope TEXT CHECK(
+            source_scope IS NULL OR source_scope IN ('global', 'entity')
+        ),
+        source_name TEXT,
+        source_entity_id TEXT,
+        source_occurrence_path TEXT,
+        dependency_set_id TEXT,
+        manifest_value_schema TEXT,
+        manifest_digest TEXT,
+        edge_cardinality INTEGER CHECK(
+            edge_cardinality IS NULL OR edge_cardinality >= 0
+        ),
+        CHECK (source_scope IS NULL OR source_extension IS NOT NULL),
+        CHECK (
+            (manifest_value_schema IS NULL) = (manifest_digest IS NULL)
+        ),
+        CHECK (
+            (
+                source_scope IS NULL
+                AND source_name IS NULL
+                AND source_entity_id IS NULL
+                AND source_occurrence_path IS NULL
+            )
+            OR
+            (
+                source_scope = 'global'
+                AND source_name IS NOT NULL
+                AND source_entity_id IS NULL
+                AND source_occurrence_path IS NOT NULL
+            )
+            OR
+            (
+                source_scope = 'entity'
+                AND source_name IS NOT NULL
+                AND source_entity_id IS NOT NULL
+                AND source_occurrence_path IS NOT NULL
+            )
+        ),
+        FOREIGN KEY (manifest_value_schema, manifest_digest)
+            REFERENCES manifest_values(value_schema, manifest_digest)
+            ON DELETE RESTRICT,
+        PRIMARY KEY (
+            dependent_artifact_id, source_artifact_id, input_path, binding_name
+        )
+    )
+    """,
+    """
+    INSERT INTO artifacts_v20 (
+        artifact_id, origin, run_id, context, workflow_name, step_name, output_name,
+        address, job_id, artifact_set_id, parameter_id, path, is_selected_output,
+        is_published, published_path, staging_path, content_digest, output_hash,
+        file_size, extension, subject_id, session_id, task_name, run_label, datatype,
+        suffix, source_metadata_json, callable_ref, software_ref, source_scope,
+        source_name, source_entity_id, source_st_dev, source_st_ino, source_st_size,
+        source_st_mtime_ns, source_st_ctime_ns, request_bundle_digest, created_at, kind,
+        digest_scheme
+    )
+    SELECT
+        artifact_id, origin, run_id, context, workflow_name, step_name, output_name,
+        address, job_id, artifact_set_id, parameter_id, path, is_selected_output,
+        is_published, published_path, staging_path, content_digest, output_hash,
+        file_size, extension, subject_id, session_id, task_name, run_label, datatype,
+        suffix, source_metadata_json, callable_ref, software_ref, source_scope,
+        source_name, source_entity_id, source_st_dev, source_st_ino, source_st_size,
+        source_st_mtime_ns, source_st_ctime_ns, request_bundle_digest, created_at,
+        'file', 'sha256'
+    FROM artifacts
+    """,
+    """
+    INSERT INTO artifact_dependencies_v20 (
+        dependent_artifact_id, source_artifact_id, source_content_digest,
+        source_file_size, source_extension, input_path, binding_name, dependency_role,
+        source_step_name, source_output_name, source_address, source_scope, source_name,
+        source_entity_id, source_occurrence_path, dependency_set_id,
+        manifest_value_schema, manifest_digest, edge_cardinality
+    )
+    SELECT
+        dependent_artifact_id, source_artifact_id, source_content_digest,
+        source_file_size, source_extension, input_path, binding_name, dependency_role,
+        source_step_name, source_output_name, source_address, source_scope, source_name,
+        source_entity_id, source_occurrence_path, dependency_set_id,
+        manifest_value_schema, manifest_digest, edge_cardinality
+    FROM artifact_dependencies
+    """,
+    """
+    DROP TABLE artifact_dependencies
+    """,
+    """
+    DROP TABLE artifacts
+    """,
+    """
+    ALTER TABLE artifacts_v20 RENAME TO artifacts
+    """,
+    """
+    ALTER TABLE artifact_dependencies_v20 RENAME TO artifact_dependencies
+    """,
+    """
+    CREATE UNIQUE INDEX IF NOT EXISTS artifacts_source_global_coordinate_uq
+        ON artifacts(context, source_name)
+        WHERE origin = 'source' AND source_scope = 'global'
+    """,
+    """
+    CREATE UNIQUE INDEX IF NOT EXISTS artifacts_source_entity_coordinate_uq
+        ON artifacts(context, source_name, source_entity_id)
+        WHERE origin = 'source' AND source_scope = 'entity'
+    """,
+    """
+    CREATE UNIQUE INDEX IF NOT EXISTS artifacts_workflow_output_uq
+        ON artifacts(run_id, step_name, output_name, address)
+        WHERE origin = 'workflow_output'
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS artifacts_path_idx
+        ON artifacts(context, path)
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS artifacts_selected_lookup_idx
+        ON artifacts(context, workflow_name, step_name, output_name, address)
+        WHERE is_selected_output = 1
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS artifacts_reuse_lookup_idx
+        ON artifacts(
+            context, step_name, address, request_bundle_digest, run_id
+        )
+        WHERE origin = 'workflow_output' AND is_published = 1
+    """,
+)
+
+def _rebuild_v20_artifact_tables(
+    conn: sqlite3.Connection,
+    *,
+    fault_hook: Callable[[str], None] | None = None,
+) -> None:
+    sequence = conn.execute(
+        "SELECT seq FROM sqlite_sequence WHERE name = 'artifacts'"
+    ).fetchone()
+    for position, statement in enumerate(_V20_REBUILD_STATEMENTS, start=1):
+        conn.execute(statement)
+        _invoke_migration_fault(fault_hook, f"after_ddl_{position:02d}")
+    conn.execute("DELETE FROM sqlite_sequence WHERE name = 'artifacts'")
+    if sequence is not None:
+        conn.execute(
+            "INSERT INTO sqlite_sequence(name, seq) VALUES ('artifacts', ?)",
+            (sequence[0],),
+        )
+    _invoke_migration_fault(fault_hook, "after_sequence_restore")
+
+
 def _create_schema(conn: sqlite3.Connection) -> None:
     version = _schema_version(conn)
     if version == REGISTRY_SCHEMA_VERSION:
@@ -4950,26 +5289,34 @@ def _create_schema(conn: sqlite3.Connection) -> None:
             f"expected empty or {REGISTRY_SCHEMA_VERSION}, found 0"
         )
 
-    additive_sql = "\n".join(
-        f"{statement.strip()};" for statement in _V19_ADDITIVE_SCHEMA_STATEMENTS
-    )
-    creation_sql = (
-        "BEGIN IMMEDIATE;\n"
-        f"{_V18_CORE_SCHEMA_SQL}\n"
-        f"{additive_sql}\n"
-        f"PRAGMA user_version = {REGISTRY_SCHEMA_VERSION};\n"
-        "COMMIT;"
-    )
+    conn.execute("PRAGMA foreign_keys = OFF")
     try:
-        conn.executescript(creation_sql)
+        conn.execute("BEGIN IMMEDIATE")
+        _create_v19_relations(conn)
+        _rebuild_v20_artifact_tables(conn)
+        conn.execute(f"PRAGMA user_version = {REGISTRY_SCHEMA_VERSION}")
+        _validate_exact_registry_structure(
+            conn, expected_version=REGISTRY_SCHEMA_VERSION
+        )
+        if conn.execute("PRAGMA foreign_key_check").fetchall():
+            raise ValidationError("registry creation found foreign-key violations")
+        if conn.execute("PRAGMA integrity_check").fetchall() != [("ok",)]:
+            raise ValidationError("registry creation failed integrity_check")
+        conn.commit()
     except Exception:
-        if conn.in_transaction:
-            conn.rollback()
+        conn.rollback()
         raise
-    _validate_exact_registry_structure(
-        conn,
-        expected_version=REGISTRY_SCHEMA_VERSION,
-    )
+    finally:
+        _set_foreign_keys(conn)
+
+
+def _create_v19_relations(conn: sqlite3.Connection) -> None:
+    # Fixed historical DDL has no semicolons inside statements.
+    for statement in _V18_CORE_SCHEMA_SQL.split(";"):
+        if statement.strip():
+            conn.execute(statement)
+    for statement in _V19_ADDITIVE_SCHEMA_STATEMENTS:
+        conn.execute(statement)
 
 
 def registry_schema_signature(conn: sqlite3.Connection) -> dict[str, object]:
@@ -5040,7 +5387,7 @@ def migrate_registry_db(
     runtime_root: Path,
     fault_hook: Callable[[str], None] | None = None,
 ) -> RegistryMigrationResult:
-    """Explicitly migrate one exact schema-18 registry to schema 19."""
+    """Explicitly migrate one exact schema-19 registry to schema 20."""
     context = validate_path_token(context, label="context")
     runtime_root = runtime_root.expanduser().resolve()
     if not runtime_root.is_dir():
@@ -5098,7 +5445,7 @@ def migrate_registry_db(
                 status="already-current",
             )
         _require_supported_migration_version(version)
-        return _migrate_registry_v18_locked(
+        return _migrate_registry_v19_locked(
             registry_path,
             context=context,
             runtime_root=runtime_root,
@@ -5106,14 +5453,14 @@ def migrate_registry_db(
         )
 
 
-def _migrate_registry_v18_locked(
+def _migrate_registry_v19_locked(
     registry_path: Path,
     *,
     context: str,
     runtime_root: Path,
     fault_hook: Callable[[str], None] | None,
 ) -> RegistryMigrationResult:
-    backup_path = registry_path.with_name(REGISTRY_V18_BACKUP_FILENAME)
+    backup_path = registry_path.with_name(REGISTRY_V19_BACKUP_FILENAME)
     live_conn = _open_migration_connection(registry_path)
     backup_validated = False
     try:
@@ -5151,13 +5498,9 @@ def _migrate_registry_v18_locked(
             ) from exc
 
         _invoke_migration_fault(fault_hook, "after_backup")
+        live_conn.execute("PRAGMA foreign_keys = OFF")
         live_conn.execute("BEGIN IMMEDIATE")
-        for position, statement in enumerate(
-            _V19_ADDITIVE_SCHEMA_STATEMENTS,
-            start=1,
-        ):
-            live_conn.execute(statement)
-            _invoke_migration_fault(fault_hook, f"after_ddl_{position:02d}")
+        _rebuild_v20_artifact_tables(live_conn, fault_hook=fault_hook)
         live_conn.execute(f"PRAGMA user_version = {REGISTRY_SCHEMA_VERSION}")
         _invoke_migration_fault(fault_hook, "after_user_version")
         _validate_migration_preflight(
@@ -5172,6 +5515,7 @@ def _migrate_registry_v18_locked(
     except Exception as exc:
         if live_conn.in_transaction:
             live_conn.rollback()
+        _set_foreign_keys(live_conn)
         live_conn.close()
         if backup_validated and _is_exact_migration_registry(
             registry_path,
@@ -5194,10 +5538,11 @@ def _migrate_registry_v18_locked(
             _require_equal_migration_contents(registry_path, backup_path)
             raise ValidationError(
                 "registry migration failed before commit; live registry remains "
-                f"schema 18: validated backup={backup_path}"
+                f"schema 19: validated backup={backup_path}"
             ) from exc
         raise
     else:
+        _set_foreign_keys(live_conn)
         live_conn.close()
 
     try:
@@ -5234,9 +5579,11 @@ def _read_registry_schema_version(path: Path) -> int:
 
 
 def _require_supported_migration_version(version: int) -> None:
+    if version == 18:
+        raise ValidationError(_V18_UPGRADE_GUIDANCE)
     if version != REGISTRY_MIGRATION_SOURCE_VERSION:
         raise ValidationError(
-            "registry migration supports only schema 18 to 19; "
+            "registry migration supports only schema 19 to 20; "
             f"found {version}"
         )
 
@@ -5314,7 +5661,7 @@ def _validate_migration_preflight(
         if expected_version == REGISTRY_MIGRATION_SOURCE_VERSION:
             _require_supported_migration_version(version)
         raise ValidationError(
-            "registry migration requires the exact V19 schema: "
+            f"registry migration requires the exact V{expected_version} schema: "
             f"found schema {version}"
         )
     _validate_exact_registry_structure(conn, expected_version=expected_version)
@@ -5370,27 +5717,33 @@ def _expected_registry_schema_signature(version: int) -> dict[str, object]:
         REGISTRY_SCHEMA_VERSION,
     }:
         raise ValueError(f"unsupported registry schema signature version: {version}")
-    with sqlite3.connect(":memory:") as conn:
-        conn.executescript(_V18_CORE_SCHEMA_SQL)
+    conn = sqlite3.connect(":memory:")
+    try:
+        conn.execute("PRAGMA foreign_keys = OFF")
+        conn.execute("BEGIN IMMEDIATE")
+        _create_v19_relations(conn)
         if version == REGISTRY_SCHEMA_VERSION:
-            for statement in _V19_ADDITIVE_SCHEMA_STATEMENTS:
-                conn.execute(statement)
+            _rebuild_v20_artifact_tables(conn)
         conn.execute(f"PRAGMA user_version = {version}")
         signature = registry_schema_signature(conn)
+        conn.commit()
+    finally:
+        if conn.in_transaction:
+            conn.rollback()
+        _set_foreign_keys(conn)
+        conn.close()
     if version == REGISTRY_MIGRATION_SOURCE_VERSION:
         digest = registry_schema_signature_digest(signature)
-        if digest != REGISTRY_V18_SCHEMA_SIGNATURE_SHA256:
+        if digest != REGISTRY_V19_SCHEMA_SIGNATURE_SHA256:
             raise ValidationError(
-                "registry migration requires the exact V18 schema: retained "
+                "registry migration requires the exact V19 schema: retained "
                 "production schema does not match its frozen signature"
             )
     return signature
 
 
 def _exact_schema_requirement_message(version: int) -> str:
-    if version == REGISTRY_MIGRATION_SOURCE_VERSION:
-        return "registry migration requires the exact V18 schema"
-    return "registry migration requires the exact V19 schema"
+    return f"registry migration requires the exact V{version} schema"
 
 
 def _is_exact_migration_registry(
@@ -5611,7 +5964,9 @@ def _registry_artifact_from_row(row: sqlite3.Row) -> RegistryArtifact:
         content_digest=str(row["content_digest"]),
         output_hash=row["output_hash"],
         file_size=int(row["file_size"]),
-        extension=str(row["extension"]),
+        extension=row["extension"],
+        kind=row["kind"],
+        digest_scheme=row["digest_scheme"],
         subject_id=row["subject_id"],
         session_id=row["session_id"],
         task_name=row["task_name"],
@@ -5730,7 +6085,7 @@ def _registry_dependency_from_row(row: sqlite3.Row) -> RegistryDependency:
         source_artifact_id=int(row["source_artifact_id"]),
         source_content_digest=str(row["source_content_digest"]),
         source_file_size=int(row["source_file_size"]),
-        source_extension=str(row["source_extension"]),
+        source_extension=row["source_extension"],
         input_path=str(row["input_path"]),
         binding_name=str(row["binding_name"]),
         dependency_role=str(row["dependency_role"]),
@@ -7370,9 +7725,11 @@ def _validate_schema_version(conn: sqlite3.Connection) -> None:
     version = _schema_version(conn)
     if version == REGISTRY_MIGRATION_SOURCE_VERSION:
         raise ValidationError(
-            "registry.db schema version 18 requires explicit migration; run "
+            "registry.db schema version 19 requires explicit migration; run "
             "'nipact registry migrate --context CONTEXT --project-dir PROJECT_DIR'"
         )
+    if version == 18:
+        raise ValidationError(_V18_UPGRADE_GUIDANCE)
     if version != REGISTRY_SCHEMA_VERSION:
         raise ValidationError(
             "registry.db schema version is incompatible: "

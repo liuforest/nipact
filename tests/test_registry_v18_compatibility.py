@@ -11,7 +11,7 @@ import pytest
 import nipact.execution as execution_module
 from conftest import (
     RegistryV18Fixture,
-    RegistryV19Fixture,
+    RegistryV20Fixture,
     registry_schema_signature,
 )
 from nipact.execution import build_run_plan, execute_run_plan
@@ -19,7 +19,6 @@ from nipact.hashing import sha256_file_digest
 from nipact.project_setup import validate_project
 from nipact.registry import (
     REGISTRY_SCHEMA_VERSION,
-    REGISTRY_V18_SCHEMA_SIGNATURE_SHA256,
     migrate_registry_db,
     registry_schema_signature as production_registry_schema_signature,
     registry_schema_signature_digest,
@@ -52,16 +51,31 @@ _SOURCE_DIGEST = "45e8f93b1f72302e7d14f405c7a101472a47af2aa307248b1710afdb348bfe
 
 
 def _application_rows(database: Path) -> dict[str, tuple[tuple[object, ...], ...]]:
+    """Compare every historical named column; V20 adds only two artifact facts."""
     with sqlite3.connect(database) as connection:
-        return {
-            table: tuple(
+        tables = [
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
+            )
+        ]
+        result = {}
+        for table in tables:
+            columns = [
+                row[1]
+                for row in connection.execute(f'PRAGMA table_info("{table}")')
+                if not (table == "artifacts" and row[1] in {"kind", "digest_scheme"})
+            ]
+            projection = ", ".join(f'"{column}"' for column in columns)
+            result[table] = tuple(
                 sorted(
-                    connection.execute(f'SELECT * FROM "{table}"').fetchall(),
+                    connection.execute(
+                        f'SELECT {projection} FROM "{table}"'
+                    ).fetchall(),
                     key=repr,
                 )
             )
-            for table in _APPLICATION_TABLES
-        }
+        return result
 
 
 def _frozen_output(*, step_name: str, output_name: str) -> Path:
@@ -133,7 +147,7 @@ def test_registry_v18_schema_signature_is_non_self_referential(
         production = production_registry_schema_signature(connection)
     assert production == expected
     assert registry_schema_signature_digest(production) == (
-        REGISTRY_V18_SCHEMA_SIGNATURE_SHA256
+        "a9f4e68f21602814326580dab4f5efa3d0bf053feb9d5e7eb50436516a9c0069"
     )
 
 
@@ -185,9 +199,9 @@ def test_registry_v18_fixture_has_complete_rows_and_files(
 
 
 def test_migrated_registry_preserves_current_readers_and_trace(
-    registry_v19_fixture: RegistryV19Fixture,
+    synthesized_v20_fixture: RegistryV20Fixture,
 ) -> None:
-    fixture = registry_v19_fixture
+    fixture = synthesized_v20_fixture
     result = validate_project(project_dir=fixture.project_dir, context=fixture.context)
     assert (result.manifest_count, result.workflow_count, result.step_count) == (1, 2, 3)
     assert (result.source_entities, result.published_outputs) == (1, 4)
@@ -278,10 +292,10 @@ def _sqlite_sequence(database: Path) -> tuple[tuple[object, ...], ...]:
 
 
 def test_registry_migration_preserves_rows_sequences_and_scientific_files(
-    registry_v18_fixture: RegistryV18Fixture,
+    registry_v19_fixture: RegistryV18Fixture,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    fixture = registry_v18_fixture
+    fixture = registry_v19_fixture
     rows_before = _application_rows(fixture.registry_path)
     sequences_before = _sqlite_sequence(fixture.registry_path)
     files_before = _scientific_file_bytes(fixture.runtime_dir)
@@ -310,7 +324,11 @@ def test_registry_migration_preserves_rows_sequences_and_scientific_files(
         check(file)
         return original_open(file, *args, **kwargs)
 
+    def reject_execution(*_args: object, **_kwargs: object) -> None:
+        pytest.fail("migration invoked scientific execution")
+
     with monkeypatch.context() as guard:
+        guard.setattr(execution_module, "_run_snakemake", reject_execution)
         guard.setattr(Path, "open", guarded_path_open)
         guard.setattr(builtins, "open", guarded_open)
         result = migrate_registry_db(
@@ -330,23 +348,15 @@ def test_registry_migration_preserves_rows_sequences_and_scientific_files(
         assert connection.execute("PRAGMA user_version").fetchone() == (
             REGISTRY_SCHEMA_VERSION,
         )
-        assert all(
-            connection.execute(f'SELECT COUNT(*) FROM "{table}"').fetchone()[0] == 0
-            for table in (
-                "specification_snapshots",
-                "specification_members",
-                "specification_snapshot_manifest_values",
-                "specification_expected_results",
-                "specification_member_attempts",
-                "specification_attempt_results",
-            )
-        )
+        assert connection.execute(
+            "SELECT DISTINCT kind, digest_scheme FROM artifacts"
+        ).fetchall() == [("file", "sha256")]
 
 
 def test_migrated_registry_preserves_reuse_and_parameter_divergence(
-    registry_v19_fixture: RegistryV19Fixture,
+    synthesized_v20_fixture: RegistryV20Fixture,
 ) -> None:
-    fixture = registry_v19_fixture
+    fixture = synthesized_v20_fixture
     base = build_run_plan(
         project_dir=fixture.project_dir,
         context=fixture.context,
@@ -390,10 +400,10 @@ def test_migrated_registry_preserves_reuse_and_parameter_divergence(
 
 
 def test_migrated_registry_reuse_only_execution_records_selection_not_generation(
-    registry_v19_fixture: RegistryV19Fixture,
+    synthesized_v20_fixture: RegistryV20Fixture,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    fixture = registry_v19_fixture
+    fixture = synthesized_v20_fixture
     before = _application_rows(fixture.registry_path)
     before_publications = before["published_outputs"]
     source_before = before["artifacts"][0]
@@ -563,8 +573,8 @@ def test_registry_v18_autoincrement_state_allocates_above_frozen_sequences(
 
 
 def test_migrated_registry_autoincrement_state_allocates_above_frozen_sequences(
-    registry_v19_fixture: RegistryV19Fixture,
+    synthesized_v20_fixture: RegistryV20Fixture,
 ) -> None:
     _assert_autoincrement_state_allocates_above_frozen_sequences(
-        registry_v19_fixture.registry_path
+        synthesized_v20_fixture.registry_path
     )

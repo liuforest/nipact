@@ -51,7 +51,7 @@ from test_specification_registry import (
     build_entity_snapshot,
     build_snapshot,
     configure_specification_project,
-    prepare_v19,
+    prepare_v20,
 )
 
 
@@ -115,7 +115,7 @@ def test_freeze_uses_one_compilation_and_exact_preflight_order(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     fixture = registry_v18_fixture
-    prepare_v19(fixture, route="fresh")
+    prepare_v20(fixture, route="fresh")
     compiled = compile_specification_snapshot(
         project_dir=fixture.project_dir,
         context=fixture.context,
@@ -191,7 +191,7 @@ def test_registered_and_explicit_freeze_share_identity_and_exact_replay(
     route: str,
 ) -> None:
     fixture = registry_v18_fixture
-    expected = prepare_v19(fixture, route=route)
+    expected = prepare_v20(fixture, route=route)
     specification_path = fixture.project_dir / "specifications/compact.yaml"
     scientific_source = fixture.runtime_dir / "data/source/entity_002.txt"
     before_ordinary = _ordinary_state(fixture.registry_path)
@@ -341,7 +341,7 @@ def test_specification_member_fresh_complete_records_exact_results(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     fixture = registry_v18_fixture
-    prepare_v19(fixture, route="fresh")
+    prepare_v20(fixture, route="fresh")
     snapshot = build_entity_snapshot(fixture)
     member = _persist_snapshot(fixture, snapshot)
     original_lock = execution_module.acquire_mutating_runtime_lock
@@ -438,7 +438,7 @@ def test_specification_member_migrated_mixed_reuse_and_later_direct_reuse(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     fixture = registry_v18_fixture
-    prepare_v19(fixture, route="migrated")
+    prepare_v20(fixture, route="migrated")
     snapshot = build_entity_snapshot(fixture)
     member = _persist_snapshot(fixture, snapshot)
     monkeypatch.setattr(
@@ -549,7 +549,7 @@ def test_specification_preappend_rejections_do_not_mutate(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     fixture = registry_v18_fixture
-    prepare_v19(fixture, route="fresh")
+    prepare_v20(fixture, route="fresh")
     snapshot = build_entity_snapshot(fixture)
     _persist_snapshot(fixture, snapshot)
     included = next(
@@ -669,7 +669,7 @@ def test_specification_lock_contention_precedes_member_mutation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     fixture = registry_v18_fixture
-    prepare_v19(fixture, route="fresh")
+    prepare_v20(fixture, route="fresh")
     snapshot = build_entity_snapshot(fixture)
     member = _persist_snapshot(fixture, snapshot)
     before = _table_rows(fixture.registry_path)
@@ -701,7 +701,7 @@ def test_specification_source_change_reconciles_at_attempt(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     fixture = registry_v18_fixture
-    prepare_v19(fixture, route="fresh")
+    prepare_v20(fixture, route="fresh")
     snapshot = build_entity_snapshot(fixture)
     member = _persist_snapshot(fixture, snapshot)
     source = fixture.runtime_dir / "data/source/entity_002.txt"
@@ -761,7 +761,7 @@ def test_specification_projection_preserves_cross_workflow_reuse_and_lineage(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     fixture = registry_v18_fixture
-    prepare_v19(fixture, route="fresh")
+    prepare_v20(fixture, route="fresh")
     config_path = fixture.project_dir / "nipact.yaml"
     config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
     workflows = config["workflows"]
@@ -970,7 +970,7 @@ def test_specification_postappend_failure_stages(
     expected_stage: str,
 ) -> None:
     fixture = registry_v18_fixture
-    prepare_v19(fixture, route="fresh")
+    prepare_v20(fixture, route="fresh")
     snapshot = build_entity_snapshot(fixture)
     member = _persist_snapshot(fixture, snapshot)
     original = RuntimeError(f"{failure_kind} broke")
@@ -1069,7 +1069,7 @@ def test_specification_normal_terminal_outcomes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     fixture = registry_v18_fixture
-    prepare_v19(fixture, route="fresh")
+    prepare_v20(fixture, route="fresh")
     snapshot = build_entity_snapshot(fixture)
     member = _persist_snapshot(fixture, snapshot)
     zero = RunOutcome(
@@ -1129,7 +1129,7 @@ def test_specification_transaction_owned_terminal_outcomes(
     expected_results: set[tuple[str, str]],
 ) -> None:
     fixture = registry_v18_fixture
-    prepare_v19(fixture, route="fresh")
+    prepare_v20(fixture, route="fresh")
     snapshot = build_entity_snapshot(fixture)
     member = _persist_snapshot(fixture, snapshot)
 
@@ -1390,7 +1390,7 @@ def test_all_specification_members_uses_canonical_stop_policy(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     fixture = registry_v18_fixture
-    prepare_v19(fixture, route="fresh")
+    prepare_v20(fixture, route="fresh")
     payload = _specification_payload()
     payload["dimensions"] = {
         "variant": {
@@ -1529,7 +1529,7 @@ def test_specification_interruption_and_postcommit_callback_boundaries(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     fixture = registry_v18_fixture
-    prepare_v19(fixture, route="fresh")
+    prepare_v20(fixture, route="fresh")
     snapshot = build_entity_snapshot(fixture)
     member = _persist_snapshot(fixture, snapshot)
 

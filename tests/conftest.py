@@ -23,8 +23,7 @@ from nipact.execution_evidence import CompletionReceipt, write_completion_receip
 from nipact.manifest import load_manifest
 from nipact.registry import (
     REGISTRY_DB_PATH,
-    REGISTRY_SCHEMA_VERSION,
-    REGISTRY_V18_BACKUP_FILENAME,
+    REGISTRY_V19_BACKUP_FILENAME,
     initialize_prepared_demo_registry_db,
     list_artifacts,
     migrate_registry_db,
@@ -50,7 +49,7 @@ class RegistryV18Fixture:
 
 
 @dataclass(frozen=True)
-class RegistryV19Fixture:
+class RegistryV20Fixture:
     project_dir: Path
     runtime_dir: Path
     registry_path: Path
@@ -187,9 +186,7 @@ def registry_schema_signature(database: Path) -> dict[str, object]:
     }
 
 
-@pytest.fixture
-def registry_v18_fixture(tmp_path: Path) -> RegistryV18Fixture:
-    """Install the static V18 compatibility fixture without production creators."""
+def _install_historical_fixture(tmp_path: Path, *, version: int) -> RegistryV18Fixture:
     fixture_root = Path(__file__).parent / "fixtures/registry_v18"
     project_dir = tmp_path / "project"
     runtime_dir = tmp_path / "runtime"
@@ -198,10 +195,17 @@ def registry_v18_fixture(tmp_path: Path) -> RegistryV18Fixture:
     registry_path = runtime_dir / REGISTRY_DB_PATH
     registry_path.parent.mkdir(parents=True)
 
+    if version == 19:
+        shutil.rmtree(runtime_dir / "outputs/v1/v18_fixture/fixture_analysis")
+        shutil.copy2(
+            fixture_root.parent / "registry_v19/compatibility.yaml", project_dir
+        )
+    sql_root = fixture_root.parent / f"registry_v{version}"
     with sqlite3.connect(registry_path) as connection:
         connection.executescript(
-            (fixture_root / "populated-registry.sql").read_text(encoding="utf-8")
+            (sql_root / "populated-registry.sql").read_text(encoding="utf-8")
         )
+        connection.execute(f"PRAGMA user_version = {version}")
 
     source_path = runtime_dir / "data/source/entity_001.txt"
     source_stat = source_path.stat()
@@ -238,27 +242,55 @@ def registry_v18_fixture(tmp_path: Path) -> RegistryV18Fixture:
         runtime_dir=runtime_dir,
         registry_path=registry_path,
         context="v18_fixture",
-        selected_artifact_id=5,
+        selected_artifact_id=5 if version == 18 else 3,
     )
 
 
 @pytest.fixture
-def registry_v19_fixture(
+def registry_v18_fixture(tmp_path: Path) -> RegistryV18Fixture:
+    """Install the actual historical V18 fixture without production creators."""
+    return _install_historical_fixture(tmp_path, version=18)
+
+
+@pytest.fixture
+def registry_v19_fixture(tmp_path: Path) -> RegistryV18Fixture:
+    """Install genuine pre-directory V19 science, including executed specifications."""
+    return _install_historical_fixture(tmp_path, version=19)
+
+
+def synthesize_v19_with_v18_science(fixture: RegistryV18Fixture) -> None:
+    """Add frozen V19 specification DDL to old V18 science, with empty spec tables."""
+    historical = Path(__file__).parent / "fixtures/registry_v19/populated-registry.sql"
+    with sqlite3.connect(":memory:") as source:
+        source.executescript(historical.read_text(encoding="utf-8"))
+        statements = source.execute(
+            "SELECT sql FROM sqlite_master WHERE name LIKE 'specification_%' "
+            "AND sql IS NOT NULL ORDER BY type DESC, name"
+        ).fetchall()
+    with sqlite3.connect(fixture.registry_path) as connection:
+        for (statement,) in statements:
+            connection.execute(statement)
+        connection.execute("PRAGMA user_version = 19")
+
+
+@pytest.fixture
+def synthesized_v19_fixture(
     registry_v18_fixture: RegistryV18Fixture,
-) -> RegistryV19Fixture:
-    """Migrate a copied static V18 fixture through the production migration."""
-    fixture = registry_v18_fixture
+) -> RegistryV18Fixture:
+    synthesize_v19_with_v18_science(registry_v18_fixture)
+    return registry_v18_fixture
+
+
+def _migrate_fixture(fixture: RegistryV18Fixture) -> RegistryV20Fixture:
     result = migrate_registry_db(
         fixture.registry_path,
         context=fixture.context,
         runtime_root=fixture.runtime_dir,
     )
-    backup_path = fixture.registry_path.with_name(REGISTRY_V18_BACKUP_FILENAME)
-    assert result.status == "migrated"
-    assert result.from_schema == 18
-    assert result.to_schema == REGISTRY_SCHEMA_VERSION
+    backup_path = fixture.registry_path.with_name(REGISTRY_V19_BACKUP_FILENAME)
+    assert (result.status, result.from_schema, result.to_schema) == ("migrated", 19, 20)
     assert result.backup_path == backup_path
-    return RegistryV19Fixture(
+    return RegistryV20Fixture(
         project_dir=fixture.project_dir,
         runtime_dir=fixture.runtime_dir,
         registry_path=fixture.registry_path,
@@ -266,6 +298,20 @@ def registry_v19_fixture(
         selected_artifact_id=fixture.selected_artifact_id,
         backup_path=backup_path,
     )
+
+
+@pytest.fixture
+def synthesized_v20_fixture(
+    synthesized_v19_fixture: RegistryV18Fixture,
+) -> RegistryV20Fixture:
+    return _migrate_fixture(synthesized_v19_fixture)
+
+
+@pytest.fixture
+def registry_v20_fixture(
+    registry_v19_fixture: RegistryV18Fixture,
+) -> RegistryV20Fixture:
+    return _migrate_fixture(registry_v19_fixture)
 
 
 def write_all_staged_outputs(run_plan: object) -> None:
