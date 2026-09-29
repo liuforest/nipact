@@ -9,7 +9,7 @@ from typing import Any, Callable
 import pytest
 import yaml
 
-from conftest import RegistryV18Fixture, RegistryV19Fixture
+from conftest import RegistryV18Fixture, RegistryV20Fixture
 from nipact.errors import ValidationError
 from nipact.project_context import ResolvedProjectContext, resolve_project_context
 from nipact.specification_config import parse_specification_registrations
@@ -236,10 +236,10 @@ def test_absent_and_empty_registrations_are_valid_for_workflow_reader_on_v18(
 
 @pytest.mark.parametrize("sections", [{}, {"specification_libraries": {}, "specifications": {}}])
 def test_absent_and_empty_registrations_are_valid_for_context_reader_on_v19(
-    registry_v19_fixture: RegistryV19Fixture,
+    synthesized_v20_fixture: RegistryV20Fixture,
     sections: dict[str, object],
 ) -> None:
-    fixture = registry_v19_fixture
+    fixture = synthesized_v20_fixture
     config_path = fixture.project_dir / "nipact.yaml"
     config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
     config.update(sections)

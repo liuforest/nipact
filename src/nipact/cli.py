@@ -176,8 +176,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     registry_migrate_parser = registry_subparsers.add_parser(
         "migrate",
-        help="migrate an exact schema-18 registry to schema 19",
-        description="migrate an exact schema-18 registry to schema 19",
+        help="migrate an exact schema-19 registry to schema 20",
+        description="migrate an exact schema-19 registry to schema 20",
     )
     _add_project_context_args(registry_migrate_parser)
 
@@ -894,7 +894,8 @@ def _run_registry_command(args: argparse.Namespace) -> None:
             raise RuntimeError("migrated registry result is missing its backup path")
         print(f"backup={_display_path(result.backup_path)}")
         print(
-            "recovery=restore the backup manually before using schema-18 software"
+            "recovery=restore the backup manually before using "
+            f"schema-{result.from_schema} software"
         )
     else:
         print(f"schema={REGISTRY_SCHEMA_VERSION}")

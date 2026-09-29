@@ -12,14 +12,14 @@ import nipact.execution as execution_module
 import nipact.registry as registry_module
 from conftest import (
     RegistryV18Fixture,
-    RegistryV19Fixture,
+    RegistryV20Fixture,
     registry_schema_signature,
 )
 from nipact.cli import main
 from nipact.errors import ValidationError
 from nipact.registry import (
     REGISTRY_SCHEMA_VERSION,
-    REGISTRY_V18_BACKUP_FILENAME,
+    REGISTRY_V19_BACKUP_FILENAME,
     initialize_registry_db,
     migrate_registry_db,
 )
@@ -151,13 +151,13 @@ _EXPECTED_FOREIGN_KEYS = {
     },
 }
 _MIGRATION_GUIDANCE = (
-    "registry.db schema version 18 requires explicit migration; run "
+    "registry.db schema version 19 requires explicit migration; run "
     "'nipact registry migrate --context CONTEXT --project-dir PROJECT_DIR'"
 )
 
 
 def _backup_path(fixture: RegistryV18Fixture) -> Path:
-    return fixture.registry_path.with_name(REGISTRY_V18_BACKUP_FILENAME)
+    return fixture.registry_path.with_name(REGISTRY_V19_BACKUP_FILENAME)
 
 
 def _schema_version(database: Path) -> int:
@@ -208,7 +208,7 @@ def _runtime_inventory(runtime_dir: Path) -> tuple[tuple[str, str, bytes | None]
     return tuple(inventory)
 
 
-def _fresh_v19(tmp_path: Path, *, context: str = "fresh") -> tuple[Path, Path]:
+def _fresh_v20(tmp_path: Path, *, context: str = "fresh") -> tuple[Path, Path]:
     runtime_dir = tmp_path / "fresh-runtime"
     registry_path = runtime_dir / "database/registry.db"
     registry_path.parent.mkdir(parents=True)
@@ -240,13 +240,13 @@ def _foreign_key_shape(
     }
 
 
-def test_fresh_and_migrated_v19_have_the_same_exact_additive_schema(
+def test_fresh_and_migrated_v20_have_the_same_exact_schema(
     tmp_path: Path,
-    registry_v19_fixture: RegistryV19Fixture,
+    registry_v20_fixture: RegistryV20Fixture,
 ) -> None:
-    _runtime_dir, fresh_database = _fresh_v19(tmp_path)
+    _runtime_dir, fresh_database = _fresh_v20(tmp_path)
     fresh = registry_schema_signature(fresh_database)
-    migrated = registry_schema_signature(registry_v19_fixture.registry_path)
+    migrated = registry_schema_signature(registry_v20_fixture.registry_path)
     assert fresh == migrated
     assert fresh["user_version"] == REGISTRY_SCHEMA_VERSION
 
@@ -274,13 +274,6 @@ def test_fresh_and_migrated_v19_have_the_same_exact_additive_schema(
         assert _foreign_key_shape(fresh, table) == _EXPECTED_FOREIGN_KEYS[table]
 
     with sqlite3.connect(fresh_database) as connection:
-        assert {
-            table: connection.execute(
-                f'SELECT COUNT(*) FROM "{table}"'
-            ).fetchone()[0]
-            for table in _NEW_TABLES
-        } == {table: 0 for table in _NEW_TABLES}
-    with sqlite3.connect(registry_v19_fixture.registry_path) as connection:
         assert {
             table: connection.execute(
                 f'SELECT COUNT(*) FROM "{table}"'
@@ -393,24 +386,24 @@ def _seed_specification_rows(connection: sqlite3.Connection) -> None:
         ),
     ],
 )
-def test_v19_schema_enforces_representative_constraints(
+def test_v20_schema_preserves_representative_constraints(
     tmp_path: Path,
     case: str,
     statement: str,
     parameters: tuple[object, ...],
 ) -> None:
     del case
-    _runtime_dir, database = _fresh_v19(tmp_path)
+    _runtime_dir, database = _fresh_v20(tmp_path)
     with sqlite3.connect(database) as connection:
         _seed_specification_rows(connection)
         with pytest.raises(sqlite3.IntegrityError):
             connection.execute(statement, parameters)
 
 
-def test_valid_v19_noop_is_read_only_and_creates_no_infrastructure(
+def test_valid_v20_noop_is_read_only_and_creates_no_infrastructure(
     tmp_path: Path,
 ) -> None:
-    runtime_dir, database = _fresh_v19(tmp_path)
+    runtime_dir, database = _fresh_v20(tmp_path)
     before = database.read_bytes()
 
     result = migrate_registry_db(
@@ -421,23 +414,23 @@ def test_valid_v19_noop_is_read_only_and_creates_no_infrastructure(
 
     assert result.status == "already-current"
     assert database.read_bytes() == before
-    assert not database.with_name(REGISTRY_V18_BACKUP_FILENAME).exists()
+    assert not database.with_name(REGISTRY_V19_BACKUP_FILENAME).exists()
     assert not (runtime_dir / RUNTIME_LOCK_FILENAME).exists()
 
 
-def test_invalid_v19_noop_fails_without_backup_lock_or_further_mutation(
+def test_invalid_v20_noop_fails_without_backup_lock_or_further_mutation(
     tmp_path: Path,
 ) -> None:
-    runtime_dir, database = _fresh_v19(tmp_path)
+    runtime_dir, database = _fresh_v20(tmp_path)
     with sqlite3.connect(database) as connection:
         connection.execute("DROP INDEX specification_member_attempts_member_idx")
     before = database.read_bytes()
 
-    with pytest.raises(ValidationError, match="exact V19 schema"):
+    with pytest.raises(ValidationError, match="exact V20 schema"):
         migrate_registry_db(database, context="fresh", runtime_root=runtime_dir)
 
     assert database.read_bytes() == before
-    assert not database.with_name(REGISTRY_V18_BACKUP_FILENAME).exists()
+    assert not database.with_name(REGISTRY_V19_BACKUP_FILENAME).exists()
     assert not (runtime_dir / RUNTIME_LOCK_FILENAME).exists()
 
 
@@ -450,16 +443,16 @@ def test_missing_live_registry_fails_without_creating_it(tmp_path: Path) -> None
         migrate_registry_db(database, context="missing", runtime_root=runtime_dir)
 
     assert not database.exists()
-    assert not database.with_name(REGISTRY_V18_BACKUP_FILENAME).exists()
+    assert not database.with_name(REGISTRY_V19_BACKUP_FILENAME).exists()
     assert not (runtime_dir / RUNTIME_LOCK_FILENAME).exists()
 
 
 @pytest.mark.parametrize("escape", [False, True], ids=["inside", "escape"])
 def test_live_registry_symlink_is_rejected_without_target_mutation(
-    registry_v18_fixture: RegistryV18Fixture,
+    registry_v19_fixture: RegistryV18Fixture,
     escape: bool,
 ) -> None:
-    fixture = registry_v18_fixture
+    fixture = registry_v19_fixture
     target = (
         fixture.runtime_dir.parent / "outside-registry.db"
         if escape
@@ -485,10 +478,10 @@ def test_live_registry_symlink_is_rejected_without_target_mutation(
 
 @pytest.mark.parametrize("escape", [False, True], ids=["inside", "escape"])
 def test_database_directory_symlink_is_rejected_without_target_mutation(
-    registry_v18_fixture: RegistryV18Fixture,
+    registry_v19_fixture: RegistryV18Fixture,
     escape: bool,
 ) -> None:
-    fixture = registry_v18_fixture
+    fixture = registry_v19_fixture
     database_dir = fixture.registry_path.parent
     target_dir = (
         fixture.runtime_dir.parent / "outside-database"
@@ -512,25 +505,25 @@ def test_database_directory_symlink_is_rejected_without_target_mutation(
 
     assert database_dir.is_symlink()
     assert target_database.read_bytes() == target_before
-    assert not target_database.with_name(REGISTRY_V18_BACKUP_FILENAME).exists()
+    assert not target_database.with_name(REGISTRY_V19_BACKUP_FILENAME).exists()
     assert not (fixture.runtime_dir / RUNTIME_LOCK_FILENAME).exists()
 
 
-def _mutate_v18_preflight_case(database: Path, case: str) -> str:
+def _mutate_v19_preflight_case(database: Path, case: str) -> str:
     with sqlite3.connect(database) as connection:
         if case in {"version-low", "version-high"}:
-            version = 17 if case == "version-low" else 20
+            version = 17 if case == "version-low" else 21
             connection.execute(f"PRAGMA user_version = {version}")
             return f"found {version}"
         if case == "missing-object":
             connection.execute("DROP INDEX published_outputs_artifact_id_idx")
-            return "exact V18 schema"
+            return "exact V19 schema"
         if case == "extra-object":
             connection.execute("CREATE TABLE unexpected_object (value TEXT)")
-            return "exact V18 schema"
+            return "exact V19 schema"
         if case == "altered-column":
             connection.execute("ALTER TABLE contexts ADD COLUMN unexpected TEXT")
-            return "exact V18 schema"
+            return "exact V19 schema"
         if case == "altered-constraint":
             connection.execute("PRAGMA writable_schema = ON")
             connection.execute(
@@ -545,7 +538,7 @@ def _mutate_v18_preflight_case(database: Path, case: str) -> str:
                 """
             )
             connection.execute("PRAGMA writable_schema = OFF")
-            return "exact V18 schema"
+            return "exact V19 schema"
         if case == "foreign-key":
             connection.execute("PRAGMA foreign_keys = OFF")
             connection.execute(
@@ -578,12 +571,12 @@ def _mutate_v18_preflight_case(database: Path, case: str) -> str:
         "context",
     ],
 )
-def test_v18_preflight_rejects_unsupported_or_nonexact_inputs_before_backup(
-    registry_v18_fixture: RegistryV18Fixture,
+def test_v19_preflight_rejects_unsupported_or_nonexact_inputs_before_backup(
+    registry_v19_fixture: RegistryV18Fixture,
     case: str,
 ) -> None:
-    fixture = registry_v18_fixture
-    message = _mutate_v18_preflight_case(fixture.registry_path, case)
+    fixture = registry_v19_fixture
+    message = _mutate_v19_preflight_case(fixture.registry_path, case)
     before = _logical_state(fixture.registry_path)
 
     with pytest.raises(ValidationError, match=message):
@@ -598,10 +591,10 @@ def test_v18_preflight_rejects_unsupported_or_nonexact_inputs_before_backup(
 
 
 def test_integrity_preflight_failure_creates_no_backup(
-    registry_v18_fixture: RegistryV18Fixture,
+    registry_v19_fixture: RegistryV18Fixture,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    fixture = registry_v18_fixture
+    fixture = registry_v19_fixture
     before = _logical_state(fixture.registry_path)
 
     def reject_integrity(*_args: object, **_kwargs: object) -> None:
@@ -627,10 +620,10 @@ def test_integrity_preflight_failure_creates_no_backup(
     ["file", "directory", "symlink", "dangling-symlink"],
 )
 def test_backup_collision_is_rejected_without_replacing_the_entry(
-    registry_v18_fixture: RegistryV18Fixture,
+    registry_v19_fixture: RegistryV18Fixture,
     kind: str,
 ) -> None:
-    fixture = registry_v18_fixture
+    fixture = registry_v19_fixture
     backup = _backup_path(fixture)
     if kind == "file":
         backup.write_bytes(b"keep")
@@ -665,9 +658,9 @@ def test_backup_collision_is_rejected_without_replacing_the_entry(
 
 
 def test_backup_and_live_registry_capture_committed_wal_state(
-    registry_v18_fixture: RegistryV18Fixture,
+    registry_v19_fixture: RegistryV18Fixture,
 ) -> None:
-    fixture = registry_v18_fixture
+    fixture = registry_v19_fixture
     digest = "d" * 64
     writer = sqlite3.connect(fixture.registry_path)
     try:
@@ -699,12 +692,12 @@ def test_backup_and_live_registry_capture_committed_wal_state(
 
 
 @pytest.mark.parametrize("failure", ["creation", "validation"])
-def test_backup_failure_removes_only_the_new_destination_and_preserves_live_v18(
-    registry_v18_fixture: RegistryV18Fixture,
+def test_backup_failure_removes_only_the_new_destination_and_preserves_live_v19(
+    registry_v19_fixture: RegistryV18Fixture,
     monkeypatch: pytest.MonkeyPatch,
     failure: str,
 ) -> None:
-    fixture = registry_v18_fixture
+    fixture = registry_v19_fixture
     backup = _backup_path(fixture)
     before = _logical_state(fixture.registry_path)
     if failure == "creation":
@@ -744,23 +737,24 @@ def test_backup_failure_removes_only_the_new_destination_and_preserves_live_v18(
 
     assert not backup.exists()
     assert _logical_state(fixture.registry_path) == before
-    assert _schema_version(fixture.registry_path) == 18
+    assert _schema_version(fixture.registry_path) == 19
 
 
 @pytest.mark.parametrize(
     "checkpoint",
     [
         "after_backup",
-        *(f"after_ddl_{index:02d}" for index in range(1, 10)),
+        *(f"after_ddl_{index:02d}" for index in range(1, 15)),
+        "after_sequence_restore",
         "after_user_version",
         "before_commit",
     ],
 )
-def test_every_precommit_checkpoint_rolls_back_to_exact_v18(
-    registry_v18_fixture: RegistryV18Fixture,
+def test_every_precommit_checkpoint_rolls_back_to_exact_v19(
+    registry_v19_fixture: RegistryV18Fixture,
     checkpoint: str,
 ) -> None:
-    fixture = registry_v18_fixture
+    fixture = registry_v19_fixture
     before_signature = registry_schema_signature(fixture.registry_path)
     before_state = _logical_state(fixture.registry_path)
 
@@ -783,10 +777,10 @@ def test_every_precommit_checkpoint_rolls_back_to_exact_v18(
     assert _logical_state(backup) == before_state
 
 
-def test_after_commit_failure_reports_ambiguity_and_keeps_v19_plus_v18_backup(
-    registry_v18_fixture: RegistryV18Fixture,
+def test_after_commit_failure_reports_ambiguity_and_keeps_v20_plus_v19_backup(
+    registry_v19_fixture: RegistryV18Fixture,
 ) -> None:
-    fixture = registry_v18_fixture
+    fixture = registry_v19_fixture
     before_signature = registry_schema_signature(fixture.registry_path)
     before_state = _logical_state(fixture.registry_path)
 
@@ -807,7 +801,7 @@ def test_after_commit_failure_reports_ambiguity_and_keeps_v19_plus_v18_backup(
     assert registry_schema_signature(backup) == before_signature
     assert _logical_state(backup) == before_state
     rows, sequences = _logical_state(fixture.registry_path)
-    assert all(rows[table] == () for table in _NEW_TABLES)
+    assert all(rows[table] == before_state[0][table] for table in _NEW_TABLES)
     assert sequences == before_state[1]
 
 
@@ -823,9 +817,9 @@ def _hold_runtime_lock(
 
 
 def test_runtime_lock_contention_prevents_backup_and_ddl(
-    registry_v18_fixture: RegistryV18Fixture,
+    registry_v19_fixture: RegistryV18Fixture,
 ) -> None:
-    fixture = registry_v18_fixture
+    fixture = registry_v19_fixture
     before = _logical_state(fixture.registry_path)
     context = multiprocessing.get_context("spawn")
     ready = context.Event()
@@ -873,13 +867,13 @@ def _project_args(fixture: RegistryV18Fixture) -> list[str]:
         "graph",
     ],
 )
-def test_declaration_only_commands_succeed_on_v18_without_registry_open(
-    registry_v18_fixture: RegistryV18Fixture,
+def test_declaration_only_commands_succeed_on_v19_without_registry_open(
+    registry_v19_fixture: RegistryV18Fixture,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
     command: str,
 ) -> None:
-    fixture = registry_v18_fixture
+    fixture = registry_v19_fixture
     argv = ["workflow", command, *_project_args(fixture)]
     if command == "steps":
         argv += ["--workflow", "base"]
@@ -900,13 +894,13 @@ def test_declaration_only_commands_succeed_on_v18_without_registry_open(
     "command",
     ["validate", "trace", "gui", "run", "dry-run"],
 )
-def test_registry_dependent_commands_reject_v18_before_any_mutation(
-    registry_v18_fixture: RegistryV18Fixture,
+def test_registry_dependent_commands_reject_v19_before_any_mutation(
+    registry_v19_fixture: RegistryV18Fixture,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
     command: str,
 ) -> None:
-    fixture = registry_v18_fixture
+    fixture = registry_v19_fixture
     if command == "validate":
         argv = ["validate", *_project_args(fixture)]
     elif command == "trace":
@@ -932,7 +926,7 @@ def test_registry_dependent_commands_reject_v18_before_any_mutation(
             argv.append("--dry-run")
 
     def reject(*_args: object, **_kwargs: object) -> object:
-        pytest.fail(f"{command} crossed its V18 rejection boundary")
+        pytest.fail(f"{command} crossed its V19 rejection boundary")
 
     monkeypatch.setattr(execution_module, "_run_snakemake", reject)
     monkeypatch.setattr(execution_module, "acquire_mutating_runtime_lock", reject)
@@ -950,11 +944,11 @@ def test_registry_dependent_commands_reject_v18_before_any_mutation(
 
 
 def test_registry_migrate_resolves_project_from_context_index(
-    registry_v18_fixture: RegistryV18Fixture,
+    registry_v19_fixture: RegistryV18Fixture,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    fixture = registry_v18_fixture
+    fixture = registry_v19_fixture
     workspace = fixture.project_dir.parent
     (workspace / "nipact.contexts.yaml").write_text(
         "contexts:\n"
@@ -969,6 +963,24 @@ def test_registry_migrate_resolves_project_from_context_index(
     output = capsys.readouterr().out.splitlines()
     assert f"context={fixture.context}" in output
     assert "status=migrated" in output
-    assert "from_schema=18" in output
-    assert "to_schema=19" in output
+    assert "from_schema=19" in output
+    assert "to_schema=20" in output
     assert output[-1] == "PASS: registry migrate"
+
+
+@pytest.mark.parametrize("command", ["migrate", "validate"])
+def test_v18_requires_the_named_pre_directory_binary_without_mutation(
+    registry_v18_fixture: RegistryV18Fixture,
+    capsys: pytest.CaptureFixture[str],
+    command: str,
+) -> None:
+    fixture = registry_v18_fixture
+    before = _runtime_inventory(fixture.runtime_dir)
+    argv = ["registry", "migrate"] if command == "migrate" else ["validate"]
+    assert main([*argv, *_project_args(fixture)]) == 1
+    error = capsys.readouterr().err
+    assert "schema version 18 requires the pre-directory release" in error
+    assert "c4ae3b2467a9e99cc6c25f20ebbc3c9081e73743" in error
+    assert "nipact registry migrate --context CONTEXT --project-dir PROJECT_DIR" in error
+    assert "with that binary for 18 to 19, then with this release for 19 to 20" in error
+    assert _runtime_inventory(fixture.runtime_dir) == before

@@ -85,7 +85,7 @@ def test_registry_migrate_parser_requires_context_and_has_help(
         main(["registry", "migrate", "--help"])
     assert exc_info.value.code == 0
     help_text = " ".join(capsys.readouterr().out.split())
-    assert "migrate an exact schema-18 registry to schema 19" in help_text
+    assert "migrate an exact schema-19 registry to schema 20" in help_text
 
 
 def _patch_registry_migration_route(
@@ -138,7 +138,7 @@ def test_registry_migrate_prints_migrated_result_and_routes_exactly(
     project_dir = tmp_path / "project"
     runtime_dir = tmp_path / "runtime"
     registry_path = (runtime_dir / "database/registry.db").resolve()
-    backup_path = registry_path.with_name("registry.v18-before-v19.db")
+    backup_path = registry_path.with_name("registry.v19-before-v20.db")
     routed = _patch_registry_migration_route(
         monkeypatch=monkeypatch,
         project_dir=project_dir,
@@ -147,8 +147,8 @@ def test_registry_migrate_prints_migrated_result_and_routes_exactly(
             context="fixture",
             registry_path=registry_path,
             status="migrated",
-            from_schema=18,
-            to_schema=19,
+            from_schema=19,
+            to_schema=20,
             backup_path=backup_path,
         ),
     )
@@ -170,10 +170,10 @@ def test_registry_migrate_prints_migrated_result_and_routes_exactly(
         "context=fixture",
         "registry=runtime/database/registry.db",
         "status=migrated",
-        "from_schema=18",
-        "to_schema=19",
-        "backup=runtime/database/registry.v18-before-v19.db",
-        "recovery=restore the backup manually before using schema-18 software",
+        "from_schema=19",
+        "to_schema=20",
+        "backup=runtime/database/registry.v19-before-v20.db",
+        "recovery=restore the backup manually before using schema-19 software",
         "PASS: registry migrate",
     ]
 
@@ -212,7 +212,7 @@ def test_registry_migrate_prints_already_current_without_backup(
         "context=fixture",
         "registry=runtime/database/registry.db",
         "status=already-current",
-        "schema=19",
+        "schema=20",
         "PASS: registry migrate",
     ]
 

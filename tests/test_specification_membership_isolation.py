@@ -14,7 +14,7 @@ from nipact.cli import main
 from nipact.execution import build_run_plan, execute_run_plan
 from nipact.registry import read_specification_snapshot_projections
 from test_specification_execution import _run_jobs_in_process
-from test_specification_registry import _specification_payload, prepare_v19
+from test_specification_registry import _specification_payload, prepare_v20
 
 
 def _query(fixture: RegistryV18Fixture, sql: str) -> list[tuple]:
@@ -70,7 +70,7 @@ def test_specification_members_preserve_ordinary_current_and_published(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     fixture = registry_v18_fixture
-    prepare_v19(fixture, route="fresh")
+    prepare_v20(fixture, route="fresh")
     _write_two_member_specification(fixture)
     monkeypatch.setattr(
         ordinary_execution_module, "_run_snakemake", _run_jobs_in_process
