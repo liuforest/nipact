@@ -97,8 +97,9 @@ class StepInput:
 @dataclass(frozen=True)
 class StepOutput:
     name: str
-    extension: str
+    extension: str | None
     address_scope: str
+    kind: str = "file"
 
 
 @dataclass(frozen=True)

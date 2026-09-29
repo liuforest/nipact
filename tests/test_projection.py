@@ -614,7 +614,7 @@ def test_projection_rejects_unknown_contract_versions(
             projection,
             output_contract=replace(
                 projection.output_contract,
-                output_contract_version=2,
+                output_contract_version=99,
             ),
         )
     expected_version = 3 if contract == "identity" else 1
@@ -958,4 +958,134 @@ def test_stored_projection_validator_rejects_v2_payload() -> None:
                 projection_json.encode("utf-8")
             ).hexdigest(),
             projection_json=projection_json,
+        )
+
+
+def test_mixed_output_contract_preserves_file_descendant_identity() -> None:
+    legacy = _resolved(_projection())
+    mixed = replace(
+        _projection(),
+        output_contract=OutputContract(
+            2,
+            (SiblingOutput("tree", None, "directory"), SiblingOutput("table", ".csv")),
+        ),
+    )
+    expected_payload = json.loads(legacy.canonical_json)
+    expected_payload["output_contract"] = {
+        "output_contract_version": 2,
+        "sibling_outputs": [
+            {"declared_extension": ".csv", "kind": "file", "output_name": "table"},
+            {"kind": "directory", "output_name": "tree"},
+        ],
+    }
+    expected = json.dumps(
+        expected_payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    )
+    resolved = _resolved(mixed)
+    assert resolved.canonical_json == expected
+    assert (
+        resolved.request_bundle_digest == hashlib.sha256(expected.encode()).hexdigest()
+    )
+    assert (
+        validate_stored_request_bundle_projection_v3(
+            projection_json=expected,
+            request_bundle_digest=resolved.request_bundle_digest,
+        ).resolved_projection
+        == resolved
+    )
+    assert (
+        _resolved(
+            replace(
+                mixed,
+                output_contract=replace(
+                    mixed.output_contract,
+                    sibling_outputs=tuple(
+                        reversed(mixed.output_contract.sibling_outputs)
+                    ),
+                ),
+            )
+        )
+        == resolved
+    )
+
+    upstream = RequestedOutputCoordinate("clms", "producer", "tree", "entity")
+    consumer = _projection_plan(UpstreamRequestedOutputBindingPlan("maps", upstream))
+    states = [
+        resolve_request_bundle_projection_plan(
+            consumer, source_snapshots={}, upstream_states={upstream: state}
+        )
+        for state in (legacy, resolved)
+    ]
+    assert states[0].request_bundle_digest != states[1].request_bundle_digest
+    payload = json.loads(states[1].canonical_json)
+    assert payload["output_contract"]["output_contract_version"] == 1
+    assert all(
+        "kind" not in output for output in payload["output_contract"]["sibling_outputs"]
+    )
+    assert payload["role_labelled_bindings"] == [
+        {
+            "role": "maps",
+            "output_name": "tree",
+            "upstream_request_bundle_digest": resolved.request_bundle_digest,
+        }
+    ]
+
+
+@pytest.mark.parametrize(
+    ("version", "outputs", "message"),
+    [
+        (
+            1,
+            (SiblingOutput("tree", None, "directory"),),
+            "requires output contract version 2",
+        ),
+        (2, (SiblingOutput("file", ".txt"),), "requires a directory"),
+        (
+            2,
+            (SiblingOutput("tree", ".txt", "directory"),),
+            "must not have an extension",
+        ),
+        (2, (SiblingOutput("tree", None, "unknown"),), "kind must be"),
+        (
+            2,
+            (SiblingOutput("tree", None, "directory"), SiblingOutput("file", None)),
+            "declared_extension must be",
+        ),
+    ],
+)
+def test_output_kind_contract_rejects_ambiguous_declarations(
+    version: int, outputs: tuple[SiblingOutput, ...], message: str
+) -> None:
+    with pytest.raises(ValidationError, match=message):
+        _resolved(
+            replace(_projection(), output_contract=OutputContract(version, outputs))
+        )
+
+
+@pytest.mark.parametrize(
+    ("version", "sibling"),
+    [
+        (1, {"output_name": "tree", "kind": "directory"}),
+        (2, {"output_name": "tree", "kind": "directory", "declared_extension": None}),
+        (2, {"output_name": "tree", "kind": "unknown"}),
+        (2, {"output_name": "file", "kind": "file", "declared_extension": ".txt"}),
+        (2, {"output_name": "tree"}),
+        (99, {"output_name": "file", "declared_extension": ".txt"}),
+    ],
+)
+def test_stored_output_contract_strict_version_and_shape(
+    version: int, sibling: dict[str, object]
+) -> None:
+    payload = json.loads(_resolved(_projection()).canonical_json)
+    payload["output_contract"] = {
+        "output_contract_version": version,
+        "sibling_outputs": [sibling],
+    }
+    data = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    with pytest.raises(
+        ValidationError, match="(shape|kind|version|requires a directory)"
+    ):
+        validate_stored_request_bundle_projection_v3(
+            projection_json=data,
+            request_bundle_digest=hashlib.sha256(data.encode()).hexdigest(),
         )

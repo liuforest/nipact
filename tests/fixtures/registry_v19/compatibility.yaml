@@ -1,0 +1,37 @@
+schema: nipact/specification-set/v1
+specification_set:
+  key: compact-freeze
+libraries: []
+fixed:
+  workflow: base
+  execution_population: cohort
+  manifest_bindings: []
+  target:
+    step: fixture_transform
+    output: left
+  results:
+    left:
+      step: fixture_transform
+      output: left
+    right:
+      step: fixture_transform
+      output: right
+dimensions:
+  variant:
+    set:
+      step: fixture_transform
+      parameter: variant
+    values:
+    - base
+    - changed
+combine:
+  product:
+  - variant
+exclude:
+- when:
+    variant: changed
+  reason: Prospectively excluded compact case.
+expected_counts:
+  candidates: 2
+  included: 1
+  excluded: 1

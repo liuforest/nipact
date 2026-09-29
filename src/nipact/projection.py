@@ -15,6 +15,7 @@ from .source_authority import LogicalSourceCoordinate
 
 IDENTITY_CONTRACT_VERSION = 3
 OUTPUT_CONTRACT_VERSION = 1
+DIRECTORY_OUTPUT_CONTRACT_VERSION = 2
 RUNNER_CONTRACT_VERSION = "2"
 
 JsonScalar: TypeAlias = None | bool | int | float | str
@@ -69,7 +70,8 @@ ProjectionBinding: TypeAlias = (
 @dataclass(frozen=True)
 class SiblingOutput:
     output_name: str
-    declared_extension: str
+    declared_extension: str | None
+    kind: str = "file"
 
 
 @dataclass(frozen=True)
@@ -568,30 +570,52 @@ def _output_contract_from_payload(payload: Any, *, path: str) -> OutputContract:
     siblings = _require_list(
         obj["sibling_outputs"], path=f"{path}.sibling_outputs"
     )
+    version = _require_int(
+        obj["output_contract_version"], path=f"{path}.output_contract_version"
+    )
+    if version not in (OUTPUT_CONTRACT_VERSION, DIRECTORY_OUTPUT_CONTRACT_VERSION):
+        raise ValidationError(f"{path}.output_contract_version must be 1 or 2")
     return OutputContract(
-        output_contract_version=_require_int(
-            obj["output_contract_version"], path=f"{path}.output_contract_version"
-        ),
+        output_contract_version=version,
         sibling_outputs=tuple(
             _sibling_output_from_payload(
-                sibling, path=f"{path}.sibling_outputs[{index}]"
+                sibling, path=f"{path}.sibling_outputs[{index}]", version=version
             )
             for index, sibling in enumerate(siblings)
         ),
     )
 
 
-def _sibling_output_from_payload(payload: Any, *, path: str) -> SiblingOutput:
+def _sibling_output_from_payload(
+    payload: Any, *, path: str, version: int
+) -> SiblingOutput:
+    kind = "file"
+    keys = {"output_name", "declared_extension"}
+    if version == DIRECTORY_OUTPUT_CONTRACT_VERSION:
+        if type(payload) is not dict or payload.get("kind") not in (
+            "file",
+            "directory",
+        ):
+            raise ValidationError(f"{path}.kind must be 'file' or 'directory'")
+        kind = payload["kind"]
+        keys = {"output_name", "kind"}
+        if kind == "file":
+            keys.add("declared_extension")
     obj = _require_object_shape(
         payload,
         path=path,
-        keys={"output_name", "declared_extension"},
+        keys=keys,
     )
     return SiblingOutput(
         output_name=_require_string(obj["output_name"], path=f"{path}.output_name"),
-        declared_extension=_require_string(
-            obj["declared_extension"], path=f"{path}.declared_extension"
+        declared_extension=(
+            None
+            if kind == "directory"
+            else _require_string(
+                obj["declared_extension"], path=f"{path}.declared_extension"
+            )
         ),
+        kind=kind,
     )
 
 
@@ -825,10 +849,11 @@ def _output_contract_payload(
         contract.output_contract_version,
         path=f"{path}.output_contract_version",
     )
-    if output_contract_version != OUTPUT_CONTRACT_VERSION:
-        raise ValidationError(
-            f"{path}.output_contract_version must be {OUTPUT_CONTRACT_VERSION}"
-        )
+    if output_contract_version not in (
+        OUTPUT_CONTRACT_VERSION,
+        DIRECTORY_OUTPUT_CONTRACT_VERSION,
+    ):
+        raise ValidationError(f"{path}.output_contract_version must be 1 or 2")
     _require_tuple(contract.sibling_outputs, path=f"{path}.sibling_outputs")
     siblings: list[dict[str, str]] = []
     for index, sibling in enumerate(contract.sibling_outputs):
@@ -836,18 +861,32 @@ def _output_contract_payload(
             raise ValidationError(
                 f"{path}.sibling_outputs[{index}] must be a SiblingOutput"
             )
-        siblings.append(
-            {
-                "output_name": _require_string(
-                    sibling.output_name,
-                    path=f"{path}.sibling_outputs[{index}].output_name",
-                ),
-                "declared_extension": _require_string(
-                    sibling.declared_extension,
-                    path=f"{path}.sibling_outputs[{index}].declared_extension",
-                ),
-            }
-        )
+        label = f"{path}.sibling_outputs[{index}]"
+        if sibling.kind not in ("file", "directory"):
+            raise ValidationError(f"{label}.kind must be 'file' or 'directory'")
+        payload = {
+            "output_name": _require_string(
+                sibling.output_name, path=f"{label}.output_name"
+            )
+        }
+        if sibling.kind == "directory":
+            if output_contract_version == OUTPUT_CONTRACT_VERSION:
+                raise ValidationError(
+                    f"{label} directory requires output contract version 2"
+                )
+            if sibling.declared_extension is not None:
+                raise ValidationError(f"{label} directory must not have an extension")
+        else:
+            payload["declared_extension"] = _require_string(
+                sibling.declared_extension, path=f"{label}.declared_extension"
+            )
+        if output_contract_version == DIRECTORY_OUTPUT_CONTRACT_VERSION:
+            payload["kind"] = sibling.kind
+        siblings.append(payload)
+    if output_contract_version == DIRECTORY_OUTPUT_CONTRACT_VERSION and not any(
+        sibling.kind == "directory" for sibling in contract.sibling_outputs
+    ):
+        raise ValidationError(f"{path} output contract version 2 requires a directory")
     output_names = [sibling["output_name"] for sibling in siblings]
     if len(output_names) != len(set(output_names)):
         raise ValidationError(f"{path}.sibling_outputs contains duplicate output names")

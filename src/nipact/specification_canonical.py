@@ -37,13 +37,18 @@ from .workflow import (
     EXECUTION_ROLES,
     PATTERN_KINDS,
     LoadedWorkflowProject,
+    StepOutput,
 )
 
 ROW_SCHEMA = "nipact/specification-row/v1"
 SNAPSHOT_SCHEMA = "nipact/specification-snapshot/v1"
+DIRECTORY_ROW_SCHEMA = "nipact/specification-row/v2"
+DIRECTORY_SNAPSHOT_SCHEMA = "nipact/specification-snapshot/v2"
 
 _ROW_DOMAIN_PREFIX = b"nipact.specification.row.v1\0"
 _SNAPSHOT_DOMAIN_PREFIX = b"nipact.specification.snapshot.v1\0"
+_DIRECTORY_ROW_DOMAIN_PREFIX = b"nipact.specification.row.v2\0"
+_DIRECTORY_SNAPSHOT_DOMAIN_PREFIX = b"nipact.specification.snapshot.v2\0"
 _CONSTRUCTION_TOKEN = object()
 _REPLAY_MISMATCH = (
     "current workflow declaration does not match frozen specification member; "
@@ -131,8 +136,9 @@ class CanonicalStepInput:
 @dataclass(frozen=True)
 class CanonicalStepOutput:
     name: str
-    extension: str
+    extension: str | None
     address_scope: str
+    kind: str = "file"
 
 
 @dataclass(frozen=True)
@@ -250,7 +256,7 @@ def canonicalize_specification_snapshot(
             workflow_selector=member.workflow_name,
         )
         row_payload = {
-            "schema": ROW_SCHEMA,
+            "schema": _row_schema(effective),
             "decision_coordinates": [
                 {
                     "name": coordinate.name,
@@ -277,7 +283,14 @@ def canonicalize_specification_snapshot(
         rows=tuple(rows_by_key.values()),
     )
     snapshot_payload = {
-        "schema": SNAPSHOT_SCHEMA,
+        "schema": (
+            DIRECTORY_SNAPSHOT_SCHEMA
+            if any(
+                _has_directory(row.effective_declaration)
+                for row in rows_by_key.values()
+            )
+            else SNAPSHOT_SCHEMA
+        ),
         "context": loaded.context,
         "members": [
             {
@@ -317,8 +330,8 @@ def decode_specification_snapshot(data: bytes) -> CanonicalSpecificationSnapshot
         expected={"schema", "context", "members", "manifest_values"},
         label="specification snapshot",
     )
-    if root["schema"] != SNAPSHOT_SCHEMA:
-        raise ValidationError(f"specification snapshot schema must be {SNAPSHOT_SCHEMA!r}")
+    if root["schema"] not in (SNAPSHOT_SCHEMA, DIRECTORY_SNAPSHOT_SCHEMA):
+        raise ValidationError("unsupported specification snapshot schema")
     context = _token(root["context"], label="specification snapshot context")
 
     manifest_values = _parse_manifest_values(root["manifest_values"])
@@ -412,6 +425,14 @@ def decode_specification_snapshot(data: bytes) -> CanonicalSpecificationSnapshot
             )
         )
 
+    has_directory = any(
+        _has_directory(member.row.effective_declaration) for member in members
+    )
+    if (root["schema"] == DIRECTORY_SNAPSHOT_SCHEMA) != has_directory:
+        raise ValidationError(
+            "specification snapshot schema does not match member row versions"
+        )
+
     supplied_manifests = set(manifests_by_identity)
     if referenced_manifests != supplied_manifests:
         missing = sorted(referenced_manifests - supplied_manifests)
@@ -431,7 +452,14 @@ def decode_specification_snapshot(data: bytes) -> CanonicalSpecificationSnapshot
         members=tuple(members),
         manifest_values=manifest_values,
         canonical_bytes=data,
-        snapshot_digest=sha256_digest(_SNAPSHOT_DOMAIN_PREFIX + data),
+        snapshot_digest=sha256_digest(
+            (
+                _DIRECTORY_SNAPSHOT_DOMAIN_PREFIX
+                if has_directory
+                else _SNAPSHOT_DOMAIN_PREFIX
+            )
+            + data
+        ),
         _construction_token=_CONSTRUCTION_TOKEN,
     )
 
@@ -511,15 +539,22 @@ def _row_from_payload(
         },
         label="specification row",
     )
-    if payload["schema"] != ROW_SCHEMA:
-        raise ValidationError(f"specification row schema must be {ROW_SCHEMA!r}")
+    if payload["schema"] not in (ROW_SCHEMA, DIRECTORY_ROW_SCHEMA):
+        raise ValidationError("unsupported specification row schema")
     workflow_selector = _token(
         payload["workflow_selector"],
         label="workflow_selector",
     )
     coordinates = _parse_coordinates(payload["decision_coordinates"])
     writes = _parse_writes(payload["writes"])
-    effective = _parse_effective_declaration(payload["effective_declaration"])
+    effective = _parse_effective_declaration(
+        payload["effective_declaration"],
+        directory_format=payload["schema"] == DIRECTORY_ROW_SCHEMA,
+    )
+    if payload["schema"] != _row_schema(effective):
+        raise ValidationError(
+            "specification row schema does not match its output kinds"
+        )
     _validate_write_alignment(writes, effective=effective)
     return CanonicalSpecificationRow(
         decision_coordinates=coordinates,
@@ -527,7 +562,14 @@ def _row_from_payload(
         writes=writes,
         effective_declaration=effective,
         canonical_bytes=canonical_bytes,
-        row_digest=sha256_digest(_ROW_DOMAIN_PREFIX + canonical_bytes),
+        row_digest=sha256_digest(
+            (
+                _DIRECTORY_ROW_DOMAIN_PREFIX
+                if _has_directory(effective)
+                else _ROW_DOMAIN_PREFIX
+            )
+            + canonical_bytes
+        ),
         _construction_token=_CONSTRUCTION_TOKEN,
     )
 
@@ -633,7 +675,9 @@ def _parse_write(payload: object, *, label: str) -> SpecificationWrite:
     raise ValidationError(f"{label} contains unsupported write type: {write_type!r}")
 
 
-def _parse_effective_declaration(payload: object) -> CanonicalEffectiveDeclaration:
+def _parse_effective_declaration(
+    payload: object, *, directory_format: bool
+) -> CanonicalEffectiveDeclaration:
     effective = _exact_mapping(payload, label="effective_declaration")
     _fields(
         effective,
@@ -652,7 +696,7 @@ def _parse_effective_declaration(payload: object) -> CanonicalEffectiveDeclarati
     if not raw_steps:
         raise ValidationError("effective steps cannot be empty")
     steps = tuple(
-        _parse_effective_step(raw_step, index=index)
+        _parse_effective_step(raw_step, index=index, directory_format=directory_format)
         for index, raw_step in enumerate(raw_steps)
     )
     if len({step.step_name for step in steps}) != len(steps):
@@ -675,7 +719,9 @@ def _parse_effective_declaration(payload: object) -> CanonicalEffectiveDeclarati
     return declaration
 
 
-def _parse_effective_step(payload: object, *, index: int) -> CanonicalEffectiveStep:
+def _parse_effective_step(
+    payload: object, *, index: int, directory_format: bool
+) -> CanonicalEffectiveStep:
     label = f"effective steps[{index}]"
     step = _exact_mapping(payload, label=label)
     _fields(
@@ -730,7 +776,9 @@ def _parse_effective_step(payload: object, *, index: int) -> CanonicalEffectiveS
         raise ValidationError(f"{label}.source_inputs must be sorted and unique")
     params_mapping = _exact_mapping(step["params"], label=f"{label}.params")
     params = _copy_json_mapping(params_mapping, label=f"{label}.params")
-    outputs = _parse_effective_outputs(step["outputs"], label=f"{label}.outputs")
+    outputs = _parse_effective_outputs(
+        step["outputs"], label=f"{label}.outputs", directory_format=directory_format
+    )
     manifest_binding = _parse_manifest_binding(
         step["manifest_binding"],
         label=f"{label}.manifest_binding",
@@ -796,6 +844,7 @@ def _parse_effective_outputs(
     payload: object,
     *,
     label: str,
+    directory_format: bool,
 ) -> tuple[CanonicalStepOutput, ...]:
     raw_outputs = _exact_list(payload, label=label)
     outputs: list[CanonicalStepOutput] = []
@@ -803,11 +852,18 @@ def _parse_effective_outputs(
     for index, raw_output in enumerate(raw_outputs):
         item_label = f"{label}[{index}]"
         item = _exact_mapping(raw_output, label=item_label)
-        _fields(
-            item,
-            expected={"name", "extension", "address_scope"},
-            label=item_label,
-        )
+        kind = "file"
+        expected = {"name", "extension", "address_scope"}
+        if directory_format:
+            kind = _choice(
+                item.get("kind"),
+                allowed=frozenset({"file", "directory"}),
+                label=f"{item_label}.kind",
+            )
+            expected = {"name", "kind", "address_scope"}
+            if kind == "file":
+                expected.add("extension")
+        _fields(item, expected=expected, label=item_label)
         name = _token(item["name"], label=f"{item_label}.name")
         if previous_name is not None and name <= previous_name:
             raise ValidationError(f"{label} must be sorted by unique name")
@@ -815,10 +871,15 @@ def _parse_effective_outputs(
         outputs.append(
             CanonicalStepOutput(
                 name=name,
-                extension=_nonempty_string(
-                    item["extension"],
-                    label=f"{item_label}.extension",
+                extension=(
+                    None
+                    if kind == "directory"
+                    else _nonempty_string(
+                        item["extension"],
+                        label=f"{item_label}.extension",
+                    )
                 ),
+                kind=kind,
                 address_scope=_choice(
                     item["address_scope"],
                     allowed=ADDRESS_SCOPES,
@@ -1061,6 +1122,11 @@ def _effective_from_adapter(
             "adapter top-level manifest bindings do not match step-local bindings"
         )
 
+    directory_format = any(
+        output.kind == "directory"
+        for step in declaration.steps
+        for output in step.outputs.values()
+    )
     payload = {
         "target": {
             "step_name": declaration.target_step_name,
@@ -1087,11 +1153,7 @@ def _effective_from_adapter(
                 "source_inputs": sorted(step.source_inputs),
                 "params": _copy_json_mapping(step.params, label="step parameters"),
                 "outputs": [
-                    {
-                        "name": name,
-                        "extension": output.extension,
-                        "address_scope": output.address_scope,
-                    }
+                    _effective_output_payload(output, directory_format=directory_format)
                     for name, output in sorted(step.outputs.items())
                     if _matching_name(name, output.name, label="step output")
                 ],
@@ -1133,7 +1195,7 @@ def _effective_from_adapter(
             for result in sorted(declaration.results, key=lambda result: result.role)
         ],
     }
-    return _parse_effective_declaration(payload)
+    return _parse_effective_declaration(payload, directory_format=directory_format)
 
 
 def _matching_name(mapping_name: str, value_name: str, *, label: str) -> bool:
@@ -1142,7 +1204,40 @@ def _matching_name(mapping_name: str, value_name: str, *, label: str) -> bool:
     return True
 
 
+def _has_directory(declaration: CanonicalEffectiveDeclaration) -> bool:
+    return any(
+        output.kind == "directory"
+        for step in declaration.steps
+        for output in step.outputs
+    )
+
+
+def _row_schema(declaration: CanonicalEffectiveDeclaration) -> str:
+    return DIRECTORY_ROW_SCHEMA if _has_directory(declaration) else ROW_SCHEMA
+
+
+def _effective_output_payload(
+    output: StepOutput | CanonicalStepOutput, *, directory_format: bool
+) -> dict[str, Any]:
+    if output.kind not in ("file", "directory"):
+        raise ValidationError(
+            f"step output {output.name!r} kind must be 'file' or 'directory'"
+        )
+    payload: dict[str, Any] = {"name": output.name, "address_scope": output.address_scope}
+    if output.kind == "directory":
+        if output.extension is not None:
+            raise ValidationError(
+                f"directory output {output.name!r} must not have an extension"
+            )
+    else:
+        payload["extension"] = output.extension
+    if directory_format:
+        payload["kind"] = output.kind
+    return payload
+
+
 def _effective_payload(declaration: CanonicalEffectiveDeclaration) -> dict[str, Any]:
+    directory_format = _has_directory(declaration)
     return {
         "target": {
             "step_name": declaration.target_step_name,
@@ -1168,11 +1263,7 @@ def _effective_payload(declaration: CanonicalEffectiveDeclaration) -> dict[str, 
                 "source_inputs": list(step.source_inputs),
                 "params": deepcopy(step.params),
                 "outputs": [
-                    {
-                        "name": output.name,
-                        "extension": output.extension,
-                        "address_scope": output.address_scope,
-                    }
+                    _effective_output_payload(output, directory_format=directory_format)
                     for output in step.outputs
                 ],
                 "manifest_binding": (
@@ -1215,7 +1306,7 @@ def _effective_payload(declaration: CanonicalEffectiveDeclaration) -> dict[str, 
 
 def _row_payload(row: CanonicalSpecificationRow) -> dict[str, Any]:
     return {
-        "schema": ROW_SCHEMA,
+        "schema": _row_schema(row.effective_declaration),
         "decision_coordinates": [
             {"name": coordinate.name, "value": deepcopy(coordinate.value)}
             for coordinate in row.decision_coordinates
