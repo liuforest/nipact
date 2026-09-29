@@ -1654,44 +1654,6 @@ def _validate_selected_resolution_memberships(
             raise ValidationError("selected-output resolution outcome is invalid")
 
 
-def read_published_outputs(
-    runtime_root: Path,
-    *,
-    context: str,
-    workflow_name: str,
-    step_name: str,
-    output_name: str,
-) -> list[dict[str, str]]:
-    """Read published-output rows for one workflow step output."""
-    registry_path = runtime_root / REGISTRY_DB_PATH
-    try:
-        with _connect_readonly(registry_path) as conn:
-            _validate_schema_version(conn)
-            rows = conn.execute(
-                """
-                SELECT address, path, output_digest, output_hash
-                FROM published_outputs
-                WHERE context = ?
-                  AND workflow_name = ?
-                  AND step_name = ?
-                  AND output_name = ?
-                ORDER BY address
-                """,
-                (context, workflow_name, step_name, output_name),
-            ).fetchall()
-    except sqlite3.Error as exc:
-        raise ValidationError(f"registry.db is malformed: {exc}") from exc
-    return [
-        {
-            "address": address,
-            "path": path,
-            "output_digest": output_digest,
-            "output_hash": output_hash,
-        }
-        for address, path, output_digest, output_hash in rows
-    ]
-
-
 def _read_artifact_by_id_conn(
     conn: sqlite3.Connection,
     artifact_id: int,
@@ -1768,24 +1730,6 @@ def read_registered_source_authorities(
             )
     except sqlite3.Error as exc:
         raise ValidationError(f"registry.db is malformed: {exc}") from exc
-
-
-def read_registered_source_snapshots(
-    path: Path,
-    *,
-    context: str,
-) -> dict[LogicalSourceCoordinate, RegisteredSourceSnapshot]:
-    """Read current source identity snapshots for one context."""
-    authorities = read_registered_source_authorities(path)
-    return {
-        coordinate: RegisteredSourceSnapshot(
-            content_digest=record.authority.content_digest,
-            file_size=record.authority.file_size,
-            declared_extension=record.authority.declaration.declared_extension,
-        )
-        for coordinate, record in authorities.items()
-        if coordinate.context == context
-    }
 
 
 def _read_registered_source_snapshots_conn(
@@ -3014,26 +2958,6 @@ def list_run_manifest_bindings(
         with _connect_readonly_rows(path) as conn:
             _validate_schema_version(conn)
             return _list_run_manifest_bindings_conn(
-                conn,
-                run_id=run_id,
-                context=context,
-            )
-    except sqlite3.Error as exc:
-        raise ValidationError(f"registry.db is malformed: {exc}") from exc
-
-
-def read_run_execution_population(
-    path: Path,
-    *,
-    run_id: int,
-    context: str | None = None,
-) -> RegistryExecutionPopulation | None:
-    """Read the workflow-level execution population recorded for a run."""
-    _validate_positive_id(run_id, label="run id")
-    try:
-        with _connect_readonly_rows(path) as conn:
-            _validate_schema_version(conn)
-            return _read_run_execution_population_conn(
                 conn,
                 run_id=run_id,
                 context=context,
