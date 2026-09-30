@@ -26,6 +26,8 @@ from nipact.specification_compiler import (
 )
 from nipact.workflow import load_workflow_project
 
+from conftest import forbid_reused_copies
+
 
 def _write_yaml(path: Path, payload: object) -> None:
     path.write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")
@@ -589,11 +591,7 @@ def test_member_and_direct_workflows_reuse_exact_ordinary_sibling_bundles(
             "_publish_run_outputs",
             lambda *_args, **_kwargs: pytest.fail("reuse-only member published outputs"),
         )
-        reuse_patch.setattr(
-            execution_module.shutil,
-            "copy2",
-            lambda *_args, **_kwargs: pytest.fail("reuse-only member copied data"),
-        )
+        forbid_reused_copies(reuse_patch)
         member_a_outcome = execute_run_plan(member_a_plan, cores=1)
     assert member_a_outcome.selected_generated_count == 0
     assert member_a_outcome.selected_reused_count == 1
@@ -670,11 +668,7 @@ def test_member_and_direct_workflows_reuse_exact_ordinary_sibling_bundles(
             "_publish_run_outputs",
             lambda *_args, **_kwargs: pytest.fail("reuse-only direct run published outputs"),
         )
-        reuse_patch.setattr(
-            execution_module.shutil,
-            "copy2",
-            lambda *_args, **_kwargs: pytest.fail("reuse-only direct run copied data"),
-        )
+        forbid_reused_copies(reuse_patch)
         direct_b_outcome = execute_run_plan(direct_b_plan, cores=1)
     assert direct_b_outcome.selected_generated_count == 0
     assert direct_b_outcome.selected_reused_count == 1

@@ -34,6 +34,16 @@ def test_directory_tree_literal_vectors_and_metadata_independence(
             member.chmod(0o400)
         os.utime(root, ns=(2, 2))
         assert directory_tree_digest(root) == (expected, 3 if nested else 0)
+        # Copy mode keeps the manifest and the metadata copytree used to preserve.
+        copy = tmp_path / f"{root_name}-copy"
+        assert directory_tree_digest(root, copy_to=copy) == (expected, 3 if nested else 0)
+        assert directory_tree_digest(copy) == (expected, 3 if nested else 0)
+        for source in [root, *root.rglob("*")]:
+            copied = (copy / source.relative_to(root)).stat()
+            assert (copied.st_mode, copied.st_mtime_ns) == (
+                source.stat().st_mode,
+                source.stat().st_mtime_ns,
+            )
 
 
 def test_directory_tree_preserves_exact_names_hidden_members_and_contents(
@@ -72,12 +82,13 @@ def test_directory_tree_preserves_exact_names_hidden_members_and_contents(
     )
 
 
+@pytest.mark.parametrize("copy", [False, True])
 @pytest.mark.parametrize(
     "invalid",
     ["file_root", "symlink_root", "symlink_member", "hardlink", "fifo", "undecodable"],
 )
 def test_directory_tree_rejects_unsupported_filesystem_objects(
-    tmp_path: Path, invalid: str
+    tmp_path: Path, invalid: str, copy: bool
 ) -> None:
     root = tmp_path / "root"
     root.mkdir()
@@ -96,5 +107,8 @@ def test_directory_tree_rejects_unsupported_filesystem_objects(
         os.mkfifo(root / "pipe")
     else:
         (root / os.fsdecode(b"bad-\xff")).write_bytes(b"")
+    destination = tmp_path / "copy"
     with pytest.raises(ValidationError, match="directory.*(requires|UTF-8)"):
-        directory_tree_digest(root)
+        directory_tree_digest(root, copy_to=destination if copy else None)
+    # The rejected member is checked before anything is written for it.
+    assert not destination.exists() or not any(destination.iterdir())
