@@ -22,10 +22,10 @@ Work in Progress:
 
 ## Installation
 
-The current source-checkout pre-release is `0.0.1a15`. Install release in a clean environment with:
+The current source-checkout pre-release is `0.0.1a16`. Install release in a clean environment with:
 
 ```bash
-python -m pip install nipact==0.0.1a15
+python -m pip install nipact==0.0.1a16
 nipact --version
 ```
 
