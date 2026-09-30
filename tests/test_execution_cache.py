@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 import yaml
 
+import nipact.artifacts as artifact_ops
 import nipact.execution as execution_module
 import nipact.registry as registry_module
 import nipact.source_authority as source_authority_module
@@ -1500,6 +1501,7 @@ def test_cross_target_run_plan_reuses_upstream_from_registry(
     assert execution_payload["prepared_reused_inputs"] == [
         {
             "artifact_id": c_plan.reused_outputs[0].source_artifact_id,
+            "kind": "file",
             "bound_occurrence_path": registered_b_path,
             "supplied_path": "staging/b_transform/b_out/sub_001.json",
         }
@@ -1592,6 +1594,7 @@ def test_allowlisted_consumer_uses_direct_canonical_reused_input(
     assert payload["prepared_reused_inputs"] == [
         {
             "artifact_id": reused_b.source_artifact_id,
+            "kind": "file",
             "bound_occurrence_path": reused_b.source_path_relative,
             "supplied_path": supplied_path,
         }
@@ -1728,14 +1731,15 @@ def test_reused_occurrence_disposition_covers_every_reachable_consumer(
         return Path(real_copy(source, destination))
 
     monkeypatch.setattr("nipact.execution.shutil.copy2", record_copy)
-    real_digest = execution_module._sha256_open_file
+    real_digest = artifact_ops._sha256_open_file
     canonical_hashes: list[Path] = []
 
     def record_digest(handle: object) -> str:
-        canonical_hashes.append(Path(handle.name).resolve())  # type: ignore[attr-defined]
+        if "outputs" in Path(handle.name).parts:
+            canonical_hashes.append(Path(handle.name).resolve())  # type: ignore[attr-defined]
         return real_digest(handle)  # type: ignore[arg-type]
 
-    monkeypatch.setattr(execution_module, "_sha256_open_file", record_digest)
+    monkeypatch.setattr(artifact_ops, "_sha256_open_file", record_digest)
 
     prepared = execution_module._prepare_reused_inputs(apply_plan.forecast)
 
@@ -2258,14 +2262,15 @@ def test_real_hydration_reads_final_resolved_canonical_path(
     reused = c_plan.reused_outputs[0]
     canonical_path = reused.source_path
 
-    original_digest = execution_module._sha256_open_file
+    original_digest = artifact_ops._sha256_open_file
     hashed_paths: list[Path] = []
 
     def recording_digest(handle: object) -> str:
-        hashed_paths.append(Path(handle.name))  # type: ignore[attr-defined]
+        if "outputs" in Path(handle.name).parts:
+            hashed_paths.append(Path(handle.name))  # type: ignore[attr-defined]
         return original_digest(handle)  # type: ignore[arg-type]
 
-    monkeypatch.setattr(execution_module, "_sha256_open_file", recording_digest)
+    monkeypatch.setattr(artifact_ops, "_sha256_open_file", recording_digest)
     assert execute_run_plan(c_plan, cores=1).all_selected_resolved
     assert hashed_paths == [canonical_path]
 
@@ -2854,14 +2859,14 @@ def test_publication_reuses_prepared_facts_for_each_fresh_staging_output(
         return 0
 
     hashed_paths: list[Path] = []
-    original_digest = execution_module.sha256_file_digest
+    original_digest = execution_module.artifact_content_facts
 
-    def record_digest(path: Path) -> str:
+    def record_digest(path: Path, kind: str):
         hashed_paths.append(path)
-        return original_digest(path)
+        return original_digest(path, kind)
 
     monkeypatch.setattr(execution_module, "_run_snakemake", write_fresh_outputs)
-    monkeypatch.setattr(execution_module, "sha256_file_digest", record_digest)
+    monkeypatch.setattr(execution_module, "artifact_content_facts", record_digest)
 
     outcome = execute_run_plan(run_plan, cores=1)
 
@@ -3335,6 +3340,7 @@ def test_derivative_reuses_compatible_base_ancestor_artifact(
     assert run_plan_payload["prepared_reused_inputs"] == [
         {
             "artifact_id": main_b_artifact_id,
+            "kind": "file",
             "bound_occurrence_path": registered_b_path,
             "supplied_path": "staging/b_transform/b_out/sub_001.json",
         }
@@ -4349,18 +4355,13 @@ def test_reused_canonical_occurrence_rejects_symlink_inside_outputs(
     published_b.rename(relocated_target)
     published_b.symlink_to(relocated_target)
 
-    c_plan = build_run_plan(
-        project_dir=project_dir,
-        context="cache",
-        workflow_name="main",
-        step_name="c_transform",
-    )
-    assert len(c_plan.reused_outputs) == 1
-    with pytest.raises(
-        ValidationError,
-        match="reused artifact canonical occurrence is not a regular file",
-    ):
-        execute_run_plan(c_plan, cores=1)
+    with pytest.raises(ValidationError, match="file root is missing or invalid"):
+        build_run_plan(
+            project_dir=project_dir,
+            context="cache",
+            workflow_name="main",
+            step_name="c_transform",
+        )
 
 
 def test_reused_canonical_occurrence_rejects_hardlink(
@@ -4387,7 +4388,7 @@ def test_reused_canonical_occurrence_rejects_hardlink(
 
     with pytest.raises(
         ValidationError,
-        match="reused artifact canonical occurrence has multiple links",
+        match="file root is missing or invalid",
     ):
         execute_run_plan(c_plan, cores=1)
 
@@ -4452,7 +4453,7 @@ def test_reused_canonical_occurrence_detects_replacement_during_hash(
         step_name="c_transform",
     )
 
-    real_digest = execution_module._sha256_open_file
+    real_digest = artifact_ops._sha256_open_file
     replaced = False
 
     def replace_after_hash(handle: object) -> str:
@@ -4466,10 +4467,10 @@ def test_reused_canonical_occurrence_detects_replacement_during_hash(
             replaced = True
         return digest
 
-    monkeypatch.setattr(execution_module, "_sha256_open_file", replace_after_hash)
+    monkeypatch.setattr(artifact_ops, "_sha256_open_file", replace_after_hash)
     with pytest.raises(
         ValidationError,
-        match="reused artifact canonical occurrence changed during verification",
+        match="artifact changed during verification",
     ):
         execute_run_plan(c_plan, cores=1)
 
@@ -4996,7 +4997,7 @@ def test_selected_multi_output_reuse_hashes_only_root_siblings_once(
 
     hashed_output_paths: list[Path] = []
 
-    real_digest = execution_module._sha256_open_file
+    real_digest = artifact_ops._sha256_open_file
 
     def record_digest(handle: object) -> str:
         resolved = Path(handle.name).resolve()  # type: ignore[attr-defined]
@@ -5004,7 +5005,7 @@ def test_selected_multi_output_reuse_hashes_only_root_siblings_once(
             hashed_output_paths.append(resolved)
         return real_digest(handle)  # type: ignore[arg-type]
 
-    monkeypatch.setattr(execution_module, "_sha256_open_file", record_digest)
+    monkeypatch.setattr(artifact_ops, "_sha256_open_file", record_digest)
     monkeypatch.setattr(
         "nipact.execution._run_snakemake",
         lambda *_args, **_kwargs: pytest.fail("reuse-only run invoked Snakemake"),
@@ -5073,14 +5074,15 @@ def test_consumed_selected_overlap_verifies_one_canonical_occurrence(
         selected_reused_output_refs=(selected_ref,),
     )
 
-    real_digest = execution_module._sha256_open_file
+    real_digest = artifact_ops._sha256_open_file
     canonical_hashes: list[Path] = []
 
     def record_digest(handle: object) -> str:
-        canonical_hashes.append(Path(handle.name).resolve())  # type: ignore[attr-defined]
+        if "outputs" in Path(handle.name).parts:
+            canonical_hashes.append(Path(handle.name).resolve())  # type: ignore[attr-defined]
         return real_digest(handle)  # type: ignore[arg-type]
 
-    monkeypatch.setattr(execution_module, "_sha256_open_file", record_digest)
+    monkeypatch.setattr(artifact_ops, "_sha256_open_file", record_digest)
     prepared = execution_module._prepare_reused_inputs(executable)
 
     assert canonical_hashes == [output_ref.source_path.resolve()]
@@ -5280,6 +5282,7 @@ def test_targeted_run_excludes_reuse_needed_only_by_unreachable_jobs(
     assert payload["prepared_reused_inputs"] == [
         {
             "artifact_id": c_plan.reused_outputs[0].source_artifact_id,
+            "kind": "file",
             "bound_occurrence_path": c_plan.reused_outputs[0].source_path_relative,
             "supplied_path": "staging/b_transform/b_out/sub_001.json",
         }
@@ -5368,15 +5371,15 @@ def test_workflow_run_skips_exhaustive_validation_but_validate_remains_exhaustiv
     original = unrelated_path.read_bytes()
     unrelated_path.write_bytes(b"#" + original[1:])
 
-    real_digest = execution_module.sha256_file_digest
+    real_digest = execution_module.artifact_content_facts
     hashed_paths: list[Path] = []
 
-    def recording_digest(path: Path) -> str:
+    def recording_digest(path: Path, kind: str):
         hashed_paths.append(Path(path))
-        return real_digest(path)
+        return real_digest(path, kind)
 
-    monkeypatch.setattr(execution_module, "sha256_file_digest", recording_digest)
-    monkeypatch.setattr(registry_module, "sha256_file_digest", recording_digest)
+    monkeypatch.setattr(execution_module, "artifact_content_facts", recording_digest)
+    monkeypatch.setattr(registry_module, "artifact_content_facts", recording_digest)
     capsys.readouterr()
 
     assert (
@@ -7530,3 +7533,196 @@ def test_targeted_run_becomes_current_and_keeps_full_execution_population(
     assert len(targeted_population) == 1
     assert targeted_population[0][0:2] == ("subjects", "entity_set_v1")
     assert targeted_population[0][3] == 2
+
+
+def test_directory_shared_copy_scope_dry_run_and_selected_sibling_budget(
+    tmp_path, monkeypatch
+):
+    from directory_support import directory_project, run, rows, plan
+
+    project, runtime = directory_project(tmp_path, monkeypatch)
+    assert run(project).all_selected_resolved
+    before = rows(runtime)
+    # Guard actual traversal/hash/copy while the real generated dry-run DAG runs.
+    with monkeypatch.context() as guard:
+
+        def forbidden(*args, **kwargs):
+            pytest.fail("planning or dry run accessed a directory payload")
+
+        guard.setattr(execution_module, "artifact_content_facts", forbidden)
+        guard.setattr(execution_module.shutil, "copytree", forbidden)
+        original_iterdir = Path.iterdir
+
+        def guarded_iterdir(path):
+            if path.is_relative_to(runtime / "outputs"):
+                forbidden()
+            return original_iterdir(path)
+
+        guard.setattr(Path, "iterdir", guarded_iterdir)
+        assert execute_run_plan(
+            plan(project, "collect", dry_run=True)
+        ).all_selected_resolved
+    assert rows(runtime) == before
+    hashes, copies = [], []
+    real_hash, real_copy = (
+        execution_module.artifact_content_facts,
+        execution_module.shutil.copytree,
+    )
+
+    def hash_payload(path, kind):
+        hashes.append((path, kind))
+        return real_hash(path, kind)
+
+    def copy_tree(source, destination, *args, **kwargs):
+        if Path(source).parent.name == "maps":
+            copies.append((Path(source), Path(destination)))
+        return real_copy(source, destination, *args, **kwargs)
+
+    monkeypatch.setattr(execution_module, "artifact_content_facts", hash_payload)
+    monkeypatch.setattr(execution_module.shutil, "copytree", copy_tree)
+    monkeypatch.setattr(
+        execution_module,
+        "_DIRECT_REUSED_INPUT_CALLABLE_REFS",
+        frozenset({"directory_runtime:read"}),
+    )
+    assert run(project, "reader", "sub_001").all_selected_resolved
+    canonical_trees = [
+        path
+        for path, kind in hashes
+        if kind == "directory" and path.is_relative_to(runtime / "outputs")
+    ]
+    assert len(canonical_trees) == 1
+    assert "/sub_001/" in canonical_trees[0].as_posix()
+    assert len(copies) == 1
+    hashes.clear()
+    copies.clear()
+    assert run(project, "collect").all_selected_resolved
+    # Two cohort trees, shared between the second reader and collector; never direct.
+    assert len(copies) == 2
+    assert len([1 for path, kind in hashes if kind == "directory"]) == 4
+    dependency_rows = rows(runtime, "artifact_dependencies")
+    latest_run = rows(runtime, "workflow_runs")[-1]["run_id"]
+    generated_ids = {
+        row["artifact_id"] for row in rows(runtime) if row["run_id"] == latest_run
+    }
+    workspace = plan(project, "collect").run_workspace
+    for source, destination in copies:
+        artifact = next(row for row in before if runtime / row["path"] == source)
+        edges = [
+            edge
+            for edge in dependency_rows
+            if edge["source_artifact_id"] == artifact["artifact_id"]
+            and edge["dependent_artifact_id"] in generated_ids
+        ]
+        assert len(edges) == (1 if artifact["address"] == "sub_001" else 2)
+        assert {edge["input_path"] for edge in edges} == {
+            destination.relative_to(workspace).as_posix()
+        }
+    hashes.clear()
+    copies.clear()
+    assert run(project, "collect").all_selected_resolved
+    assert len(hashes) == 1 and hashes[0][1] == "file" and not copies
+    hashes.clear()
+    assert run(project, "mixed", "sub_001").all_selected_resolved
+    assert len(hashes) == 3 and sorted(kind for _, kind in hashes) == [
+        "directory",
+        "directory",
+        "file",
+    ]
+    assert not copies
+
+
+@pytest.mark.parametrize("corruption", ["same_size", "membership", "unconsumed"])
+def test_directory_corruption_rejected_before_consumption_or_membership(
+    tmp_path, monkeypatch, corruption
+):
+    from directory_support import directory_project, run, rows
+
+    project, runtime = directory_project(tmp_path, monkeypatch)
+    assert run(project, address="sub_001").all_selected_resolved
+    before = rows(runtime)
+    memberships = rows(runtime, "published_outputs")
+    name = "empty" if corruption == "unconsumed" else "maps"
+    root = runtime / next(row["path"] for row in before if row["output_name"] == name)
+    timestamp = root.stat()
+    if corruption == "same_size":
+        (root / "nested/deep/value.txt").write_text("omega")
+    else:
+        (root / "new_empty").mkdir()
+    os.utime(root, ns=(timestamp.st_atime_ns, timestamp.st_mtime_ns))
+    with pytest.raises(ValidationError, match="(digest|size) mismatch"):
+        run(project, "mixed" if corruption == "unconsumed" else "reader", "sub_001")
+    assert [row for row in rows(runtime) if row["origin"] == "workflow_output"] == [
+        row for row in before if row["origin"] == "workflow_output"
+    ]
+    assert rows(runtime, "published_outputs") == memberships
+
+
+def test_directory_selected_consumed_overlap_verifies_occurrence_once(
+    tmp_path, monkeypatch
+):
+    from directory_support import directory_project, run, plan
+
+    project, runtime = directory_project(tmp_path, monkeypatch)
+    assert run(project, address="sub_001").all_selected_resolved
+    executable = plan(project, "reader", "sub_001").forecast
+    reused = executable.reused_outputs[0]
+    selected = SelectedReusedBundleRef(
+        step_name="mixed",
+        output_name="maps",
+        address="sub_001",
+        reuse_request=reused.reuse_request,
+        planned_sibling_artifact_ids=tuple(
+            (candidate.output_name, candidate.artifact_id)
+            for candidate in reused.bundle.outputs
+        ),
+    )
+    executable = replace(executable, selected_reused_output_refs=(selected,))
+    hashes = []
+    real_hash = execution_module.artifact_content_facts
+
+    def record(path, kind):
+        hashes.append(path)
+        return real_hash(path, kind)
+
+    monkeypatch.setattr(execution_module, "artifact_content_facts", record)
+    prepared = execution_module._prepare_reused_inputs(executable)
+    assert len(prepared.inputs) == 1
+    assert hashes.count(reused.source_path) == 1
+    assert len(hashes) == 4  # all three canonical siblings, one delivered tree
+
+
+def test_directory_deterministic_divergence_rolls_back_entire_bundle(
+    tmp_path, monkeypatch
+):
+    from directory_support import directory_project, run, rows, plan
+    from nipact.runtime import run_job
+
+    project, runtime = directory_project(tmp_path, monkeypatch)
+    assert run(project, "source_text", "sub_001").all_selected_resolved
+    first = plan(project, address="sub_001")
+    assert execute_run_plan(first).all_selected_resolved
+    old = [row for row in rows(runtime) if row["origin"] == "workflow_output"]
+    memberships = rows(runtime, "published_outputs")
+
+    def divergent(executable, **kwargs):
+        for job in executable.jobs:
+            run_job(
+                run_plan_path=executable.run_workspace / "run_plan.json",
+                job_id=job.job_id,
+            )
+            if job.step_name == "mixed":
+                (job.outputs["maps"].staging_path / "nested/deep/value.txt").write_text(
+                    "omega"
+                )
+        return 0
+
+    monkeypatch.setattr(execution_module, "_run_snakemake", divergent)
+    with pytest.raises(ValidationError, match="divergent content"):
+        execution_module._execute_executable_run_plan(
+            first.forecast, cores=1, status_callback=None
+        )
+    assert [row for row in rows(runtime) if row["origin"] == "workflow_output"] == old
+    assert rows(runtime, "published_outputs") == memberships
+    tree = runtime / next(row["path"] for row in old if row["output_name"] == "maps")
+    assert (tree / "nested/deep/value.txt").read_text() == "alpha"

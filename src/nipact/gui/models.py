@@ -87,7 +87,9 @@ class Artifact(Dto):
     content_digest: str
     output_hash: str | None
     file_size: int
-    extension: str
+    extension: str | None
+    kind: str
+    digest_scheme: str
     subject_id: str | None
     session_id: str | None
     task_name: str | None
@@ -148,7 +150,9 @@ class TraceArtifact(Dto):
     content_digest: str
     output_hash: str | None
     file_size: int
-    extension: str
+    extension: str | None
+    kind: str
+    digest_scheme: str
     subject_id: str | None
     session_id: str | None
     task_name: str | None
@@ -174,7 +178,7 @@ class TraceDependency(Dto):
     input_path: str
     source_content_digest: str
     source_file_size: int
-    source_extension: str
+    source_extension: str | None
     source_scope: str | None = None
     source_name: str | None = None
     source_entity_id: str | None = None

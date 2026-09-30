@@ -3,23 +3,25 @@
 from __future__ import annotations
 
 import errno
-import hashlib
 import json
 from importlib import metadata
 import os
 import platform
 import shlex
 import shutil
-import stat
 import subprocess
 import sys
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, BinaryIO, Callable
+from typing import Any, Callable
 
 from ._version import __version__
 from .artifacts import (
     CANONICAL_OUTPUT_ROOT,
+    artifact_content_facts,
+    artifact_root_matches,
+    root_observation,
+    remove_owned_path,
     canonical_output_directory,
     canonical_output_path,
 )
@@ -33,12 +35,13 @@ from .execution_evidence import (
     read_completion_receipt,
     write_json_atomic,
 )
-from .hashing import sha256_file_digest, short_hash
+from .hashing import sha256_file_digest, short_hash, DIRECTORY_DIGEST_SCHEME
 from .identity import validate_path_token
 from .manifest import Manifest
 from .projection import (
     IDENTITY_CONTRACT_VERSION,
     OUTPUT_CONTRACT_VERSION,
+    DIRECTORY_OUTPUT_CONTRACT_VERSION,
     RUNNER_CONTRACT_VERSION,
     CollectionBindingPlan,
     OutputContract,
@@ -136,8 +139,9 @@ class PublishedOutputSpec:
     step_name: str
     output_name: str
     address: str
-    declared_extension: str
+    declared_extension: str | None
     request_bundle_digest: str | None
+    kind: str = "file"
 
 
 @dataclass(frozen=True)
@@ -145,24 +149,29 @@ class _PreparedOutput:
     row: PublishedOutputRow
     staging_path: Path
     file_size: int
-    staged_device: int
-    staged_inode: int
-    staged_link_count: int
+    kind: str
+    root_observation: tuple[int, ...]
+    scheduler_path: Path
+    staging_root: Path
 
 
 @dataclass(frozen=True)
 class _MaterializedOutputResult:
     row: PublishedOutputRow
-    staging_path: Path
     file_size: int
+    scheduler_path: Path
+    staging_root: Path
 
 
 @dataclass(frozen=True)
 class RunJobOutput:
     output_name: str
-    declared_extension: str
+    declared_extension: str | None
     staging_path: Path
     staging_path_relative: str
+    kind: str
+    scheduler_path: Path
+    scheduler_path_relative: str
 
 
 @dataclass(frozen=True)
@@ -184,7 +193,7 @@ class RunJob:
         return self._single_output().output_name
 
     @property
-    def declared_extension(self) -> str:
+    def declared_extension(self) -> str | None:
         return self._single_output().declared_extension
 
     @property
@@ -248,7 +257,7 @@ class RunJobOutputRef:
         return self.job.execution_role
 
     @property
-    def declared_extension(self) -> str:
+    def declared_extension(self) -> str | None:
         return self.output.declared_extension
 
     @property
@@ -258,6 +267,14 @@ class RunJobOutputRef:
     @property
     def staging_path_relative(self) -> str:
         return self.output.staging_path_relative
+
+    @property
+    def kind(self) -> str:
+        return self.output.kind
+
+    @property
+    def scheduler_path_relative(self) -> str:
+        return self.output.scheduler_path_relative
 
     @property
     def input_records(self) -> tuple[ArtifactInputRow, ...]:
@@ -284,7 +301,7 @@ class ReusedRunJobOutputRef:
     execution_role: str
     callable_ref: str
     parameters_json: str
-    declared_extension: str
+    declared_extension: str | None
     staging_path: Path
     staging_path_relative: str
     source_path: Path
@@ -300,6 +317,10 @@ class ReusedRunJobOutputRef:
     projection_state: RequestBundleProjectionState
     candidate: ReusableArtifactCandidate
     bundle: ReusableArtifactBundleCandidate
+
+    @property
+    def kind(self) -> str:
+        return self.candidate.kind
 
 
 @dataclass(frozen=True)
@@ -1118,27 +1139,20 @@ def _prepare_one_job(
         except KeyError as exc:
             raise ValidationError("run plan is missing a publishable output") from exc
         try:
-            before = os.lstat(output_ref.staging_path)
+            os.lstat(output_ref.staging_path)
         except FileNotFoundError:
             return [], "missing staged output"
         except OSError:
             return [], "unreadable staged output"
-        if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
+        if not artifact_root_matches(output_ref.staging_path, spec.kind):
             return [], "invalid staged output"
         try:
-            output_digest = sha256_file_digest(output_ref.staging_path)
+            output_digest, payload_size = artifact_content_facts(
+                output_ref.staging_path, spec.kind
+            )
             after = os.lstat(output_ref.staging_path)
-        except FileNotFoundError:
-            return [], "staged output changed"
-        except OSError:
-            return [], "unreadable staged output"
-        if (
-            not stat.S_ISREG(after.st_mode)
-            or after.st_nlink != 1
-            or (after.st_dev, after.st_ino, after.st_size)
-            != (before.st_dev, before.st_ino, before.st_size)
-        ):
-            return [], "staged output changed"
+        except (OSError, ValidationError):
+            return [], "invalid staged output"
         output_hash = short_hash(output_digest)
         if spec.request_bundle_digest is None:
             raise ValidationError("publishable output request identity is unresolved")
@@ -1150,6 +1164,7 @@ def _prepare_one_job(
             output_name=spec.output_name,
             output_hash=output_hash,
             declared_extension=spec.declared_extension,
+            kind=spec.kind,
         )
         _contained_canonical_output_path(
             run_plan.runtime_root,
@@ -1168,10 +1183,11 @@ def _prepare_one_job(
                     output_hash=output_hash,
                 ),
                 staging_path=output_ref.staging_path,
-                file_size=after.st_size,
-                staged_device=after.st_dev,
-                staged_inode=after.st_ino,
-                staged_link_count=after.st_nlink,
+                file_size=payload_size,
+                kind=spec.kind,
+                root_observation=root_observation(after),
+                scheduler_path=output_ref.output.scheduler_path,
+                staging_root=run_plan.run_workspace / "staging",
             )
         )
     return prepared, None
@@ -1324,12 +1340,15 @@ def _materialize_one_prepared_job(
                 _validate_existing_published_file(
                     final_path,
                     expected_digest=prepared.row.output_digest,
+                    kind=prepared.kind,
+                    expected_size=prepared.file_size,
                 )
             results.append(
                 _MaterializedOutputResult(
                     row=prepared.row,
-                    staging_path=prepared.staging_path,
                     file_size=prepared.file_size,
+                    scheduler_path=prepared.scheduler_path,
+                    staging_root=prepared.staging_root,
                 )
             )
     except ValidationError:
@@ -1356,71 +1375,48 @@ def _has_unprepared_fresh_parent(
     return False
 
 
-def _validate_existing_published_file(path: Path, *, expected_digest: str) -> None:
-    try:
-        path_stat = os.lstat(path)
-    except FileNotFoundError as exc:
-        raise ValidationError(f"missing published output file: {path}") from exc
-    if not stat.S_ISREG(path_stat.st_mode):
-        raise ValidationError(f"published output path is not a regular file: {path}")
-    if path_stat.st_nlink != 1:
-        raise ValidationError(f"published output path has multiple hardlinks: {path}")
-    if sha256_file_digest(path) != expected_digest:
+def _validate_existing_published_file(
+    path: Path,
+    *,
+    expected_digest: str,
+    kind: str = "file",
+    expected_size: int | None = None,
+) -> None:
+    digest, size = artifact_content_facts(path, kind)
+    if digest != expected_digest or (
+        expected_size is not None and size != expected_size
+    ):
         raise ValidationError("published output artifact digest mismatch")
 
 
 def _recheck_prepared_staging(prepared: _PreparedOutput) -> None:
-    try:
-        current = os.lstat(prepared.staging_path)
-    except FileNotFoundError as exc:
-        raise ValidationError(
-            f"prepared staged output is missing: {prepared.staging_path}"
-        ) from exc
-    if (
-        not stat.S_ISREG(current.st_mode)
-        or current.st_nlink != 1
-        or current.st_nlink != prepared.staged_link_count
-        or (current.st_dev, current.st_ino, current.st_size)
-        != (prepared.staged_device, prepared.staged_inode, prepared.file_size)
-    ):
+    if root_observation(prepared.staging_path.lstat()) != prepared.root_observation:
         raise ValidationError(
             f"prepared staged output changed before materialization: {prepared.staging_path}"
         )
 
 
 def _finalize_published_output_staging(
-    results: tuple[_MaterializedOutputResult, ...],
+    results: tuple[_MaterializedOutputResult, ...]
 ) -> tuple[str, ...]:
-    """Remove retained successful output staging after registry commit."""
     warnings: list[str] = []
-    for staging_path in dict.fromkeys(result.staging_path for result in results):
+    for result in results:
         try:
-            os.lstat(staging_path)
-        except FileNotFoundError:
-            continue
-        except OSError as exc:
-            warnings.append(f"could not inspect published staging {staging_path}: {exc}")
-            continue
-        try:
-            staging_path.unlink()
-        except OSError as exc:
-            warnings.append(f"could not remove published staging {staging_path}: {exc}")
+            remove_owned_path(result.scheduler_path, staging_root=result.staging_root)
+        except (OSError, ValidationError) as exc:
+            warnings.append(
+                f"could not remove published staging {result.scheduler_path}: {exc}"
+            )
     return tuple(warnings)
 
 
 def _remove_expected_staged_outputs(run_plan: ExecutableRunPlan) -> None:
-    publishable_outputs = _output_refs_by_key(run_plan.jobs)
+    outputs = _output_refs_by_key(run_plan.jobs)
     for spec in run_plan.published_outputs:
-        key = (spec.step_name, spec.output_name, spec.address)
-        try:
-            output_ref = publishable_outputs[key]
-        except KeyError as exc:
-            raise ValidationError("run plan is missing a publishable output") from exc
-        path = output_ref.staging_path
-        if path.is_dir():
-            raise ValidationError(f"staged output path is a directory: {path}")
-        if path.exists() or path.is_symlink():
-            path.unlink()
+        output = outputs[(spec.step_name, spec.output_name, spec.address)].output
+        remove_owned_path(
+            output.scheduler_path, staging_root=run_plan.run_workspace / "staging"
+        )
 
 
 def _remove_expected_completion_receipts(run_plan: ExecutableRunPlan) -> None:
@@ -1452,7 +1448,7 @@ def _write_run_workspace(
     except ExecutionEvidenceError as exc:
         raise ValidationError(str(exc)) from exc
     selected_outputs = [
-        output_ref.staging_path_relative
+        output_ref.scheduler_path_relative
         for output_ref in run_plan.selected_fresh_output_refs
     ]
     _write_text_file(
@@ -1522,7 +1518,7 @@ def _contained_canonical_output_path(runtime_root: Path, relative_path: str) -> 
         raise ValidationError("canonical output path must stay inside runtime dir")
     if not _path_contains_or_same(resolved_layout_root, resolved_path):
         raise ValidationError("canonical output path must stay inside outputs/v1/")
-    return resolved_path
+    return runtime_root / path
 
 
 def _path_contains_or_same(parent: Path, child: Path) -> bool:
@@ -1571,12 +1567,12 @@ def _prepare_reused_inputs(
 ) -> _PreparedReusedInputs:
     candidates = _exact_reused_candidates(run_plan)
     consumers_by_artifact = _reused_input_consumers(run_plan)
-    verified_occurrences: dict[tuple[Path, str, int], Path] = {}
+    verified_occurrences: dict[tuple[Path, str, str, str, int], Path] = {}
     _verify_selected_reused_outputs(
         run_plan, candidates=candidates, verified_occurrences=verified_occurrences
     )
     occurrence_groups: dict[
-        tuple[Path, str, int],
+        tuple[Path, str, str, str, int],
         list[tuple[ReusedRunJobOutputRef, ReusableArtifactCandidate, Path]],
     ] = {}
     for output_ref in run_plan.reused_outputs:
@@ -1588,6 +1584,8 @@ def _prepare_reused_inputs(
         )
         occurrence_key = (
             source_path.resolve(),
+            candidate.kind,
+            candidate.digest_scheme,
             candidate.content_digest,
             candidate.file_size,
         )
@@ -1602,7 +1600,7 @@ def _prepare_reused_inputs(
             for output_ref, _candidate, _source_path in group
             for callable_ref in consumers_by_artifact[output_ref.source_artifact_id]
         }
-        direct = all(
+        direct = group[0][1].kind == "file" and all(
             callable_ref in _DIRECT_REUSED_INPUT_CALLABLE_REFS
             for callable_ref in consumer_refs
         )
@@ -1615,10 +1613,22 @@ def _prepare_reused_inputs(
             )
             supplied_path = copy_ref.staging_path
             supplied_path.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(source_path, supplied_path)
-            if supplied_path.stat().st_size != copy_candidate.file_size:
+            remove_owned_path(
+                supplied_path, staging_root=run_plan.run_workspace / "staging"
+            )
+            if copy_candidate.kind == "directory":
+                shutil.copytree(source_path, supplied_path, symlinks=True)
+            else:
+                shutil.copy2(source_path, supplied_path)
+            if (
+                copy_candidate.kind == "file"
+                and supplied_path.stat().st_size != copy_candidate.file_size
+            ):
                 raise ValidationError("hydrated artifact file size mismatch")
-            if sha256_file_digest(supplied_path) != copy_candidate.content_digest:
+            digest, size = artifact_content_facts(supplied_path, copy_candidate.kind)
+            if size != copy_candidate.file_size:
+                raise ValidationError("hydrated artifact file size mismatch")
+            if digest != copy_candidate.content_digest:
                 raise ValidationError("hydrated artifact digest mismatch")
         for output_ref, _candidate, _source_path in group:
             supplied_by_artifact[output_ref.source_artifact_id] = supplied_path
@@ -1675,7 +1685,7 @@ def _verify_selected_reused_outputs(
     run_plan: ExecutableRunPlan,
     *,
     candidates: dict[int, ReusableArtifactCandidate],
-    verified_occurrences: dict[tuple[Path, str, int], Path],
+    verified_occurrences: dict[tuple[Path, str, str, str, int], Path],
 ) -> None:
     for selected_ref in run_plan.selected_reused_output_refs:
         for output_name, planned_artifact_id in selected_ref.planned_sibling_artifact_ids:
@@ -1704,12 +1714,14 @@ def _verify_reused_canonical_occurrence(
     run_plan: ExecutableRunPlan,
     candidate: ReusableArtifactCandidate,
     *,
-    verified_occurrences: dict[tuple[Path, str, int], Path],
+    verified_occurrences: dict[tuple[Path, str, str, str, int], Path],
 ) -> Path:
     """Verify one exact frozen canonical occurrence and return its lexical path."""
     if candidate.published_path != candidate.path:
         raise ValidationError("reused artifact publication path is inconsistent")
-    if not candidate.path.endswith(candidate.extension):
+    if candidate.extension is not None and not candidate.path.endswith(
+        candidate.extension
+    ):
         raise ValidationError("reused artifact extension is inconsistent")
     if candidate.output_hash != short_hash(candidate.content_digest):
         raise ValidationError("reused artifact content hash is inconsistent")
@@ -1721,6 +1733,7 @@ def _verify_reused_canonical_occurrence(
         output_name=candidate.output_name,
         output_hash=candidate.output_hash,
         declared_extension=candidate.extension,
+        kind=candidate.kind,
     )
     if candidate.path != expected_path:
         raise ValidationError(
@@ -1731,96 +1744,31 @@ def _verify_reused_canonical_occurrence(
         candidate.path,
     )
     lexical_path = run_plan.runtime_root / candidate.path
-    try:
-        before = os.lstat(lexical_path)
-    except FileNotFoundError as exc:
+    if not lexical_path.exists() and not lexical_path.is_symlink():
+        raise ValidationError("reused artifact canonical occurrence is missing")
+    if not artifact_root_matches(lexical_path, candidate.kind):
         raise ValidationError(
-            f"reused artifact canonical occurrence is missing: {candidate.path}"
-        ) from exc
-    except OSError as exc:
-        raise ValidationError(
-            f"reused artifact canonical occurrence is unreadable: {candidate.path}"
-        ) from exc
-    if not stat.S_ISREG(before.st_mode):
-        raise ValidationError(
-            "reused artifact canonical occurrence is not a regular file"
+            f"reused artifact canonical occurrence is not a regular {candidate.kind} or has multiple links"
         )
-    if before.st_nlink != 1:
-        raise ValidationError("reused artifact canonical occurrence has multiple links")
-    if before.st_size != candidate.file_size:
-        raise ValidationError("reused artifact canonical occurrence size mismatch")
     occurrence_key = (
-        resolved_path,
+        resolved_path.resolve(),
+        candidate.kind,
+        candidate.digest_scheme,
         candidate.content_digest,
         candidate.file_size,
     )
     prior = verified_occurrences.get(occurrence_key)
     if prior is not None:
         return prior
-
-    try:
-        with lexical_path.open("rb") as handle:
-            opened_before = os.fstat(handle.fileno())
-            if (
-                not stat.S_ISREG(opened_before.st_mode)
-                or opened_before.st_nlink != 1
-                or (opened_before.st_dev, opened_before.st_ino, opened_before.st_size)
-                != (before.st_dev, before.st_ino, before.st_size)
-            ):
-                raise ValidationError(
-                    "reused artifact canonical occurrence changed before verification"
-                )
-            observed_digest = _sha256_open_file(handle)
-            opened_after = os.fstat(handle.fileno())
-    except FileNotFoundError as exc:
-        raise ValidationError(
-            f"reused artifact canonical occurrence is missing: {candidate.path}"
-        ) from exc
-    except OSError as exc:
-        raise ValidationError(
-            f"reused artifact canonical occurrence is unreadable: {candidate.path}"
-        ) from exc
-
-    try:
-        after = os.lstat(lexical_path)
-    except FileNotFoundError as exc:
-        raise ValidationError(
-            "reused artifact canonical occurrence changed during verification"
-        ) from exc
-    except OSError as exc:
-        raise ValidationError(
-            f"reused artifact canonical occurrence is unreadable: {candidate.path}"
-        ) from exc
-    expected_stat = (before.st_dev, before.st_ino, before.st_size, before.st_nlink)
-    if (
-        not stat.S_ISREG(opened_after.st_mode)
-        or opened_after.st_nlink != 1
-        or (
-            opened_after.st_dev,
-            opened_after.st_ino,
-            opened_after.st_size,
-            opened_after.st_nlink,
-        )
-        != expected_stat
-        or not stat.S_ISREG(after.st_mode)
-        or after.st_nlink != 1
-        or (after.st_dev, after.st_ino, after.st_size, after.st_nlink)
-        != expected_stat
-    ):
-        raise ValidationError(
-            "reused artifact canonical occurrence changed during verification"
-        )
-    if observed_digest != candidate.content_digest:
+    if candidate.kind == "file" and lexical_path.stat().st_size != candidate.file_size:
+        raise ValidationError("reused artifact canonical occurrence size mismatch")
+    digest, size = artifact_content_facts(lexical_path, candidate.kind)
+    if size != candidate.file_size:
+        raise ValidationError("reused artifact canonical occurrence size mismatch")
+    if digest != candidate.content_digest:
         raise ValidationError("reused artifact canonical occurrence digest mismatch")
     verified_occurrences[occurrence_key] = lexical_path
     return lexical_path
-
-
-def _sha256_open_file(handle: BinaryIO) -> str:
-    digest = hashlib.sha256()
-    for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-        digest.update(chunk)
-    return digest.hexdigest()
 
 
 def _resolve_dry_run_forecast_bundles(
@@ -1916,7 +1864,7 @@ def _run_snakemake(run_plan: ExecutableRunPlan, *, cores: int, dry_run: bool) ->
     if dry_run:
         command.append("--dry-run")
     command.extend(
-        output_ref.staging_path_relative
+        output_ref.scheduler_path_relative
         for output_ref in run_plan.selected_fresh_output_refs
     )
     env = os.environ.copy()
@@ -1962,6 +1910,11 @@ def _snakefile_text(
 ) -> str:
     payload = run_plan_payload or _run_plan_payload(run_plan)
     payload_jobs = payload["jobs"]
+    scheduler_paths = {
+        output.staging_path_relative: output.scheduler_path_relative
+        for job in run_plan.jobs
+        for output in job.outputs.values()
+    }
     if run_plan.dry_run:
         lines = [
             "# Generated by NIPACT for a dry run. Do not edit.",
@@ -1978,12 +1931,19 @@ def _snakefile_text(
         inputs = [
             "run_plan.json",
             *(
-                path
+                scheduler_paths.get(path, path)
                 for paths in job_payload["inputs"].values()
                 for path in paths
             ),
         ]
-        outputs = list(job_payload["outputs"].values())
+        outputs = [
+            (
+                f"directory({json.dumps(output.scheduler_path_relative)})"
+                if output.kind == "directory"
+                else json.dumps(output.scheduler_path_relative)
+            )
+            for output in job.outputs.values()
+        ]
         shell_text = shlex.join(
             [
                 sys.executable,
@@ -2002,18 +1962,12 @@ def _snakefile_text(
                 "    input:",
                 *[f"        {json.dumps(path)}," for path in inputs],
                 "    output:",
-                *_snakefile_output_lines(outputs),
+                *[f"        {output}," for output in outputs],
                 f"    shell: {json.dumps(shell_text)}",
                 "",
             ]
         )
     return "\n".join(lines)
-
-
-def _snakefile_output_lines(outputs: list[str]) -> list[str]:
-    if len(outputs) == 1:
-        return [f"        {json.dumps(outputs[0])}"]
-    return [f"        {json.dumps(path)}," for path in outputs]
 
 
 def _run_plan_payload(
@@ -2046,8 +2000,7 @@ def _run_plan_payload(
             run_plan.execution_population
         ),
         "manifest_bindings": [
-            _manifest_binding_payload(binding)
-            for binding in run_plan.manifest_bindings
+            _manifest_binding_payload(binding) for binding in run_plan.manifest_bindings
         ],
         "prepared_reused_inputs": prepared_payload,
         "jobs": {
@@ -2064,12 +2017,17 @@ def _run_plan_payload(
                     else None
                 ),
                 "declared_outputs": sorted(job.outputs),
-                "completion_receipt_path": completion_receipt_relative_path(
-                    job.job_id
-                ),
+                "completion_receipt_path": completion_receipt_relative_path(job.job_id),
                 "outputs": {
                     output_name: output.staging_path_relative
                     for output_name, output in sorted(job.outputs.items())
+                },
+                "output_kinds": {
+                    name: output.kind for name, output in job.outputs.items()
+                },
+                "scheduler_outputs": {
+                    name: output.scheduler_path_relative
+                    for name, output in job.outputs.items()
                 },
                 "inputs": {
                     name: [path_substitutions.get(path, path) for path in paths]
@@ -2101,9 +2059,7 @@ def _run_plan_payload(
                     *run_plan.selected_reused_output_refs,
                 )
             ),
-            key=lambda item: (
-                item["step_name"], item["output_name"], item["address"]
-            ),
+            key=lambda item: (item["step_name"], item["output_name"], item["address"]),
         ),
         "selected_fresh_outputs": [
             {
@@ -2183,6 +2139,7 @@ def _prepared_reused_input_payload(
         payload.append(
             {
                 "artifact_id": artifact_id,
+                "kind": prepared.candidate.kind,
                 "bound_occurrence_path": _runtime_relative_path(
                     run_plan.runtime_root,
                     prepared.bound_occurrence_path,
@@ -2239,6 +2196,7 @@ def _input_record_payload(
         "source_callable_ref": record.source_callable_ref,
         "source_parameters_json": record.source_parameters_json,
         "source_extension": record.source_extension,
+        "source_kind": record.source_kind,
         "source_execution_role": record.source_execution_role,
         "source_is_reused": record.source_is_reused,
         "source_artifact_path": record.source_artifact_path,
@@ -2308,6 +2266,12 @@ def _workflow_output_artifact_rows(
                     output_hash=published_result.row.output_hash,
                     file_size=published_result.file_size,
                     extension=output_ref.declared_extension,
+                    kind=output_ref.kind,
+                    digest_scheme=(
+                        DIRECTORY_DIGEST_SCHEME
+                        if output_ref.kind == "directory"
+                        else "sha256"
+                    ),
                     parameters_json=_compact_json(output_ref.params),
                     callable_ref=output_ref.callable_ref,
                     is_selected_output=key in selected_output_keys,
@@ -2377,6 +2341,7 @@ def _actual_input_record(
         input_path=input_path,
         registry_source_artifact_id=candidate.artifact_id,
         source_extension=candidate.extension,
+        source_kind=candidate.kind,
         source_input_records=nested,
     )
 
@@ -2719,6 +2684,7 @@ def _published_output_specs(
                     output_name=output_name,
                     address=job.address,
                     declared_extension=output.declared_extension,
+                    kind=output.kind,
                     request_bundle_digest=request_bundle_digest,
                 )
             )
@@ -2934,11 +2900,16 @@ def _request_projection_plan(
         result_affecting_settings={},
         determinism_contract="deterministic",
         output_contract=OutputContract(
-            output_contract_version=OUTPUT_CONTRACT_VERSION,
+            output_contract_version=(
+                DIRECTORY_OUTPUT_CONTRACT_VERSION
+                if any(output.kind == "directory" for output in outputs.values())
+                else OUTPUT_CONTRACT_VERSION
+            ),
             sibling_outputs=tuple(
                 SiblingOutput(
                     output_name=output_name,
                     declared_extension=output.extension,
+                    kind=output.kind,
                 )
                 for output_name, output in outputs.items()
             ),
@@ -3075,23 +3046,22 @@ def _run_job_outputs(
     outputs: dict[str, Any],
     address: str,
 ) -> dict[str, RunJobOutput]:
-    return {
-        output_name: RunJobOutput(
+    result = {}
+    for output_name, output in outputs.items():
+        container = (
+            f"staging/{step.step_name}/{output_name}/{address}{output.extension or ''}"
+        )
+        payload = f"{container}/payload" if output.kind == "directory" else container
+        result[output_name] = RunJobOutput(
             output_name=output_name,
             declared_extension=output.extension,
-            staging_path=(
-                run_workspace
-                / "staging"
-                / step.step_name
-                / output_name
-                / f"{address}{output.extension}"
-            ),
-            staging_path_relative=(
-                f"staging/{step.step_name}/{output_name}/{address}{output.extension}"
-            ),
+            kind=output.kind,
+            staging_path=run_workspace / payload,
+            staging_path_relative=payload,
+            scheduler_path=run_workspace / container,
+            scheduler_path_relative=container,
         )
-        for output_name, output in outputs.items()
-    }
+    return result
 
 
 def _reusable_output_refs_for_job(
@@ -3493,6 +3463,7 @@ def _workflow_input_record(
         source_callable_ref=source_output.callable_ref,
         source_parameters_json=_source_parameters_json(source_output),
         source_extension=source_output.declared_extension,
+        source_kind=source_output.kind,
         source_execution_role=source_output.execution_role,
         source_is_reused=isinstance(source_output, ReusedRunJobOutputRef),
         manifest_value_schema=manifest_value_schema,

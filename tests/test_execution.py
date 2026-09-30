@@ -2989,3 +2989,174 @@ def test_dry_run_fails_on_nonzero_snakemake_exit(
         "manifest_bindings": 0,
     }
     assert list((runtime_dir / "outputs/v1").rglob("*.json")) == []
+
+
+@pytest.mark.parametrize("target", ["mixed", "collect"])
+def test_real_directory_scheduler_payload_and_complete_siblings(
+    tmp_path, monkeypatch, target
+):
+    from directory_support import directory_project, run, rows
+
+    project, runtime = directory_project(tmp_path, monkeypatch)
+    observed = []
+    real_hash = execution_module.artifact_content_facts
+
+    def record(path, kind):
+        observed.append((path, kind))
+        return real_hash(path, kind)
+
+    monkeypatch.setattr(execution_module, "artifact_content_facts", record)
+    monkeypatch.setattr(
+        execution_module.shutil,
+        "copytree",
+        lambda *a, **kw: pytest.fail("fresh publication copied a tree"),
+    )
+    monkeypatch.setattr(
+        execution_module.shutil,
+        "copy2",
+        lambda *a, **kw: pytest.fail("fresh publication copied a file"),
+    )
+    outcome = run(project, target)
+    assert outcome.all_selected_resolved
+    artifacts = [row for row in rows(runtime) if row["origin"] == "workflow_output"]
+    trees = [row for row in artifacts if row["kind"] == "directory"]
+    assert len(trees) == 4
+    assert len(observed) == len(artifacts)
+    for row in trees:
+        assert row["extension"] is None
+        assert row["digest_scheme"] == "nipact-directory-tree-sha256-v1"
+        expected_size = (
+            0
+            if row["output_name"] == "empty"
+            else len("hidden")
+            + len("scientific")
+            + len("alpha" if row["address"] == "sub_001" else "beta")
+        )
+        assert row["file_size"] == expected_size
+        assert not (runtime / row["staging_path"]).parent.exists()
+    if target == "mixed":
+        assert {row["step_name"] for row in artifacts} == {"source_text", "mixed"}
+    else:
+        summary = next(row for row in artifacts if row["step_name"] == "collect")
+        assert json.loads((runtime / summary["path"]).read_text()) == ["alpha", "beta"]
+        tree_ids = {row["artifact_id"] for row in trees if row["output_name"] == "maps"}
+        dependencies = [
+            row
+            for row in rows(runtime, "artifact_dependencies")
+            if row["source_artifact_id"] in tree_ids
+        ]
+        assert len(dependencies) == 4
+        assert all(
+            row["source_extension"] is None and row["input_path"].endswith("/payload")
+            for row in dependencies
+        )
+
+
+@pytest.mark.parametrize("failure", ["missing", "wrong_kind", "link", "raise"])
+def test_directory_rejection_preserves_complete_bundle_and_descendants(
+    tmp_path, monkeypatch, failure
+):
+    from directory_support import directory_project, run, rows, change_step
+
+    project, runtime = directory_project(tmp_path, monkeypatch)
+    change_step(project, "mixed", params={"failure": failure})
+    outcome = run(project, "reader", "sub_001")
+    assert not outcome.all_selected_resolved
+    assert any(step == "mixed" for step, address, reason in outcome.failed_jobs)
+    assert not [row for row in rows(runtime) if row["step_name"] in {"mixed", "reader"}]
+
+
+@pytest.mark.parametrize("fault", ["move", "record", "conflict", "exdev"])
+def test_mixed_directory_publication_fault_and_orphan_retry(
+    tmp_path, monkeypatch, fault
+):
+    from directory_support import directory_project, run, rows
+
+    project, runtime = directory_project(tmp_path, monkeypatch)
+    # Publish the file ancestor first; its accepted state must survive all failures.
+    assert run(project, "source_text", "sub_001").all_selected_resolved
+    ancestor = next(row for row in rows(runtime) if row["step_name"] == "source_text")
+    source_plan = build_run_plan(
+        project_dir=project,
+        context="mini",
+        workflow_name="main",
+        step_name="mixed",
+        address="sub_001",
+    )
+
+    def in_process(executable, **kwargs):
+        for job in executable.jobs:
+            run_job(
+                run_plan_path=executable.run_workspace / "run_plan.json",
+                job_id=job.job_id,
+            )
+        return 0
+
+    monkeypatch.setattr(execution_module, "_run_snakemake", in_process)
+    real_replace = execution_module.os.replace
+    conflict = []
+    with monkeypatch.context() as inject:
+        if fault == "record":
+            inject.setattr(
+                execution_module,
+                "record_workflow_run",
+                lambda *a, **kw: (_ for _ in ()).throw(
+                    ValidationError("record failure")
+                ),
+            )
+        elif fault in {"move", "exdev"}:
+
+            def fail_move(source, destination):
+                if "/staging/mixed/maps/" in str(source) and "/outputs/" in str(
+                    destination
+                ):
+                    raise OSError(
+                        errno.EXDEV if fault == "exdev" else errno.EIO,
+                        "injected move failure",
+                    )
+                return real_replace(source, destination)
+
+            import errno
+
+            inject.setattr(execution_module.os, "replace", fail_move)
+        else:
+            real_materialize = execution_module._materialize_one_prepared_job
+
+            def preexisting(executable, prepared):
+                for output in prepared:
+                    if output.kind == "directory" and output.file_size:
+                        destination = runtime / output.row.path
+                        destination.mkdir(parents=True)
+                        (destination / "conflict").write_text("untouched")
+                        conflict.append(destination)
+                return real_materialize(executable, prepared)
+
+            inject.setattr(
+                execution_module, "_materialize_one_prepared_job", preexisting
+            )
+        if fault == "record":
+            with pytest.raises(ValidationError, match="record failure"):
+                execute_run_plan(source_plan)
+        else:
+            assert not execute_run_plan(source_plan).all_selected_resolved
+    assert (
+        next(
+            row
+            for row in rows(runtime)
+            if row["artifact_id"] == ancestor["artifact_id"]
+        )
+        == ancestor
+    )
+    assert not [row for row in rows(runtime) if row["step_name"] == "mixed"]
+    if fault == "conflict":
+        assert (conflict[0] / "conflict").read_text() == "untouched"
+        assert not run(project, address="sub_001").all_selected_resolved
+    else:
+        orphans = {
+            path: path.stat().st_ino
+            for path in (runtime / "outputs/v1/mini/mixed/sub_001").glob("*/empty/*")
+        }
+        assert len(orphans) == 1
+        assert run(project, address="sub_001").all_selected_resolved
+        assert {path: path.stat().st_ino for path in orphans} == orphans
+        assert len([row for row in rows(runtime) if row["step_name"] == "mixed"]) == 3

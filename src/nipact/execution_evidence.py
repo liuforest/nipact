@@ -13,7 +13,7 @@ from typing import Any, Mapping
 from .hashing import is_valid_digest
 from .identity import validate_path_token
 
-RUN_PLAN_SCHEMA_VERSION = 2
+RUN_PLAN_SCHEMA_VERSION = 3
 COMPLETION_RECEIPT_SCHEMA_VERSION = 1
 _INVOCATION_TOKEN_BYTES = 16
 _RECEIPT_KEYS = {

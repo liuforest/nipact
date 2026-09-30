@@ -32,6 +32,8 @@ function artifact(overrides: Partial<Artifact>): Artifact {
     content_digest: "a".repeat(64),
     output_hash: null,
     file_size: 12,
+    kind: "file",
+    digest_scheme: "sha256",
     extension: ".json",
     subject_id: null,
     session_id: null,

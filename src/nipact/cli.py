@@ -14,6 +14,7 @@ from time import perf_counter
 from typing import Any, Sequence
 
 from ._version import __version__
+from .artifacts import artifact_root_matches
 
 PACKAGE_NAME = "nipact"
 FALLBACK_DESCRIPTION = (
@@ -698,7 +699,7 @@ def _run_workflow_command(args: argparse.Namespace) -> int | None:
                 sum(
                     1
                     for output_ref in run_plan.selected_fresh_output_refs
-                    if output_ref.staging_path.is_file()
+                    if artifact_root_matches(output_ref.staging_path, output_ref.kind)
                 ),
             )
         feedback.key_value("run_workspace", _display_path(run_plan.run_workspace))

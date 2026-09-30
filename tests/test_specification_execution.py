@@ -1583,3 +1583,122 @@ def test_specification_interruption_and_postcommit_callback_boundaries(
         attempt=committed_ref,
         member=member,
     ) == "complete"
+
+
+@pytest.mark.parametrize("ordinary_first", [True, False])
+def test_directory_specification_bidirectional_reuse_and_source_basis(
+    tmp_path, monkeypatch, ordinary_first
+):
+    from directory_support import directory_project, run, rows, change_step
+
+    project, runtime = directory_project(tmp_path, monkeypatch)
+    source = project / "directory-spec.yaml"
+    source.write_text(
+        yaml.safe_dump(
+            {
+                "schema": "nipact/specification-set/v1",
+                "specification_set": {"key": "trees"},
+                "libraries": [],
+                "expected_counts": {"candidates": 1, "included": 1, "excluded": 0},
+                "fixed": {
+                    "workflow": "main",
+                    "execution_population": "subjects",
+                    "target": {"step": "mixed", "output": "maps"},
+                    "results": {"maps": {"step": "mixed", "output": "maps"}},
+                },
+                "members": [
+                    {
+                        "key": "one",
+                        "decision_coordinates": {"choice": "one"},
+                        "disposition": "included",
+                    }
+                ],
+            }
+        )
+    )
+    frozen = freeze_specification_snapshot(
+        project_dir=project, context="mini", source=ExplicitSpecificationSource(source)
+    )
+    if ordinary_first:
+        assert run(project).all_selected_resolved
+    result = run_specification_member(
+        project_dir=project,
+        context="mini",
+        snapshot_digest=frozen.snapshot.snapshot_digest,
+        member_key="one",
+    )
+    assert result.outcome == "complete"
+    assert result.ordinary_outcome.selected_reused_count == (2 if ordinary_first else 0)
+    projection = read_specification_snapshot_projections(
+        runtime / "database/registry.db",
+        context="mini",
+        snapshot_digest=frozen.snapshot.snapshot_digest,
+    )
+    assert {value.kind for value in projection.results} == {"directory"}
+    assert {value.extension for value in projection.results} == {None}
+    assert len(projection.result_source_basis) == 2
+    accepted_ids = {
+        row["artifact_id"] for row in rows(runtime) if row["output_name"] == "maps"
+    }
+    assert {value.artifact_id for value in projection.results} == accepted_ids
+    alternate = yaml.safe_load((project / "workflows/main.yaml").read_text())
+    alternate["workflow_name"] = "other"
+    (project / "workflows/other.yaml").write_text(yaml.safe_dump(alternate))
+    config = yaml.safe_load((project / "nipact.yaml").read_text())
+    config["workflows"]["other"] = "workflows/other.yaml"
+    (project / "nipact.yaml").write_text(yaml.safe_dump(config))
+    reused = execute_run_plan(
+        build_run_plan(
+            project_dir=project,
+            context="mini",
+            workflow_name="other",
+            step_name="mixed",
+        )
+    )
+    assert reused.selected_reused_count == 2
+    assert {
+        row["artifact_id"] for row in rows(runtime) if row["output_name"] == "maps"
+    } == accepted_ids
+    assert run(project, "collect").all_selected_resolved
+    payload = yaml.safe_load(source.read_text())
+    payload["fixed"]["target"] = {"step": "collect", "output": "summary"}
+    payload["fixed"]["results"] = {"summary": {"step": "collect", "output": "summary"}}
+    source.write_text(yaml.safe_dump(payload))
+    downstream = freeze_specification_snapshot(
+        project_dir=project, context="mini", source=ExplicitSpecificationSource(source)
+    )
+    with monkeypatch.context() as guard:
+        guard.setattr(
+            ordinary_execution_module,
+            "_run_snakemake",
+            lambda *a, **kw: pytest.fail("exact specification reuse invoked scheduler"),
+        )
+        assert (
+            run_specification_member(
+                project_dir=project,
+                context="mini",
+                snapshot_digest=downstream.snapshot.snapshot_digest,
+                member_key="one",
+            ).outcome
+            == "complete"
+        )
+    projection = read_specification_snapshot_projections(
+        runtime / "database/registry.db",
+        context="mini",
+        snapshot_digest=downstream.snapshot.snapshot_digest,
+    )
+    assert [value.kind for value in projection.results] == ["file"]
+    assert {value.source_entity_id for value in projection.result_source_basis} == {
+        "sub_001",
+        "sub_002",
+    }
+    change_step(project, "mixed", step_contract_version="2")
+    attempts = rows(runtime, "specification_member_attempts")
+    with pytest.raises(ValidationError, match="(effective|declaration)"):
+        run_specification_member(
+            project_dir=project,
+            context="mini",
+            snapshot_digest=frozen.snapshot.snapshot_digest,
+            member_key="one",
+        )
+    assert rows(runtime, "specification_member_attempts") == attempts

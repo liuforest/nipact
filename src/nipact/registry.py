@@ -13,6 +13,8 @@ from urllib.parse import quote
 
 from .artifacts import (
     CANONICAL_OUTPUT_ROOT,
+    artifact_content_facts,
+    artifact_root_matches,
     STORAGE_LAYOUT_VERSION,
     canonical_output_path,
 )
@@ -21,7 +23,6 @@ from .hashing import (
     DIRECTORY_DIGEST_SCHEME,
     is_valid_digest,
     sha256_digest,
-    sha256_file_digest,
     short_hash,
 )
 from .identity import validate_hash_alias, validate_path_token
@@ -32,6 +33,7 @@ from .projection import (
     ResolvedRequestBundleProjectionV3,
     RequestedOutputCoordinate,
     ValidatedStoredRequestBundleProjectionV3,
+    SiblingOutput,
     resolve_request_bundle_projection_plan,
     validate_stored_request_bundle_projection_v3,
 )
@@ -74,7 +76,10 @@ def _validate_artifact_content_facts(
     extension: str | None,
 ) -> None:
     if (
-        kind == "file" and digest_scheme == "sha256" and isinstance(extension, str)
+        kind == "file"
+        and digest_scheme == "sha256"
+        and isinstance(extension, str)
+        and bool(extension.strip())
     ) or (
         kind == "directory"
         and digest_scheme == DIRECTORY_DIGEST_SCHEME
@@ -131,6 +136,7 @@ class ArtifactInputRow:
     edge_cardinality: int | None = None
     registry_source_artifact_id: int | None = None
     source_input_records: tuple["ArtifactInputRow", ...] = ()
+    source_kind: str = "file"
 
 
 @dataclass(frozen=True)
@@ -253,6 +259,8 @@ class SpecificationResultProjection:
     extension: str | None
     request_bundle_digest: str | None
     current_publication_path: str | None
+    kind: str | None = None
+    digest_scheme: str | None = None
 
 
 @dataclass(frozen=True)
@@ -397,7 +405,7 @@ class ReusableArtifactBundleRequest:
     step_name: str
     address: str
     resolved_projection: ResolvedRequestBundleProjectionV3
-    sibling_outputs: tuple[tuple[str, str], ...]
+    sibling_outputs: tuple[tuple[str, str | None], ...]
     input_records: tuple[ArtifactInputRow, ...]
 
 
@@ -1181,7 +1189,7 @@ def validate_registry_db(
                        a.context, a.workflow_name, a.step_name, a.output_name,
                        a.address, a.origin, a.is_published, a.published_path,
                        a.content_digest, a.output_hash, a.request_bundle_digest,
-                       a.extension
+                       a.extension, a.kind, a.digest_scheme
                 FROM published_outputs po
                 JOIN artifacts a ON a.artifact_id = po.artifact_id
                 WHERE po.context = ?
@@ -1194,7 +1202,7 @@ def validate_registry_db(
                 SELECT artifact_id, context, workflow_name, step_name, output_name,
                        address, origin, is_published, path, published_path,
                        content_digest, output_hash, file_size, extension,
-                       request_bundle_digest
+                       request_bundle_digest, kind, digest_scheme
                 FROM artifacts
                 WHERE context = ?
                   AND origin = 'workflow_output'
@@ -1203,7 +1211,7 @@ def validate_registry_db(
                 """,
                 (context,),
             ).fetchall()
-            _validate_request_bundle_projection_graph(conn, context=context)
+            contracts = _validate_request_bundle_projection_graph(conn, context=context)
     except sqlite3.Error as exc:
         raise ValidationError(f"registry.db is malformed: {exc}") from exc
 
@@ -1220,18 +1228,20 @@ def validate_registry_db(
     ]
     if rows != expected_rows:
         raise ValidationError("registry.db manifest rows are out of date")
-    verified_occurrences: set[tuple[Path, str]] = set()
+    verified_occurrences: set[tuple[Path, str, str, str, int]] = set()
     _validate_published_output_rows(
         published_rows,
         context=context,
         runtime_root=runtime_root,
         loaded_workflow_project=loaded_workflow_project,
+        contracts=contracts,
     )
     _validate_accepted_workflow_output_rows(
         accepted_artifact_rows,
         context=context,
         runtime_root=runtime_root,
         loaded_workflow_project=loaded_workflow_project,
+        contracts=contracts,
         verified_occurrences=verified_occurrences,
     )
     return {"manifests": len(rows), "published_outputs": len(published_rows)}
@@ -1276,7 +1286,7 @@ def validate_prepared_registry_db(
                        a.context, a.workflow_name, a.step_name, a.output_name,
                        a.address, a.origin, a.is_published, a.published_path,
                        a.content_digest, a.output_hash, a.request_bundle_digest,
-                       a.extension
+                       a.extension, a.kind, a.digest_scheme
                 FROM published_outputs po
                 JOIN artifacts a ON a.artifact_id = po.artifact_id
                 WHERE po.context = ?
@@ -1289,7 +1299,7 @@ def validate_prepared_registry_db(
                 SELECT artifact_id, context, workflow_name, step_name, output_name,
                        address, origin, is_published, path, published_path,
                        content_digest, output_hash, file_size, extension,
-                       request_bundle_digest
+                       request_bundle_digest, kind, digest_scheme
                 FROM artifacts
                 WHERE context = ?
                   AND origin = 'workflow_output'
@@ -1298,21 +1308,23 @@ def validate_prepared_registry_db(
                 """,
                 (context,),
             ).fetchall()
-            _validate_request_bundle_projection_graph(conn, context=context)
+            contracts = _validate_request_bundle_projection_graph(conn, context=context)
     except sqlite3.Error as exc:
         raise ValidationError(f"registry.db is malformed: {exc}") from exc
-    verified_occurrences: set[tuple[Path, str]] = set()
+    verified_occurrences: set[tuple[Path, str, str, str, int]] = set()
     _validate_published_output_rows(
         published_rows,
         context=context,
         runtime_root=runtime_root,
         loaded_workflow_project=loaded_workflow_project,
+        contracts=contracts,
     )
     _validate_accepted_workflow_output_rows(
         accepted_artifact_rows,
         context=context,
         runtime_root=runtime_root,
         loaded_workflow_project=loaded_workflow_project,
+        contracts=contracts,
         verified_occurrences=verified_occurrences,
     )
     return {"published_outputs": int(published_outputs)}
@@ -1322,7 +1334,7 @@ def _validate_request_bundle_projection_graph(
     conn: sqlite3.Connection,
     *,
     context: str,
-) -> None:
+) -> dict[str, ValidatedStoredRequestBundleProjectionV3]:
     rows = conn.execute(
         """
         SELECT request_bundle_digest, projection_json
@@ -1331,6 +1343,7 @@ def _validate_request_bundle_projection_graph(
         """
     ).fetchall()
     graph: dict[str, tuple[str, ...]] = {}
+    contracts = {}
     for row in rows:
         digest = str(row[0])
         validated = validate_stored_request_bundle_projection_v3(
@@ -1338,6 +1351,7 @@ def _validate_request_bundle_projection_graph(
             projection_json=str(row[1]),
         )
         graph[digest] = validated.direct_upstream_request_bundle_digests
+        contracts[digest] = validated
     for digest, upstream_digests in graph.items():
         for upstream_digest in upstream_digests:
             if upstream_digest not in graph:
@@ -1387,6 +1401,7 @@ def _validate_request_bundle_projection_graph(
             raise ValidationError(
                 "registry workflow artifact references a missing request projection"
             )
+    return contracts
 
 
 def record_workflow_run(
@@ -2303,15 +2318,23 @@ def resolve_reusable_artifact_bundle(
 
 def _validate_reusable_bundle_request(
     request: ReusableArtifactBundleRequest,
-) -> dict[str, str]:
-    validate_stored_request_bundle_projection_v3(
+) -> dict[str, SiblingOutput]:
+    validated = validate_stored_request_bundle_projection_v3(
         request_bundle_digest=request.resolved_projection.request_bundle_digest,
         projection_json=request.resolved_projection.canonical_json,
     )
-    declared_outputs = dict(request.sibling_outputs)
-    if len(declared_outputs) != len(request.sibling_outputs):
-        raise ValidationError("reusable bundle request has duplicate sibling outputs")
-    return declared_outputs
+    projection = validated.projection
+    outputs = {
+        output.output_name: output
+        for output in projection.output_contract.sibling_outputs
+    }
+    if len(dict(request.sibling_outputs)) != len(request.sibling_outputs) or dict(
+        request.sibling_outputs
+    ) != {name: output.declared_extension for name, output in outputs.items()}:
+        raise ValidationError(
+            "reusable bundle request does not match retained output contract"
+        )
+    return outputs
 
 
 def _resolve_reusable_artifact_bundle_conn(
@@ -2320,7 +2343,7 @@ def _resolve_reusable_artifact_bundle_conn(
     runtime_root: Path,
     request: ReusableArtifactBundleRequest,
     preferred_artifact_ids: tuple[int, ...] | None,
-    declared_outputs: dict[str, str],
+    declared_outputs: dict[str, SiblingOutput],
     lineage_memo: dict[tuple[str, int], bool],
 ) -> ReusableArtifactBundleCandidate | None:
     try:
@@ -2459,7 +2482,10 @@ def _resolve_reusable_artifact_bundle_conn(
                         runtime_root=runtime_root,
                         context=request.context,
                         candidate=candidate,
-                        declared_extension=declared_outputs[candidate.output_name],
+                        declared_extension=declared_outputs[
+                            candidate.output_name
+                        ].declared_extension,
+                        kind=declared_outputs[candidate.output_name].kind,
                     )
                 )
                 is not None
@@ -2675,6 +2701,8 @@ def _workflow_artifacts_are_equivalent(
         and source.content_digest == requested.content_digest
         and source.file_size == requested.file_size
         and source.extension == requested.extension
+        and source.kind == requested.kind
+        and source.digest_scheme == requested.digest_scheme
     )
 
 
@@ -2792,17 +2820,20 @@ def _reusable_artifact_occurrence_error(
     runtime_root: Path,
     context: str,
     candidate: ReusableArtifactCandidate,
-    declared_extension: str,
+    declared_extension: str | None,
+    kind: str = "file",
 ) -> str | None:
     if candidate.published_path != candidate.path:
         raise ValidationError(
             "registered reusable artifact publication path is inconsistent"
         )
-    if candidate.extension != declared_extension:
+    if candidate.extension != declared_extension or candidate.kind != kind:
         raise ValidationError(
             "registered reusable artifact extension does not match its output contract"
         )
-    if not candidate.path.endswith(declared_extension):
+    if declared_extension is not None and not candidate.path.endswith(
+        declared_extension
+    ):
         raise ValidationError(
             "registered reusable artifact path does not match its declared extension"
         )
@@ -2818,6 +2849,7 @@ def _reusable_artifact_occurrence_error(
         output_name=candidate.output_name,
         output_hash=candidate.output_hash,
         declared_extension=declared_extension,
+        kind=kind,
     )
     if candidate.path != expected_path:
         raise ValidationError(
@@ -2829,9 +2861,12 @@ def _reusable_artifact_occurrence_error(
         raise ValidationError(
             "registered reusable artifact path must stay inside outputs/v1/"
         )
-    if not artifact_path.is_file():
-        return "registered reusable artifact file is missing"
-    if artifact_path.stat().st_size != candidate.file_size:
+    lexical_path = runtime_root / candidate.path
+    if not lexical_path.exists() and not lexical_path.is_symlink():
+        return f"registered reusable artifact {kind} is missing"
+    if not artifact_root_matches(lexical_path, kind):
+        return f"registered reusable artifact {kind} root is missing or invalid"
+    if kind == "file" and artifact_path.stat().st_size != candidate.file_size:
         return "registered reusable artifact file size mismatch"
     return None
 
@@ -3916,8 +3951,6 @@ def _validate_reused_dependency_source(
 ) -> None:
     if input_record.registry_source_artifact_id is None:
         raise ValidationError("reused workflow dependency source artifact is missing")
-    if input_record.source_extension is None:
-        raise ValidationError("reused workflow dependency source metadata is incomplete")
     if (
         input_record.source_step_name is None
         or input_record.source_output_name is None
@@ -3940,7 +3973,7 @@ def _validate_reused_dependency_source(
         conn,
         input_record.registry_source_artifact_id,
     )
-    _validated_stored_request_bundle_projection(
+    retained = _validated_stored_request_bundle_projection(
         conn,
         expected_request_bundle_digest,
     )
@@ -3957,23 +3990,52 @@ def _validate_reused_dependency_source(
     if (
         artifact.request_bundle_digest != expected_request_bundle_digest
         or artifact.extension != input_record.source_extension
+        or artifact.kind != input_record.source_kind
     ):
         raise ValidationError("reused workflow dependency source identity mismatch")
     if not artifact.is_published or artifact.published_path != artifact.path:
         raise ValidationError("reused workflow dependency source publication mismatch")
-    if not artifact.path.endswith(artifact.extension):
+    _retained_artifact_output(
+        retained,
+        context=context,
+        step_name=artifact.step_name,
+        address=artifact.address,
+        output_name=artifact.output_name,
+        kind=artifact.kind,
+        digest_scheme=artifact.digest_scheme,
+        extension=artifact.extension,
+    )
+    if artifact.extension is not None and not artifact.path.endswith(
+        artifact.extension
+    ):
         raise ValidationError("reused workflow dependency source path extension mismatch")
     if not is_valid_digest(artifact.content_digest):
         raise ValidationError("reused workflow dependency source digest is invalid")
+    expected_path = canonical_output_path(
+        context=context,
+        step_name=artifact.step_name,
+        address=artifact.address,
+        request_bundle_digest=expected_request_bundle_digest,
+        output_name=artifact.output_name,
+        output_hash=artifact.output_hash,
+        declared_extension=artifact.extension,
+        kind=artifact.kind,
+    )
+    if artifact.path != expected_path:
+        raise ValidationError(
+            "reused workflow dependency source canonical path mismatch"
+        )
     source_path = _runtime_relative_file_path(runtime_root, artifact.path)
     outputs_root = (runtime_root / "outputs").resolve()
     if not _path_contains_or_same(outputs_root, source_path):
         raise ValidationError(
             "reused workflow dependency source path must stay inside outputs/"
         )
-    if not source_path.is_file():
-        raise ValidationError("reused workflow dependency source file is missing")
-    if source_path.stat().st_size != artifact.file_size:
+    if not artifact_root_matches(runtime_root / artifact.path, artifact.kind):
+        raise ValidationError(
+            f"reused workflow dependency source {artifact.kind} root is missing or invalid"
+        )
+    if artifact.kind == "file" and source_path.stat().st_size != artifact.file_size:
         raise ValidationError("reused workflow dependency source file size mismatch")
     if not _workflow_artifact_dependencies_match_registry(
         conn,
@@ -4298,12 +4360,51 @@ def _environment_observation_json(observation: EnvironmentObservationV1) -> str:
     )
 
 
+def _retained_artifact_output(
+    retained: ValidatedStoredRequestBundleProjectionV3,
+    *,
+    context: str,
+    step_name: str,
+    address: str,
+    output_name: str,
+    kind: str,
+    digest_scheme: str,
+    extension: str | None,
+) -> SiblingOutput:
+    projection = retained.projection
+    output = next(
+        (
+            output
+            for output in projection.output_contract.sibling_outputs
+            if output.output_name == output_name
+        ),
+        None,
+    )
+    _validate_artifact_content_facts(kind, digest_scheme, extension)
+    if (
+        (
+            projection.namespace,
+            projection.step_contract.step_contract_id,
+            projection.address,
+        )
+        != (context, step_name, address)
+        or output is None
+        or output.kind != kind
+        or output.declared_extension != extension
+    ):
+        raise ValidationError(
+            "registry artifact does not match retained output contract"
+        )
+    return output
+
+
 def _validate_published_output_rows(
     rows: list[tuple[Any, ...]],
     *,
     context: str,
     runtime_root: Path,
     loaded_workflow_project: Any,
+    contracts: dict[str, ValidatedStoredRequestBundleProjectionV3],
 ) -> None:
     workflow_steps = {
         workflow_name: set(workflow.steps)
@@ -4331,6 +4432,8 @@ def _validate_published_output_rows(
             artifact_output_hash,
             request_bundle_digest,
             artifact_extension,
+            artifact_kind,
+            artifact_digest_scheme,
         ) = row
         if not all(
             isinstance(value, str) and value
@@ -4354,9 +4457,17 @@ def _validate_published_output_rows(
         step = loaded_workflow_project.steps.get(step_name)
         if step is None or output_name not in step.outputs:
             raise ValidationError("registry.db published output references unknown step output")
-        declared_extension = step.outputs[output_name].extension
-        if artifact_extension != declared_extension:
-            raise ValidationError("registry.db published output extension is invalid")
+        _retained_artifact_output(
+            contracts[request_bundle_digest],
+            context=context,
+            step_name=step_name,
+            address=address,
+            output_name=output_name,
+            kind=artifact_kind,
+            digest_scheme=artifact_digest_scheme,
+            extension=artifact_extension,
+        )
+        declared_extension = artifact_extension
         if not is_valid_digest(request_bundle_digest):
             raise ValidationError("registry.db published output request digest is invalid")
         if not is_valid_digest(output_digest):
@@ -4375,11 +4486,13 @@ def _validate_published_output_rows(
             output_name=output_name,
             output_hash=output_hash,
             declared_extension=declared_extension,
+            kind=artifact_kind,
         )
         _resolve_published_output_path(
             runtime_root,
             output_artifact_path,
             expected_path=expected_path,
+            kind=artifact_kind,
         )
         if (
             artifact_context != context
@@ -4405,7 +4518,8 @@ def _validate_accepted_workflow_output_rows(
     context: str,
     runtime_root: Path,
     loaded_workflow_project: Any,
-    verified_occurrences: set[tuple[Path, str]],
+    contracts: dict[str, ValidatedStoredRequestBundleProjectionV3],
+    verified_occurrences: set[tuple[Path, str, str, str, int]],
 ) -> None:
     for row in rows:
         _validate_accepted_workflow_output_row(
@@ -4413,6 +4527,7 @@ def _validate_accepted_workflow_output_rows(
             context=context,
             runtime_root=runtime_root,
             loaded_workflow_project=loaded_workflow_project,
+            contracts=contracts,
             verified_occurrences=verified_occurrences,
         )
 
@@ -4423,7 +4538,8 @@ def _validate_accepted_workflow_output_row(
     context: str,
     runtime_root: Path,
     loaded_workflow_project: Any,
-    verified_occurrences: set[tuple[Path, str]],
+    contracts: dict[str, ValidatedStoredRequestBundleProjectionV3],
+    verified_occurrences: set[tuple[Path, str, str, str, int]],
 ) -> None:
     (
         artifact_id,
@@ -4441,6 +4557,8 @@ def _validate_accepted_workflow_output_row(
         file_size,
         extension,
         request_bundle_digest,
+        kind,
+        digest_scheme,
     ) = row
     if type(artifact_id) is not int or artifact_id <= 0:
         raise ValidationError("registry.db accepted artifact id is invalid")
@@ -4475,9 +4593,17 @@ def _validate_accepted_workflow_output_row(
         raise ValidationError("registry.db accepted artifact file size is invalid")
     if not is_valid_digest(request_bundle_digest):
         raise ValidationError("registry.db accepted artifact request digest is invalid")
-    declared_extension = step.outputs[output_name].extension
-    if extension != declared_extension:
-        raise ValidationError("registry.db accepted artifact extension is invalid")
+    _retained_artifact_output(
+        contracts[request_bundle_digest],
+        context=context,
+        step_name=step_name,
+        address=address,
+        output_name=output_name,
+        kind=kind,
+        digest_scheme=digest_scheme,
+        extension=extension,
+    )
+    declared_extension = extension
     expected_path = canonical_output_path(
         context=context,
         step_name=step_name,
@@ -4486,18 +4612,23 @@ def _validate_accepted_workflow_output_row(
         output_name=output_name,
         output_hash=output_hash,
         declared_extension=declared_extension,
+        kind=kind,
     )
     resolved_path = _resolve_published_output_path(
         runtime_root,
         published_path,
         expected_path=expected_path,
+        kind=kind,
     )
-    if resolved_path.stat().st_size != file_size:
-        raise ValidationError("published output artifact file size mismatch")
-    occurrence = (resolved_path, content_digest)
+    occurrence = (resolved_path, kind, digest_scheme, content_digest, file_size)
     if occurrence in verified_occurrences:
         return
-    if sha256_file_digest(resolved_path) != content_digest:
+    if kind == "file" and resolved_path.stat().st_size != file_size:
+        raise ValidationError("published output artifact file size mismatch")
+    digest, size = artifact_content_facts(resolved_path, kind)
+    if size != file_size:
+        raise ValidationError("published output artifact file size mismatch")
+    if digest != content_digest:
         raise ValidationError("published output artifact digest mismatch")
     verified_occurrences.add(occurrence)
 
@@ -4507,6 +4638,7 @@ def _resolve_published_output_path(
     raw_path: Any,
     *,
     expected_path: str,
+    kind: str = "file",
 ) -> Path:
     if not isinstance(raw_path, str):
         raise ValidationError("published output artifact path must be a string")
@@ -4525,7 +4657,7 @@ def _resolve_published_output_path(
     outputs_root = (runtime_root / CANONICAL_OUTPUT_ROOT).resolve()
     if not _path_contains_or_same(outputs_root, resolved):
         raise ValidationError("published output artifact path must stay inside outputs/v1/")
-    if not resolved.is_file():
+    if not artifact_root_matches(runtime_root / relative_path, kind):
         raise ValidationError(f"missing published output artifact: {raw_path}")
     return resolved
 
@@ -6516,6 +6648,8 @@ def _read_specification_snapshot_projections_conn(
                     output_hash=facts.output_hash,
                     file_size=facts.file_size,
                     extension=facts.extension,
+                    kind=facts.kind,
+                    digest_scheme=facts.digest_scheme,
                     request_bundle_digest=facts.request_bundle_digest,
                     current_publication_path=current_publications.get(key),
                 )
@@ -6673,6 +6807,8 @@ def _read_specification_result_facts(
                artifact.output_hash AS artifact_output_hash,
                artifact.file_size AS artifact_file_size,
                artifact.extension AS artifact_extension,
+               artifact.kind AS artifact_kind,
+               artifact.digest_scheme AS artifact_digest_scheme,
                artifact.request_bundle_digest AS artifact_request_bundle_digest,
                producing.run_id AS joined_producing_run_id,
                producing.context AS producing_context,
@@ -6776,9 +6912,9 @@ def _read_specification_result_facts(
         file_size = row["artifact_file_size"]
         if type(file_size) is not int or file_size < 0:
             raise ValidationError("stored specification result file size is invalid")
-        extension = _require_specification_projection_text(
-            row["artifact_extension"],
-            label="specification result extension",
+        extension = row["artifact_extension"]
+        _validate_artifact_content_facts(
+            row["artifact_kind"], row["artifact_digest_scheme"], extension
         )
         key = (attempt_id, descriptor.role, descriptor.address)
         if key in facts:
@@ -6798,6 +6934,8 @@ def _read_specification_result_facts(
             output_hash=output_hash,
             file_size=file_size,
             extension=extension,
+            kind=row["artifact_kind"],
+            digest_scheme=row["artifact_digest_scheme"],
             request_bundle_digest=request_bundle_digest,
             current_publication_path=None,
         )
@@ -6925,6 +7063,8 @@ def _read_specification_result_source_basis(
                source.content_digest AS source_artifact_content_digest,
                source.file_size AS source_artifact_file_size,
                source.extension AS source_artifact_extension,
+               source.kind AS source_artifact_kind,
+               source.digest_scheme AS source_artifact_digest_scheme,
                source.source_scope AS source_artifact_scope,
                source.source_name AS source_artifact_name,
                source.source_entity_id AS source_artifact_entity_id
@@ -6967,12 +7107,16 @@ def _read_specification_result_source_basis(
             not is_valid_digest(digest)
             or type(file_size) is not int
             or file_size < 0
-            or type(extension) is not str
-            or not extension.strip()
         ):
             raise ValidationError(
                 "stored specification dependency snapshot is malformed"
             )
+
+        _validate_artifact_content_facts(
+            row["source_artifact_kind"], row["source_artifact_digest_scheme"], extension
+        )
+        if row["source_origin"] == "source" and row["source_artifact_kind"] != "file":
+            raise ValidationError("external source snapshot must be a file")
 
         workflow_coordinate = (
             row["source_step_name"],

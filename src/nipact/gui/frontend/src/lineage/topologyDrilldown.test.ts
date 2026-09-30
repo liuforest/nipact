@@ -31,6 +31,8 @@ function artifact(overrides: Partial<TraceArtifact> & { artifact_id: number }): 
     content_digest: "0".repeat(64),
     output_hash: null,
     file_size: 1,
+    kind: "file",
+    digest_scheme: "sha256",
     extension: ".json",
     subject_id: null,
     session_id: null,

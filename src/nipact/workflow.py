@@ -43,7 +43,7 @@ REQUIRED_STEP_FIELDS = frozenset(
     }
 )
 INPUT_FIELDS = frozenset({"artifact", "dependency_role"})
-OUTPUT_FIELDS = frozenset({"extension", "address_scope"})
+OUTPUT_FIELDS = frozenset({"extension", "address_scope", "kind"})
 MANIFEST_BINDING_FIELDS = frozenset({"role", "manifest"})
 BASE_WORKFLOW_FIELDS = frozenset(
     {"workflow_name", "execution_population", "steps"}
@@ -410,6 +410,7 @@ def workflow_plan_to_graph(plan: WorkflowPlan) -> dict[str, Any]:
                     "step_name": step.step_name,
                     "output_name": output_name,
                     "extension": output.extension,
+                    "kind": output.kind,
                     "address_scope": output.address_scope,
                     "hash_version": None,
                     "param_hash": None,
@@ -576,8 +577,19 @@ def validate_workflow_graph(graph: Mapping[str, Any]) -> None:
             _graph_string(artifact, "output_name", label="artifact"),
             label="artifact output_name",
         )
-        extension = _graph_string(artifact, "extension", label="artifact")
-        if not extension.startswith(".") or "/" in extension or "\\" in extension:
+        kind = _graph_allowed_string(
+            artifact, "kind", allowed={"file", "directory"}, label="artifact"
+        )
+        extension = artifact.get("extension")
+        if kind == "directory":
+            if extension is not None:
+                raise ValidationError("workflow graph directory extension must be null")
+        elif (
+            not isinstance(extension, str)
+            or not extension.startswith(".")
+            or "/" in extension
+            or "\\" in extension
+        ):
             raise ValidationError("workflow graph artifact extension must be a file extension")
         _graph_allowed_string(
             artifact,
@@ -1284,17 +1296,37 @@ def _parse_outputs(payload: Any, *, label: str) -> dict[str, StepOutput]:
         _check_fields(
             raw_output,
             allowed=OUTPUT_FIELDS,
-            required=OUTPUT_FIELDS,
+            required=frozenset({"address_scope"}),
             label=f"{label} {name!r}",
         )
-        extension = _required_string(raw_output, "extension", f"{label} {name!r} extension")
-        if not extension.startswith(".") or "/" in extension or "\\" in extension:
-            raise ValidationError(f"{label} {name!r} extension must be a file extension")
+        kind = raw_output.get("kind", "file")
+        if kind not in ("file", "directory"):
+            raise ValidationError(f"{label} {name!r} kind must be file or directory")
+        extension = None
+        if kind == "directory":
+            if "extension" in raw_output:
+                raise ValidationError(f"{label} {name!r} directory forbids extension")
+        else:
+            extension = _required_string(
+                raw_output, "extension", f"{label} {name!r} extension"
+            )
+            if (
+                not extension.startswith(".")
+                or "/" in extension
+                or "\\" in extension
+                or extension in {".", ".."}
+            ):
+                raise ValidationError(
+                    f"{label} {name!r} extension must be a file extension"
+                )
         outputs[name] = StepOutput(
             name=name,
             extension=extension,
+            kind=kind,
             address_scope=_allowed_value(
-                _required_string(raw_output, "address_scope", f"{label} {name!r} address_scope"),
+                _required_string(
+                    raw_output, "address_scope", f"{label} {name!r} address_scope"
+                ),
                 allowed=ADDRESS_SCOPES,
                 label=f"{label} {name!r} address_scope",
             ),

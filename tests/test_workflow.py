@@ -535,3 +535,99 @@ def test_graph_validation_rejects_bad_references(tmp_path: Path) -> None:
 
     with pytest.raises(ValidationError, match="unknown source artifact"):
         validate_workflow_graph(graph)
+
+
+@pytest.mark.parametrize(
+    "output,valid",
+    [
+        ({"extension": ".json", "address_scope": "entity"}, True),
+        ({"kind": "file", "extension": ".json", "address_scope": "entity"}, True),
+        ({"kind": "directory", "address_scope": "entity"}, True),
+        ({"kind": "directory", "extension": None, "address_scope": "entity"}, False),
+        ({"kind": "directory", "extension": ".zip", "address_scope": "entity"}, False),
+        ({"kind": "folder", "address_scope": "entity"}, False),
+        ({"kind": "directory"}, False),
+    ],
+)
+def test_output_kind_loader_and_compiled_graph(tmp_path, monkeypatch, output, valid):
+    from directory_support import directory_project, change_step
+
+    project, runtime = directory_project(tmp_path, monkeypatch)
+    change_step(project, "source_text", outputs={"raw_text": output})
+    if not valid:
+        with pytest.raises(ValidationError):
+            load_workflow_project(project_dir=project, context="mini")
+        return
+    loaded = load_workflow_project(project_dir=project, context="mini")
+    graph = workflow_plan_to_graph(
+        compile_workflow_plan(loaded, workflow_name="main", step_name="source_text")
+    )
+    validate_workflow_graph(graph)
+    artifact = graph["artifacts"][0]
+    assert artifact["kind"] == output.get("kind", "file")
+    assert artifact["extension"] == output.get("extension")
+
+
+def test_explicit_file_kind_keeps_public_request_and_frozen_bytes(
+    tmp_path, monkeypatch
+):
+    from directory_support import directory_project, change_step, plan, run
+    from nipact.specification_execution import compile_specification_snapshot
+    from nipact.specification_loading import ExplicitSpecificationSource
+
+    project, runtime = directory_project(tmp_path, monkeypatch)
+    assert run(project, "source_text", "sub_001").all_selected_resolved
+    request = (
+        plan(project, "source_text", "sub_001")
+        .selected_reused_output_refs[0]
+        .reuse_request.resolved_projection
+    )
+    source = project / "file-spec.yaml"
+    source.write_text(
+        yaml.safe_dump(
+            {
+                "schema": "nipact/specification-set/v1",
+                "specification_set": {"key": "files"},
+                "libraries": [],
+                "fixed": {
+                    "workflow": "main",
+                    "execution_population": "subjects",
+                    "target": {"step": "source_text", "output": "raw_text"},
+                    "results": {"text": {"step": "source_text", "output": "raw_text"}},
+                },
+                "members": [
+                    {
+                        "key": "one",
+                        "decision_coordinates": {"choice": "one"},
+                        "disposition": "included",
+                    }
+                ],
+                "expected_counts": {"candidates": 1, "included": 1, "excluded": 0},
+            }
+        )
+    )
+    before = compile_specification_snapshot(
+        project_dir=project, context="mini", source=ExplicitSpecificationSource(source)
+    ).snapshot
+    change_step(
+        project,
+        "source_text",
+        outputs={
+            "raw_text": {
+                "kind": "file",
+                "extension": ".json",
+                "address_scope": "entity",
+            }
+        },
+    )
+    after = compile_specification_snapshot(
+        project_dir=project, context="mini", source=ExplicitSpecificationSource(source)
+    ).snapshot
+    assert before.canonical_bytes == after.canonical_bytes
+    current = (
+        plan(project, "source_text", "sub_001")
+        .selected_reused_output_refs[0]
+        .reuse_request.resolved_projection
+    )
+    assert current.canonical_json == request.canonical_json
+    assert current.request_bundle_digest == request.request_bundle_digest

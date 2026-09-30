@@ -41,6 +41,8 @@ def _write_runtime_plan(
                 "declared_outputs": list(output_names),
                 "completion_receipt_path": f"receipts/{job_id}.json",
                 "outputs": outputs,
+                "output_kinds": {name: "file" for name in outputs},
+                "scheduler_outputs": outputs,
                 "inputs": {},
                 "input_records": [],
                 "params": {},
@@ -158,6 +160,7 @@ def test_runtime_resolves_prepared_reused_input(
     payload = json.loads(run_plan_path.read_text(encoding="utf-8"))
     payload["prepared_reused_inputs"] = [
         {
+            "kind": "file",
             "artifact_id": 7,
             "bound_occurrence_path": canonical.relative_to(tmp_path).as_posix(),
             "supplied_path": supplied,
@@ -170,6 +173,7 @@ def test_runtime_resolves_prepared_reused_input(
             "binding_name": "upstream",
             "input_path": supplied,
             "origin": "workflow_output",
+            "source_kind": "file",
             "registry_source_artifact_id": 7,
         }
     ]
@@ -203,6 +207,7 @@ def test_runtime_rejects_mismatched_prepared_reuse(
     if failure == "wrong_canonical_path":
         payload["prepared_reused_inputs"] = [
             {
+                "kind": "file",
                 "artifact_id": 7,
                 "bound_occurrence_path": canonical.relative_to(tmp_path).as_posix(),
                 "supplied_path": supplied,
@@ -215,6 +220,7 @@ def test_runtime_rejects_mismatched_prepared_reuse(
             "binding_name": "upstream",
             "input_path": supplied,
             "origin": "workflow_output",
+            "source_kind": "file",
             "registry_source_artifact_id": 7,
         }
     ]
@@ -251,12 +257,14 @@ def test_runtime_rejects_duplicate_input_binding_path(
             "binding_name": "upstream",
             "input_path": relative,
             "origin": "workflow_output",
+            "source_kind": "file",
             "registry_source_artifact_id": None,
         },
         {
             "binding_name": "upstream",
             "input_path": relative,
             "origin": "workflow_output",
+            "source_kind": "file",
             "registry_source_artifact_id": None,
         },
     ]

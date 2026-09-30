@@ -253,6 +253,8 @@ def _artifact_summary(artifact: RegistryArtifact) -> models.Artifact:
         output_hash=artifact.output_hash,
         file_size=artifact.file_size,
         extension=artifact.extension,
+        kind=artifact.kind,
+        digest_scheme=artifact.digest_scheme,
         subject_id=artifact.subject_id,
         session_id=artifact.session_id,
         task_name=artifact.task_name,
