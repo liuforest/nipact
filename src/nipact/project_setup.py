@@ -12,6 +12,7 @@ from typing import Any
 import yaml
 
 from .examples.colors_processing_demo import project_template as colors_template
+from .examples.directory_outputs_demo import project_template as directories_template
 from .examples.dynamic_functional_connectivity_demo import (
     project_template as dfc_template,
 )
@@ -28,11 +29,13 @@ _RUNTIME_DIRECTORIES = ("data", "database", "outputs", "manifests/generated")
 _PREPARED_DEMO_TEMPLATES = {
     fmri_template.SUPPORTED_DEMO: fmri_template,
     dfc_template.SUPPORTED_DEMO: dfc_template,
+    directories_template.SUPPORTED_DEMO: directories_template,
 }
 _SUPPORTED_DEMOS = (
     colors_template.SUPPORTED_DEMO,
     fmri_template.SUPPORTED_DEMO,
     dfc_template.SUPPORTED_DEMO,
+    directories_template.SUPPORTED_DEMO,
 )
 
 
