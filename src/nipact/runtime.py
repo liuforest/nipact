@@ -10,6 +10,8 @@ from importlib import import_module
 from pathlib import Path
 from typing import Any, Callable
 
+from .artifacts import artifact_root_matches
+
 from .execution_evidence import (
     RUN_PLAN_SCHEMA_VERSION,
     CompletionReceipt,
@@ -29,6 +31,7 @@ class _PreparedReusedInputAuthority:
     artifact_id: int
     bound_occurrence: Path
     supplied_path: str
+    kind: str
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -83,7 +86,9 @@ def run_job(*, run_plan_path: Path, job_id: str) -> None:
         address=_required_string(job, "address"),
     )
     for output_name, output_path in sorted(output_paths.items()):
-        if not output_path.is_file():
+        if not artifact_root_matches(
+            output_path, _required_mapping(job, "output_kinds")[output_name]
+        ):
             raise RuntimeError(
                 f"runtime job did not create output {output_name!r}: {output_path}"
             )
@@ -120,6 +125,10 @@ def _resolve_outputs(
     raw_outputs = _required_mapping(job, "outputs")
     if not raw_outputs:
         raise RuntimeError("job outputs must not be empty")
+    kinds = _required_mapping(job, "output_kinds")
+    scheduler_outputs = _required_mapping(job, "scheduler_outputs")
+    if set(kinds) != set(raw_outputs) or set(scheduler_outputs) != set(raw_outputs):
+        raise RuntimeError("output kinds and scheduler paths must cover outputs")
     outputs: dict[str, Path] = {}
     for raw_name, raw_path in sorted(raw_outputs.items()):
         if not isinstance(raw_name, str) or not raw_name:
@@ -132,6 +141,19 @@ def _resolve_outputs(
             allowed_root=run_workspace / "staging",
             label="job output",
         )
+        kind = kinds[raw_name]
+        if kind not in ("file", "directory"):
+            raise RuntimeError("invalid output kind")
+        scheduler = _resolve_relative_under(
+            base=run_workspace,
+            relative_path=_required_string(scheduler_outputs, raw_name),
+            allowed_root=run_workspace / "staging",
+            label="scheduler output",
+        )
+        if (kind == "file" and scheduler != output_path) or (
+            kind == "directory" and output_path != scheduler / "payload"
+        ):
+            raise RuntimeError("invalid scheduler/payload relationship")
         output_path.parent.mkdir(parents=True, exist_ok=True)
         outputs[raw_name] = output_path
     return outputs
@@ -202,7 +224,12 @@ def _resolve_input_path(
     prepared_reused_inputs: dict[int, _PreparedReusedInputAuthority],
 ) -> Path:
     origin = _required_string(record, "origin")
+    kind = _required_string(record, "source_kind")
+    if kind not in ("file", "directory"):
+        raise RuntimeError("invalid input kind")
     if origin == "source":
+        if kind != "file":
+            raise RuntimeError("external sources must be files")
         resolved_input = _resolve_relative_under(
             base=run_workspace,
             relative_path=input_path,
@@ -239,7 +266,7 @@ def _resolve_input_path(
                 raise RuntimeError(
                     "reused workflow input has no prepared input authority"
                 ) from exc
-            if input_path != prepared.supplied_path:
+            if input_path != prepared.supplied_path or kind != prepared.kind:
                 raise RuntimeError(
                     "reused workflow input path does not match prepared authority"
                 )
@@ -254,8 +281,8 @@ def _resolve_input_path(
             allowed_root=run_workspace / "staging",
             label="workflow input",
         )
-        if not resolved_input.is_file():
-            raise RuntimeError(f"missing workflow input: {input_path}")
+        if not artifact_root_matches(run_workspace / input_path, kind):
+            raise RuntimeError(f"missing or wrong-kind workflow input: {input_path}")
         return resolved_input
 
     raise RuntimeError(f"unsupported input origin: {origin}")
@@ -275,6 +302,7 @@ def _prepared_reused_input_authorities(
     for raw_entry in raw_entries:
         if not isinstance(raw_entry, dict) or set(raw_entry) != {
             "artifact_id",
+            "kind",
             "bound_occurrence_path",
             "supplied_path",
         }:
@@ -303,6 +331,7 @@ def _prepared_reused_input_authorities(
             artifact_id=artifact_id,
             bound_occurrence=bound_occurrence,
             supplied_path=supplied_path,
+            kind=_required_string(raw_entry, "kind"),
         )
 
     jobs = _required_mapping(run_plan, "jobs")
@@ -354,8 +383,12 @@ def _resolve_prepared_reused_input(
         raise RuntimeError(
             "reused workflow input does not match its bound canonical occurrence"
         )
-    if not resolved_input.is_file():
-        raise RuntimeError(f"missing reused workflow input: {prepared.supplied_path}")
+    if prepared.kind == "directory" and resolved_input == prepared.bound_occurrence:
+        raise RuntimeError("reused directories require copied delivery")
+    if not artifact_root_matches(lexical_path, prepared.kind):
+        raise RuntimeError(
+            f"missing or wrong-kind reused workflow input: {prepared.supplied_path}"
+        )
     return resolved_input
 
 

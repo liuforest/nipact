@@ -3,9 +3,14 @@
 from __future__ import annotations
 
 from pathlib import Path
+import os
+import shutil
+import stat
+import hashlib
+from typing import BinaryIO
 
 from .errors import ValidationError
-from .hashing import is_valid_digest
+from .hashing import is_valid_digest, directory_tree_digest
 from .identity import validate_hash_alias, validate_path_token
 
 STORAGE_LAYOUT_VERSION = 1
@@ -47,7 +52,8 @@ def canonical_output_path(
     request_bundle_digest: str,
     output_name: str,
     output_hash: str,
-    declared_extension: str,
+    declared_extension: str | None,
+    kind: str = "file",
 ) -> str:
     """Return the complete canonical runtime-relative path for one output."""
     directory = canonical_output_directory(
@@ -61,16 +67,83 @@ def canonical_output_path(
         address=address,
         output_hash=output_hash,
         declared_extension=declared_extension,
+        kind=kind,
     )
     return f"{directory}/{filename}"
 
 
-def output_filename(*, address: str, output_hash: str, declared_extension: str) -> str:
+def output_filename(
+    *,
+    address: str,
+    output_hash: str,
+    declared_extension: str | None,
+    kind: str = "file",
+) -> str:
     """Return the final hash-named output filename."""
     address = validate_path_token(address, label="output address")
     output_hash = validate_hash_alias(output_hash)
+    if kind == "directory" and declared_extension is None:
+        return f"{address}.{output_hash}"
+    if kind != "file":
+        raise ValidationError("invalid output kind or extension")
     _validate_declared_extension(declared_extension)
     return f"{address}.{output_hash}{declared_extension}"
+
+
+def artifact_root_matches(path: Path, kind: str) -> bool:
+    """Check only the lexical root; never enumerate a directory payload."""
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return False
+    return (kind == "directory" and stat.S_ISDIR(info.st_mode)) or (
+        kind == "file" and stat.S_ISREG(info.st_mode) and info.st_nlink == 1
+    )
+
+
+def root_observation(info: os.stat_result) -> tuple[int, ...]:
+    return (
+        info.st_dev,
+        info.st_ino,
+        info.st_mode,
+        info.st_nlink,
+        info.st_size,
+        info.st_mtime_ns,
+        info.st_ctime_ns,
+    )
+
+
+def artifact_content_facts(path: Path, kind: str) -> tuple[str, int]:
+    """Verify one quiescent payload, returning its digest and payload bytes."""
+    if kind == "directory":
+        return directory_tree_digest(path)
+    info = path.lstat()
+    if kind != "file" or not stat.S_ISREG(info.st_mode):
+        raise ValidationError(f"artifact is not a regular file: {path}")
+    if info.st_nlink != 1:
+        raise ValidationError(f"artifact has multiple hardlinks: {path}")
+    before = root_observation(path.lstat())
+    with path.open("rb") as handle:
+        if root_observation(os.fstat(handle.fileno())) != before:
+            raise ValidationError(f"artifact changed before verification: {path}")
+        digest = _sha256_open_file(handle)
+        if root_observation(os.fstat(handle.fileno())) != before:
+            raise ValidationError(f"artifact changed during verification: {path}")
+    if root_observation(path.lstat()) != before:
+        raise ValidationError(f"artifact changed during verification: {path}")
+    return digest, before[4]
+
+
+def remove_owned_path(path: Path, *, staging_root: Path) -> None:
+    """Remove a disposable staging entry without following its root symlink."""
+    if path == staging_root or not path.is_relative_to(staging_root):
+        raise ValidationError("owned output must stay below staging root")
+    if not path.parent.resolve().is_relative_to(staging_root.resolve()):
+        raise ValidationError("owned output parent escaped staging root")
+    if path.is_symlink() or path.is_file():
+        path.unlink()
+    elif path.exists():
+        shutil.rmtree(path)
 
 
 def parse_output_filename(
@@ -101,3 +174,10 @@ def _validate_declared_extension(value: object) -> str:
     if "/" in value or "\\" in value or value in {".", ".."}:
         raise ValidationError("declared extension must be a file extension")
     return value
+
+
+def _sha256_open_file(handle: BinaryIO) -> str:
+    digest = hashlib.sha256()
+    for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+        digest.update(chunk)
+    return digest.hexdigest()

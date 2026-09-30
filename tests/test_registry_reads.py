@@ -621,17 +621,17 @@ def test_project_validation_accepts_cross_workflow_membership_path(
         )
 
     target_hashes = 0
-    real_sha256_file_digest = registry.sha256_file_digest
+    real_sha256_file_digest = registry.artifact_content_facts
 
-    def count_shared_artifact_hashes(path: Path) -> str:
+    def count_shared_artifact_hashes(path: Path, kind: str):
         nonlocal target_hashes
         if path == runtime_dir / shared_path:
             target_hashes += 1
-        return real_sha256_file_digest(path)
+        return real_sha256_file_digest(path, kind)
 
     monkeypatch.setattr(
         registry,
-        "sha256_file_digest",
+        "artifact_content_facts",
         count_shared_artifact_hashes,
     )
     result = validate_project(project_dir=project_dir, context="colors")
@@ -676,6 +676,8 @@ def test_accepted_artifact_validation_hashes_shared_occurrence_once(
             len(payload),
             ".json",
             request_bundle_digest,
+            "file",
+            "sha256",
         )
         for artifact_id in (10, 11)
     ]
@@ -683,19 +685,20 @@ def test_accepted_artifact_validation_hashes_shared_occurrence_once(
         steps={"example": SimpleNamespace(outputs={"result": SimpleNamespace(extension=".json")})}
     )
     hash_calls = 0
-    real_sha256_file_digest = registry.sha256_file_digest
+    real_sha256_file_digest = registry.artifact_content_facts
 
-    def count_hashes(path: Path) -> str:
+    def count_hashes(path: Path, kind: str):
         nonlocal hash_calls
         hash_calls += 1
-        return real_sha256_file_digest(path)
+        return real_sha256_file_digest(path, kind)
 
-    monkeypatch.setattr(registry, "sha256_file_digest", count_hashes)
+    monkeypatch.setattr(registry, "artifact_content_facts", count_hashes)
     registry._validate_accepted_workflow_output_rows(
         rows,
         context="colors",
         runtime_root=tmp_path,
         loaded_workflow_project=loaded_project,
+        contracts={request_bundle_digest: _example_retained_contract()},
         verified_occurrences=set(),
     )
 
@@ -706,7 +709,7 @@ def test_accepted_artifact_validation_hashes_shared_occurrence_once(
     ("field_index", "bad_value", "message"),
     [
         (12, 999, "file size mismatch"),
-        (13, ".txt", "extension is invalid"),
+        (13, ".txt", "retained output contract"),
     ],
 )
 def test_accepted_artifact_validation_checks_size_and_extension(
@@ -748,6 +751,8 @@ def test_accepted_artifact_validation_checks_size_and_extension(
             len(payload),
             ".json",
             request_bundle_digest,
+            "file",
+            "sha256",
         )
     )
     row[field_index] = bad_value
@@ -761,6 +766,7 @@ def test_accepted_artifact_validation_checks_size_and_extension(
             context="colors",
             runtime_root=tmp_path,
             loaded_workflow_project=loaded_project,
+            contracts={request_bundle_digest: _example_retained_contract()},
             verified_occurrences=set(),
         )
 
@@ -1113,3 +1119,81 @@ def test_read_session_rejects_incompatible_schema(tmp_path: Path) -> None:
     with pytest.raises(ValidationError, match="schema version is incompatible"):
         with _open_registry_read_session(incompatible_path):
             pass
+
+
+def test_retained_file_directory_contracts_coexist_after_public_transition(
+    tmp_path, monkeypatch
+):
+    from directory_support import directory_project, run, rows, change_step
+    import yaml
+    from nipact.workflow import load_workflow_project
+
+    project, runtime = directory_project(tmp_path, monkeypatch)
+    path = project / "steps/mixed.yaml"
+    original = yaml.safe_load(path.read_text())
+    # Same callable and port, first as a legacy file; only the declaration changes.
+    module = tmp_path / "importable/directory_runtime.py"
+    module.write_text(
+        module.read_text().replace(
+            '    outputs["empty"].mkdir()',
+            '    if outputs["empty"].suffix == ".txt":\n        outputs["empty"].write_text("historical")\n    else:\n        outputs["empty"].mkdir()',
+        )
+    )
+    outputs = dict(original["outputs"])
+    outputs["empty"] = {"extension": ".txt", "address_scope": "entity"}
+    change_step(project, "mixed", outputs=outputs)
+    assert run(project, address="sub_001").all_selected_resolved
+    before = rows(runtime)
+    deps = rows(runtime, "artifact_dependencies")
+    old = next(row for row in before if row["output_name"] == "empty")
+    change_step(project, "mixed", outputs=original["outputs"])
+
+    def validate():
+        return registry.validate_prepared_registry_db(
+            runtime / "database/registry.db",
+            context="mini",
+            runtime_root=runtime,
+            loaded_workflow_project=load_workflow_project(
+                project_dir=project, context="mini"
+            ),
+        )
+
+    validate()  # old membership uses its retained file contract
+    assert run(project, address="sub_001").published_count == 3
+    validate()  # both generations, after membership replacement
+    assert [
+        row
+        for row in rows(runtime)
+        if row["artifact_id"] in {old["artifact_id"] for old in before}
+        and row["origin"] == "workflow_output"
+    ] == [row for row in before if row["origin"] == "workflow_output"]
+    assert rows(runtime, "artifact_dependencies")[: len(deps)] == deps
+    assert (runtime / old["path"]).read_text() == "historical"
+    change_step(project, "mixed", outputs=outputs)
+    assert run(project, address="sub_001").selected_reused_count == 1
+    validate()
+    with sqlite3.connect(runtime / "database/registry.db") as conn:
+        conn.execute(
+            "UPDATE artifacts SET extension='.bad' WHERE artifact_id=?",
+            (old["artifact_id"],),
+        )
+    with pytest.raises(ValidationError, match="retained output contract"):
+        validate()
+
+
+def _example_retained_contract():
+    # This fixture is metadata-only; canonical serialization is covered by golden vectors.
+    return SimpleNamespace(
+        projection=SimpleNamespace(
+            namespace="colors",
+            address="subject",
+            step_contract=SimpleNamespace(step_contract_id="example"),
+            output_contract=SimpleNamespace(
+                sibling_outputs=(
+                    SimpleNamespace(
+                        output_name="result", kind="file", declared_extension=".json"
+                    ),
+                )
+            ),
+        )
+    )

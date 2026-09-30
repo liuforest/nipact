@@ -27,6 +27,8 @@ function detail(overrides: Partial<ArtifactDetail> = {}): ArtifactDetail {
     content_digest: "a".repeat(64),
     output_hash: null,
     file_size: 12,
+    kind: "file",
+    digest_scheme: "sha256",
     extension: ".json",
     subject_id: null,
     session_id: null,
@@ -89,4 +91,12 @@ describe("ArtifactDetailPage", () => {
       screen.getByText("historical staging path (may not exist)"),
     ).toBeInTheDocument();
   });
+});
+
+it("identifies a directory and reports its scientific payload bytes", async () => {
+  renderPage(detail({ kind: "directory", extension: null, file_size: 21, digest_scheme: "nipact-directory-tree-sha256-v1" }));
+  await screen.findByText("directory");
+  expect(screen.getByText("payload bytes")).toBeInTheDocument();
+  expect(screen.getByText("21")).toBeInTheDocument();
+  expect(screen.getByText("nipact-directory-tree-sha256-v1")).toBeInTheDocument();
 });

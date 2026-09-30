@@ -664,6 +664,8 @@ def _result_projection(
         output_hash=(f"output-{artifact_id}" if present else None),
         file_size=artifact_id if present else None,
         extension=".json" if present else None,
+        kind="file" if present else None,
+        digest_scheme="sha256" if present else None,
         request_bundle_digest=(f"{artifact_id + 1:064x}" if present else None),
         current_publication_path=(
             f"outputs/{descriptor.role}.json" if present else None
@@ -884,7 +886,8 @@ def test_results_serializes_the_complete_typed_projection_without_inference(
         for failure in (attempt["failure"] for attempt in payload["attempts"])
     )
     assert all(
-        set(result) == {
+        set(result)
+        == {
             "attempt_id",
             "member_key",
             "role",
@@ -899,6 +902,8 @@ def test_results_serializes_the_complete_typed_projection_without_inference(
             "output_hash",
             "file_size",
             "extension",
+            "kind",
+            "digest_scheme",
             "request_bundle_digest",
             "current_publication_path",
         }

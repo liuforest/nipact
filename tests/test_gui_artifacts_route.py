@@ -122,3 +122,65 @@ def test_artifact_groups_route_step_filter_narrows_groups(
     assert {group["step_name"] for group in filtered} == {"color_sector_analysis"}
     filtered_total = sum(group["artifact_count"] for group in filtered)
     assert 0 < filtered_total < sum(group["artifact_count"] for group in full)
+
+
+def test_directory_inspection_is_metadata_only_and_preserves_nullable_edges(
+    tmp_path, monkeypatch
+):
+    from directory_support import directory_project, run, rows
+    import nipact.artifacts as artifact_ops
+
+    project, runtime = directory_project(tmp_path, monkeypatch)
+    assert run(project, "reader", "sub_001").all_selected_resolved
+    tree = next(row for row in rows(runtime) if row["output_name"] == "maps")
+    consumer = next(row for row in rows(runtime) if row["step_name"] == "reader")
+    client = TestClient(create_gui_app(project_dir=project, context="mini"))
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("inspection read scientific payload")
+
+    monkeypatch.setattr(artifact_ops, "artifact_content_facts", forbidden)
+    original_iterdir = __import__("pathlib").Path.iterdir
+
+    def guarded(path):
+        if path.is_relative_to(runtime / "outputs"):
+            forbidden()
+        return original_iterdir(path)
+
+    monkeypatch.setattr(__import__("pathlib").Path, "iterdir", guarded)
+    detail = client.get(f'/api/artifacts/{tree["artifact_id"]}').json()
+    assert (detail["kind"], detail["extension"], detail["file_size"]) == (
+        "directory",
+        None,
+        21,
+    )
+    assert detail["digest_scheme"] == "nipact-directory-tree-sha256-v1"
+    assert (
+        client.get("/api/artifacts/resolve", params={"path": tree["path"]}).json()[
+            "artifact_id"
+        ]
+        == tree["artifact_id"]
+    )
+    listing = client.get("/api/artifacts").json()["artifacts"]
+    assert (
+        next(row for row in listing if row["artifact_id"] == tree["artifact_id"])[
+            "kind"
+        ]
+        == "directory"
+    )
+    from nipact.trace import build_trace_graph_for_artifact_id
+
+    graph = build_trace_graph_for_artifact_id(
+        runtime / "database/registry.db",
+        artifact_id=consumer["artifact_id"],
+        context="mini",
+    )
+    assert (
+        next(
+            row
+            for row in graph["artifacts"]
+            if row["artifact_id"] == tree["artifact_id"]
+        )["extension"]
+        is None
+    )
+    assert any(edge["source_extension"] is None for edge in graph["dependencies"])

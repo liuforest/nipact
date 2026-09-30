@@ -74,7 +74,9 @@ export interface Artifact {
   content_digest: string;
   output_hash: string | null;
   file_size: number;
-  extension: string;
+  extension: string | null;
+  kind: "file" | "directory";
+  digest_scheme: string;
   subject_id: string | null;
   session_id: string | null;
   task_name: string | null;
@@ -150,7 +152,9 @@ export interface TraceArtifact {
   content_digest: string;
   output_hash: string | null;
   file_size: number;
-  extension: string;
+  extension: string | null;
+  kind: "file" | "directory";
+  digest_scheme: string;
   subject_id: string | null;
   session_id: string | null;
   task_name: string | null;
@@ -176,7 +180,7 @@ export interface TraceDependency {
   input_path: string;
   source_content_digest: string;
   source_file_size: number;
-  source_extension: string;
+  source_extension: string | null;
   source_scope?: string | null;
   source_name?: string | null;
   source_entity_id?: string | null;

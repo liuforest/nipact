@@ -102,6 +102,7 @@ class ResolvedRequestBundleProjectionV3:
 
 @dataclass(frozen=True)
 class ValidatedStoredRequestBundleProjectionV3:
+    projection: RequestBundleProjectionV3
     resolved_projection: ResolvedRequestBundleProjectionV3
     direct_upstream_request_bundle_digests: tuple[str, ...]
 
@@ -351,6 +352,7 @@ def validate_stored_request_bundle_projection_v3(
         }
     )
     return ValidatedStoredRequestBundleProjectionV3(
+        projection=projection,
         resolved_projection=resolved,
         direct_upstream_request_bundle_digests=tuple(upstream_digests),
     )

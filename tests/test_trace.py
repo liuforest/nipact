@@ -149,6 +149,8 @@ def test_trace_graph_payload_shape_is_stable_for_gui_contract(
         "output_hash",
         "file_size",
         "extension",
+        "kind",
+        "digest_scheme",
         "subject_id",
         "session_id",
         "task_name",

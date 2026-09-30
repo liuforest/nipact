@@ -88,8 +88,10 @@ function identityItems(artifact: Artifact): KeyValueItem[] {
     },
     { label: "published", value: artifact.is_published ? "yes" : "no" },
     { label: "selected output", value: artifact.is_selected_output ? "yes" : "no" },
+    { label: "kind", value: artifact.kind },
+    { label: "digest scheme", value: artifact.digest_scheme },
     { label: "extension", value: artifact.extension },
-    { label: "file size", value: artifact.file_size },
+    { label: "payload bytes", value: artifact.file_size },
     { label: "created", value: artifact.created_at },
   ];
 }

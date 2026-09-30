@@ -135,6 +135,8 @@ const graph: TraceGraphResponse = {
       content_digest: "2".repeat(64),
       output_hash: "2".repeat(16),
       file_size: 2,
+      kind: "file",
+      digest_scheme: "sha256",
       extension: ".json",
       subject_id: null,
       session_id: null,
