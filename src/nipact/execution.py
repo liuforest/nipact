@@ -8,7 +8,6 @@ from importlib import metadata
 import os
 import platform
 import shlex
-import shutil
 import subprocess
 import sys
 from dataclasses import dataclass, replace
@@ -335,6 +334,7 @@ class _PreparedReusedInput:
 class _PreparedReusedInputs:
     candidates: dict[int, ReusableArtifactCandidate]
     inputs: tuple[_PreparedReusedInput, ...]
+    copied_paths: tuple[Path, ...]
 
 
 @dataclass(frozen=True)
@@ -1015,6 +1015,19 @@ def _execute_executable_run_plan(
         ) from exc
     _emit_status(status_callback, "registry_updated")
     cleanup_warnings = _finalize_published_output_staging(published_results)
+    all_selected_resolved = all(
+        intent.outcome is not None for intent in selected_resolution_intents
+    )
+    # A registry commit can record the survivors of a partial failure; reused
+    # input copies are disposable only after the whole invocation succeeded.
+    if returncode == 0 and not failed_jobs and all_selected_resolved:
+        for path in prepared_reused_inputs.copied_paths:
+            try:
+                remove_owned_path(path, staging_root=run_plan.run_workspace / "staging")
+            except (OSError, ValidationError) as exc:
+                cleanup_warnings += (
+                    f"could not remove reused input copy {path}: {exc}",
+                )
     selected_generated_count = sum(
         intent.outcome == "generated" for intent in selected_resolution_intents
     )
@@ -1026,9 +1039,7 @@ def _execute_executable_run_plan(
         selected_generated_count=selected_generated_count,
         selected_reused_count=selected_reused_count,
         failed_jobs=failed_jobs,
-        all_selected_resolved=all(
-            intent.outcome is not None for intent in selected_resolution_intents
-        ),
+        all_selected_resolved=all_selected_resolved,
         published_bytes=published_bytes,
         cleanup_warnings=cleanup_warnings,
     )
@@ -1567,47 +1578,48 @@ def _prepare_reused_inputs(
 ) -> _PreparedReusedInputs:
     candidates = _exact_reused_candidates(run_plan)
     consumers_by_artifact = _reused_input_consumers(run_plan)
-    verified_occurrences: dict[tuple[Path, str, str, str, int], Path] = {}
-    _verify_selected_reused_outputs(
-        run_plan, candidates=candidates, verified_occurrences=verified_occurrences
-    )
     occurrence_groups: dict[
         tuple[Path, str, str, str, int],
-        list[tuple[ReusedRunJobOutputRef, ReusableArtifactCandidate, Path]],
+        list[tuple[ReusedRunJobOutputRef, ReusableArtifactCandidate]],
     ] = {}
     for output_ref in run_plan.reused_outputs:
         candidate = candidates[output_ref.source_artifact_id]
-        source_path = _verify_reused_canonical_occurrence(
-            run_plan,
-            candidate,
-            verified_occurrences=verified_occurrences,
-        )
-        occurrence_key = (
-            source_path.resolve(),
-            candidate.kind,
-            candidate.digest_scheme,
-            candidate.content_digest,
-            candidate.file_size,
+        _source_path, occurrence_key = _checked_reused_canonical_occurrence(
+            run_plan, candidate
         )
         occurrence_groups.setdefault(occurrence_key, []).append(
-            (output_ref, candidate, source_path)
+            (output_ref, candidate)
         )
+    direct_keys = {
+        occurrence_key
+        for occurrence_key, group in occurrence_groups.items()
+        if group[0][1].kind == "file"
+        and all(
+            callable_ref in _DIRECT_REUSED_INPUT_CALLABLE_REFS
+            for output_ref, _candidate in group
+            for callable_ref in consumers_by_artifact[output_ref.source_artifact_id]
+        )
+    }
+    verified_occurrences: dict[tuple[Path, str, str, str, int], Path] = {}
+    # A selected sibling that is also copied is verified by its copy pass below.
+    _verify_selected_reused_outputs(
+        run_plan,
+        candidates=candidates,
+        verified_occurrences=verified_occurrences,
+        copied_keys=occurrence_groups.keys() - direct_keys,
+    )
 
     supplied_by_artifact: dict[int, Path] = {}
-    for group in occurrence_groups.values():
-        consumer_refs = {
-            callable_ref
-            for output_ref, _candidate, _source_path in group
-            for callable_ref in consumers_by_artifact[output_ref.source_artifact_id]
-        }
-        direct = group[0][1].kind == "file" and all(
-            callable_ref in _DIRECT_REUSED_INPUT_CALLABLE_REFS
-            for callable_ref in consumer_refs
-        )
-        if direct:
-            supplied_path = group[0][2]
+    copied_paths: list[Path] = []
+    for occurrence_key, group in occurrence_groups.items():
+        if occurrence_key in direct_keys:
+            supplied_path = _verify_reused_canonical_occurrence(
+                run_plan,
+                group[0][1],
+                verified_occurrences=verified_occurrences,
+            )
         else:
-            copy_ref, copy_candidate, source_path = min(
+            copy_ref, copy_candidate = min(
                 group,
                 key=lambda item: item[0].staging_path_relative,
             )
@@ -1616,21 +1628,14 @@ def _prepare_reused_inputs(
             remove_owned_path(
                 supplied_path, staging_root=run_plan.run_workspace / "staging"
             )
-            if copy_candidate.kind == "directory":
-                shutil.copytree(source_path, supplied_path, symlinks=True)
-            else:
-                shutil.copy2(source_path, supplied_path)
-            if (
-                copy_candidate.kind == "file"
-                and supplied_path.stat().st_size != copy_candidate.file_size
-            ):
-                raise ValidationError("hydrated artifact file size mismatch")
-            digest, size = artifact_content_facts(supplied_path, copy_candidate.kind)
-            if size != copy_candidate.file_size:
-                raise ValidationError("hydrated artifact file size mismatch")
-            if digest != copy_candidate.content_digest:
-                raise ValidationError("hydrated artifact digest mismatch")
-        for output_ref, _candidate, _source_path in group:
+            _verify_reused_canonical_occurrence(
+                run_plan,
+                copy_candidate,
+                verified_occurrences=verified_occurrences,
+                copy_to=supplied_path,
+            )
+            copied_paths.append(supplied_path)
+        for output_ref, _candidate in group:
             supplied_by_artifact[output_ref.source_artifact_id] = supplied_path
 
     prepared = tuple(
@@ -1645,7 +1650,9 @@ def _prepare_reused_inputs(
         )
         for output_ref in run_plan.reused_outputs
     )
-    return _PreparedReusedInputs(candidates=candidates, inputs=prepared)
+    return _PreparedReusedInputs(
+        candidates=candidates, inputs=prepared, copied_paths=tuple(copied_paths)
+    )
 
 
 def _reused_input_consumers(
@@ -1686,6 +1693,7 @@ def _verify_selected_reused_outputs(
     *,
     candidates: dict[int, ReusableArtifactCandidate],
     verified_occurrences: dict[tuple[Path, str, str, str, int], Path],
+    copied_keys: set[tuple[Path, str, str, str, int]],
 ) -> None:
     for selected_ref in run_plan.selected_reused_output_refs:
         for output_name, planned_artifact_id in selected_ref.planned_sibling_artifact_ids:
@@ -1703,11 +1711,15 @@ def _verify_selected_reused_outputs(
                 raise ValidationError(
                     "selected reused artifact has the wrong requested coordinate"
                 )
-            _verify_reused_canonical_occurrence(
-                run_plan,
-                candidate,
-                verified_occurrences=verified_occurrences,
+            _source_path, occurrence_key = _checked_reused_canonical_occurrence(
+                run_plan, candidate
             )
+            if occurrence_key not in copied_keys:
+                _verify_reused_canonical_occurrence(
+                    run_plan,
+                    candidate,
+                    verified_occurrences=verified_occurrences,
+                )
 
 
 def _verify_reused_canonical_occurrence(
@@ -1715,8 +1727,37 @@ def _verify_reused_canonical_occurrence(
     candidate: ReusableArtifactCandidate,
     *,
     verified_occurrences: dict[tuple[Path, str, str, str, int], Path],
+    copy_to: Path | None = None,
 ) -> Path:
-    """Verify one exact frozen canonical occurrence and return its lexical path."""
+    """Verify one exact frozen canonical occurrence and return its lexical path.
+
+    With ``copy_to``, the same content pass writes the owned delivered copy.
+    """
+    lexical_path, occurrence_key = _checked_reused_canonical_occurrence(
+        run_plan, candidate
+    )
+    if copy_to is None:
+        prior = verified_occurrences.get(occurrence_key)
+        if prior is not None:
+            return prior
+    if candidate.kind == "file" and lexical_path.stat().st_size != candidate.file_size:
+        raise ValidationError("reused artifact canonical occurrence size mismatch")
+    digest, size = artifact_content_facts(
+        lexical_path, candidate.kind, copy_to=copy_to
+    )
+    if size != candidate.file_size:
+        raise ValidationError("reused artifact canonical occurrence size mismatch")
+    if digest != candidate.content_digest:
+        raise ValidationError("reused artifact canonical occurrence digest mismatch")
+    verified_occurrences[occurrence_key] = lexical_path
+    return lexical_path
+
+
+def _checked_reused_canonical_occurrence(
+    run_plan: ExecutableRunPlan,
+    candidate: ReusableArtifactCandidate,
+) -> tuple[Path, tuple[Path, str, str, str, int]]:
+    """Check occurrence metadata; return its lexical path and occurrence key."""
     if candidate.published_path != candidate.path:
         raise ValidationError("reused artifact publication path is inconsistent")
     if candidate.extension is not None and not candidate.path.endswith(
@@ -1750,25 +1791,13 @@ def _verify_reused_canonical_occurrence(
         raise ValidationError(
             f"reused artifact canonical occurrence is not a regular {candidate.kind} or has multiple links"
         )
-    occurrence_key = (
+    return lexical_path, (
         resolved_path.resolve(),
         candidate.kind,
         candidate.digest_scheme,
         candidate.content_digest,
         candidate.file_size,
     )
-    prior = verified_occurrences.get(occurrence_key)
-    if prior is not None:
-        return prior
-    if candidate.kind == "file" and lexical_path.stat().st_size != candidate.file_size:
-        raise ValidationError("reused artifact canonical occurrence size mismatch")
-    digest, size = artifact_content_facts(lexical_path, candidate.kind)
-    if size != candidate.file_size:
-        raise ValidationError("reused artifact canonical occurrence size mismatch")
-    if digest != candidate.content_digest:
-        raise ValidationError("reused artifact canonical occurrence digest mismatch")
-    verified_occurrences[occurrence_key] = lexical_path
-    return lexical_path
 
 
 def _resolve_dry_run_forecast_bundles(

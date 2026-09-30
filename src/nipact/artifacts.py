@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from pathlib import Path
 import os
 import shutil
@@ -113,10 +114,15 @@ def root_observation(info: os.stat_result) -> tuple[int, ...]:
     )
 
 
-def artifact_content_facts(path: Path, kind: str) -> tuple[str, int]:
-    """Verify one quiescent payload, returning its digest and payload bytes."""
+def artifact_content_facts(
+    path: Path, kind: str, *, copy_to: Path | None = None
+) -> tuple[str, int]:
+    """Verify one quiescent payload, returning its digest and payload bytes.
+
+    With ``copy_to``, write the verified bytes to that absent destination too.
+    """
     if kind == "directory":
-        return directory_tree_digest(path)
+        return directory_tree_digest(path, copy_to=copy_to)
     info = path.lstat()
     if kind != "file" or not stat.S_ISREG(info.st_mode):
         raise ValidationError(f"artifact is not a regular file: {path}")
@@ -126,11 +132,14 @@ def artifact_content_facts(path: Path, kind: str) -> tuple[str, int]:
     with path.open("rb") as handle:
         if root_observation(os.fstat(handle.fileno())) != before:
             raise ValidationError(f"artifact changed before verification: {path}")
-        digest = _sha256_open_file(handle)
+        with nullcontext() if copy_to is None else copy_to.open("xb") as copy:
+            digest = _sha256_open_file(handle, copy)
         if root_observation(os.fstat(handle.fileno())) != before:
             raise ValidationError(f"artifact changed during verification: {path}")
     if root_observation(path.lstat()) != before:
         raise ValidationError(f"artifact changed during verification: {path}")
+    if copy_to is not None:
+        shutil.copystat(path, copy_to)
     return digest, before[4]
 
 
@@ -176,8 +185,10 @@ def _validate_declared_extension(value: object) -> str:
     return value
 
 
-def _sha256_open_file(handle: BinaryIO) -> str:
+def _sha256_open_file(handle: BinaryIO, destination: BinaryIO | None = None) -> str:
     digest = hashlib.sha256()
     for chunk in iter(lambda: handle.read(1024 * 1024), b""):
         digest.update(chunk)
+        if destination is not None:
+            destination.write(chunk)
     return digest.hexdigest()

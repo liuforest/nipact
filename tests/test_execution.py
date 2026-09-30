@@ -1296,7 +1296,7 @@ def test_execute_run_plan_publishes_selected_outputs_without_real_snakemake(
         ),
     )
     monkeypatch.setattr(
-        "nipact.execution.shutil.copy2",
+        "shutil.copy2",
         lambda *_args, **_kwargs: pytest.fail("publication copied artifact bytes"),
     )
     events: list[str] = []
@@ -1929,7 +1929,7 @@ def test_cross_filesystem_publication_fails_without_copying(
 
     monkeypatch.setattr("nipact.execution._run_snakemake", run_then_reject_move)
     monkeypatch.setattr(
-        "nipact.execution.shutil.copy2",
+        "shutil.copy2",
         lambda *_args, **_kwargs: pytest.fail("EXDEV used a copy fallback"),
     )
 
@@ -3001,19 +3001,19 @@ def test_real_directory_scheduler_payload_and_complete_siblings(
     observed = []
     real_hash = execution_module.artifact_content_facts
 
-    def record(path, kind):
+    def record(path, kind, copy_to=None):
+        if copy_to is not None:
+            pytest.fail("fresh publication copied an output")
         observed.append((path, kind))
         return real_hash(path, kind)
 
     monkeypatch.setattr(execution_module, "artifact_content_facts", record)
     monkeypatch.setattr(
-        execution_module.shutil,
-        "copytree",
+        "shutil.copytree",
         lambda *a, **kw: pytest.fail("fresh publication copied a tree"),
     )
     monkeypatch.setattr(
-        execution_module.shutil,
-        "copy2",
+        "shutil.copy2",
         lambda *a, **kw: pytest.fail("fresh publication copied a file"),
     )
     outcome = run(project, target)

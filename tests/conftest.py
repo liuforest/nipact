@@ -314,6 +314,20 @@ def registry_v20_fixture(
     return _migrate_fixture(registry_v19_fixture)
 
 
+def forbid_reused_copies(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Fail any verify-and-copy pass; ordinary content verification still runs."""
+    import nipact.execution as execution_module
+
+    real = execution_module.artifact_content_facts
+
+    def guarded(path: Path, kind: str, *, copy_to: Path | None = None) -> object:
+        if copy_to is not None:
+            pytest.fail(f"reused artifact was copied to {copy_to}")
+        return real(path, kind)
+
+    monkeypatch.setattr(execution_module, "artifact_content_facts", guarded)
+
+
 def write_all_staged_outputs(run_plan: object) -> None:
     selected_keys = {
         (job.step_name, job.output_name, job.address)

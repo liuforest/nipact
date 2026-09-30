@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 import hashlib
 import json
 import os
 from pathlib import Path
+import shutil
 import stat
 
 from .errors import ValidationError
@@ -28,8 +30,13 @@ def sha256_file_digest(path: Path, *, chunk_size: int = 1024 * 1024) -> str:
     return digest.hexdigest()
 
 
-def directory_tree_digest(path: Path) -> tuple[str, int]:
-    """Hash a quiescent tree's exact members; return digest and payload byte size."""
+def directory_tree_digest(
+    path: Path, *, copy_to: Path | None = None
+) -> tuple[str, int]:
+    """Hash a quiescent tree's exact members; return digest and payload byte size.
+
+    With ``copy_to``, also write each checked member into that absent destination.
+    """
     records: list[list[object]] = []
     payload_size = 0
 
@@ -44,7 +51,7 @@ def directory_tree_digest(path: Path) -> tuple[str, int]:
             info.st_ctime_ns,
         )
 
-    def visit(member: Path, relative: str) -> None:
+    def visit(member: Path, relative: str, target: Path | None) -> None:
         nonlocal payload_size
         try:
             relative.encode("utf-8", errors="strict")
@@ -56,8 +63,14 @@ def directory_tree_digest(path: Path) -> tuple[str, int]:
         if stat.S_ISDIR(before.st_mode):
             if relative:
                 records.append(["directory", relative])
+            if target is not None:
+                target.mkdir()
             for child in member.iterdir():
-                visit(child, f"{relative}/{child.name}" if relative else child.name)
+                visit(
+                    child,
+                    f"{relative}/{child.name}" if relative else child.name,
+                    None if target is None else target / child.name,
+                )
         elif relative and stat.S_ISREG(before.st_mode) and before.st_nlink == 1:
             digest = hashlib.sha256()
             with member.open("rb") as handle:
@@ -65,8 +78,11 @@ def directory_tree_digest(path: Path) -> tuple[str, int]:
                     raise ValidationError(
                         f"directory member changed while hashing: {member}"
                     )
-                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-                    digest.update(chunk)
+                with nullcontext() if target is None else target.open("xb") as copy:
+                    for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                        digest.update(chunk)
+                        if copy is not None:
+                            copy.write(chunk)
                 if observation(os.fstat(handle.fileno())) != observation(before):
                     raise ValidationError(
                         f"directory member changed while hashing: {member}"
@@ -80,9 +96,11 @@ def directory_tree_digest(path: Path) -> tuple[str, int]:
             )
         if observation(member.lstat()) != observation(before):
             raise ValidationError(f"directory member changed while hashing: {member}")
+        if target is not None:
+            shutil.copystat(member, target)
 
     try:
-        visit(path, "")
+        visit(path, "", copy_to)
     except OSError as exc:
         raise ValidationError(f"cannot read directory tree {path}: {exc}") from exc
     records.sort(key=lambda record: str(record[1]).encode("utf-8"))

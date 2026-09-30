@@ -38,6 +38,8 @@ from nipact.runtime_lock import (
 from nipact.source_authority import LogicalSourceCoordinate
 from nipact.trace import build_trace_graph_for_workflow_coordinate
 
+from conftest import forbid_reused_copies
+
 
 def _write_yaml(path: Path, payload: dict[str, object]) -> None:
     path.write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")
@@ -1454,7 +1456,6 @@ def test_cross_target_run_plan_reuses_upstream_from_registry(
         output_name="b_out",
         address="sub_001",
     )
-    registered_b_digest = sha256_file_digest(runtime_dir / registered_b_path)
 
     c_plan = build_run_plan(
         project_dir=project_dir,
@@ -1483,8 +1484,7 @@ def test_cross_target_run_plan_reuses_upstream_from_registry(
     assert execute_run_plan(c_plan, cores=1).published_count == len(c_plan.published_outputs)
 
     hydrated_b = c_plan.run_workspace / "staging/b_transform/b_out/sub_001.json"
-    assert hydrated_b.is_file()
-    assert sha256_file_digest(hydrated_b) == registered_b_digest
+    assert not hydrated_b.exists()  # the verified copy is removed after success
     execution_payload = json.loads(
         (c_plan.run_workspace / "run_plan.json").read_text(encoding="utf-8")
     )
@@ -1580,12 +1580,12 @@ def test_allowlisted_consumer_uses_direct_canonical_reused_input(
         "_DIRECT_REUSED_INPUT_CALLABLE_REFS",
         frozenset({"cache_runtime:step_c_file"}),
     )
-    monkeypatch.setattr(
-        "nipact.execution.shutil.copy2",
-        lambda *_args, **_kwargs: pytest.fail("direct delivery copied reused bytes"),
-    )
+    forbid_reused_copies(monkeypatch)
 
-    assert execute_run_plan(c_plan, cores=1).all_selected_resolved
+    outcome = execute_run_plan(c_plan, cores=1)
+    assert outcome.all_selected_resolved
+    # Success cleanup never removes a directly delivered canonical occurrence.
+    assert reused_b.source_path.is_file() and outcome.cleanup_warnings == ()
 
     payload = json.loads(
         (c_plan.run_workspace / "run_plan.json").read_text(encoding="utf-8")
@@ -1723,21 +1723,22 @@ def test_reused_occurrence_disposition_covers_every_reachable_consumer(
         "_DIRECT_REUSED_INPUT_CALLABLE_REFS",
         direct_callable_refs,
     )
-    real_copy = execution_module.shutil.copy2
+    real_facts = execution_module.artifact_content_facts
     copy_calls: list[tuple[Path, Path]] = []
 
-    def record_copy(source: Path, destination: Path) -> Path:
-        copy_calls.append((Path(source), Path(destination)))
-        return Path(real_copy(source, destination))
+    def record_copy(path: Path, kind: str, *, copy_to: Path | None = None):
+        if copy_to is not None:
+            copy_calls.append((Path(path), Path(copy_to)))
+        return real_facts(path, kind, copy_to=copy_to)
 
-    monkeypatch.setattr("nipact.execution.shutil.copy2", record_copy)
+    monkeypatch.setattr(execution_module, "artifact_content_facts", record_copy)
     real_digest = artifact_ops._sha256_open_file
     canonical_hashes: list[Path] = []
 
-    def record_digest(handle: object) -> str:
+    def record_digest(handle: object, destination: object = None) -> str:
         if "outputs" in Path(handle.name).parts:
             canonical_hashes.append(Path(handle.name).resolve())  # type: ignore[attr-defined]
-        return real_digest(handle)  # type: ignore[arg-type]
+        return real_digest(handle, destination)  # type: ignore[arg-type]
 
     monkeypatch.setattr(artifact_ops, "_sha256_open_file", record_digest)
 
@@ -1779,10 +1780,7 @@ def test_cross_target_dry_run_maps_reused_upstream_without_copying(
         if path.is_file()
     }
 
-    def fail_copy(*_args: object, **_kwargs: object) -> None:
-        raise AssertionError("dry run must not copy reused artifacts")
-
-    monkeypatch.setattr("nipact.execution.shutil.copy2", fail_copy)
+    forbid_reused_copies(monkeypatch)
 
     c_plan = build_run_plan(
         project_dir=project_dir,
@@ -2265,10 +2263,10 @@ def test_real_hydration_reads_final_resolved_canonical_path(
     original_digest = artifact_ops._sha256_open_file
     hashed_paths: list[Path] = []
 
-    def recording_digest(handle: object) -> str:
+    def recording_digest(handle: object, destination: object = None) -> str:
         if "outputs" in Path(handle.name).parts:
             hashed_paths.append(Path(handle.name))  # type: ignore[attr-defined]
-        return original_digest(handle)  # type: ignore[arg-type]
+        return original_digest(handle, destination)  # type: ignore[arg-type]
 
     monkeypatch.setattr(artifact_ops, "_sha256_open_file", recording_digest)
     assert execute_run_plan(c_plan, cores=1).all_selected_resolved
@@ -3311,7 +3309,6 @@ def test_derivative_reuses_compatible_base_ancestor_artifact(
         output_name="b_out",
         address="sub_001",
     )
-    registered_b_digest = sha256_file_digest(runtime_dir / registered_b_path)
 
     derivative_c_plan = build_run_plan(
         project_dir=project_dir,
@@ -3331,8 +3328,7 @@ def test_derivative_reuses_compatible_base_ancestor_artifact(
     )
 
     hydrated_b = derivative_c_plan.run_workspace / "staging/b_transform/b_out/sub_001.json"
-    assert hydrated_b.is_file()
-    assert sha256_file_digest(hydrated_b) == registered_b_digest
+    assert not hydrated_b.exists()  # the verified copy is removed after success
     run_plan_payload = json.loads(
         (derivative_c_plan.run_workspace / "run_plan.json").read_text(encoding="utf-8")
     )
@@ -4456,9 +4452,9 @@ def test_reused_canonical_occurrence_detects_replacement_during_hash(
     real_digest = artifact_ops._sha256_open_file
     replaced = False
 
-    def replace_after_hash(handle: object) -> str:
+    def replace_after_hash(handle: object, destination: object = None) -> str:
         nonlocal replaced
-        digest = real_digest(handle)  # type: ignore[arg-type]
+        digest = real_digest(handle, destination)  # type: ignore[arg-type]
         if not replaced:
             path = Path(handle.name)  # type: ignore[attr-defined]
             content = path.read_bytes()
@@ -4932,10 +4928,7 @@ def test_targeted_selected_job_reuses_registered_equivalent_without_execution(
         "nipact.execution._run_snakemake",
         lambda *_args, **_kwargs: pytest.fail("reuse-only run invoked Snakemake"),
     )
-    monkeypatch.setattr(
-        "nipact.execution.shutil.copy2",
-        lambda *_args, **_kwargs: pytest.fail("reuse-only run copied an artifact"),
-    )
+    forbid_reused_copies(monkeypatch)
     monkeypatch.setattr(
         "nipact.execution._publish_run_outputs",
         lambda *_args, **_kwargs: pytest.fail("reuse-only run published outputs"),
@@ -4999,21 +4992,18 @@ def test_selected_multi_output_reuse_hashes_only_root_siblings_once(
 
     real_digest = artifact_ops._sha256_open_file
 
-    def record_digest(handle: object) -> str:
+    def record_digest(handle: object, destination: object = None) -> str:
         resolved = Path(handle.name).resolve()  # type: ignore[attr-defined]
         if (runtime_dir / "outputs").resolve() in resolved.parents:
             hashed_output_paths.append(resolved)
-        return real_digest(handle)  # type: ignore[arg-type]
+        return real_digest(handle, destination)  # type: ignore[arg-type]
 
     monkeypatch.setattr(artifact_ops, "_sha256_open_file", record_digest)
     monkeypatch.setattr(
         "nipact.execution._run_snakemake",
         lambda *_args, **_kwargs: pytest.fail("reuse-only run invoked Snakemake"),
     )
-    monkeypatch.setattr(
-        "nipact.execution.shutil.copy2",
-        lambda *_args, **_kwargs: pytest.fail("reuse-only run copied an artifact"),
-    )
+    forbid_reused_copies(monkeypatch)
     counts_before = _registry_row_counts(runtime_dir)
     outcome = execute_run_plan(selected_plan, cores=1)
     counts_after = _registry_row_counts(runtime_dir)
@@ -5077,10 +5067,10 @@ def test_consumed_selected_overlap_verifies_one_canonical_occurrence(
     real_digest = artifact_ops._sha256_open_file
     canonical_hashes: list[Path] = []
 
-    def record_digest(handle: object) -> str:
+    def record_digest(handle: object, destination: object = None) -> str:
         if "outputs" in Path(handle.name).parts:
             canonical_hashes.append(Path(handle.name).resolve())  # type: ignore[attr-defined]
-        return real_digest(handle)  # type: ignore[arg-type]
+        return real_digest(handle, destination)  # type: ignore[arg-type]
 
     monkeypatch.setattr(artifact_ops, "_sha256_open_file", record_digest)
     prepared = execution_module._prepare_reused_inputs(executable)
@@ -5091,6 +5081,8 @@ def test_consumed_selected_overlap_verifies_one_canonical_occurrence(
     assert prepared.inputs[0].bound_occurrence_path == output_ref.source_path
     assert prepared.inputs[0].supplied_path == output_ref.staging_path
     assert prepared.inputs[0].supplied_path.read_bytes() == output_ref.source_path.read_bytes()
+    delivered, canonical = prepared.inputs[0].supplied_path.stat(), output_ref.source_path.stat()
+    assert (delivered.st_mode, delivered.st_mtime_ns) == (canonical.st_mode, canonical.st_mtime_ns)
     assert prepared.candidates[output_ref.source_artifact_id] == output_ref.candidate
     assert prepared.inputs[0].bound_occurrence_path.is_relative_to(runtime_dir)
 
@@ -5235,7 +5227,7 @@ def test_targeted_run_reuses_valid_upstream_for_selected_entity(
     # b was hydrated from the registry, not recomputed.
     lines = log_path.read_text(encoding="utf-8").splitlines()
     assert lines.count("B sub_001") == 1
-    assert (c_plan.run_workspace / "staging/b_transform/b_out/sub_001.json").is_file()
+    assert not (c_plan.run_workspace / "staging/b_transform/b_out/sub_001.json").exists()
     c_payload = _latest_workflow_payload(
         runtime_dir,
         step_name="c_transform",
@@ -5288,7 +5280,7 @@ def test_targeted_run_excludes_reuse_needed_only_by_unreachable_jobs(
         }
     ]
     staging = c_plan.run_workspace / "staging"
-    assert (staging / "b_transform/b_out/sub_001.json").is_file()
+    assert not (staging / "b_transform/b_out/sub_001.json").exists()
     assert not (staging / "b_transform/b_out/sub_002.json").exists()
     assert not (staging / "c_transform/c_out/sub_002.json").exists()
 
@@ -5374,9 +5366,9 @@ def test_workflow_run_skips_exhaustive_validation_but_validate_remains_exhaustiv
     real_digest = execution_module.artifact_content_facts
     hashed_paths: list[Path] = []
 
-    def recording_digest(path: Path, kind: str):
+    def recording_digest(path: Path, kind: str, **kwargs):
         hashed_paths.append(Path(path))
-        return real_digest(path, kind)
+        return real_digest(path, kind, **kwargs)
 
     monkeypatch.setattr(execution_module, "artifact_content_facts", recording_digest)
     monkeypatch.setattr(registry_module, "artifact_content_facts", recording_digest)
@@ -7550,7 +7542,6 @@ def test_directory_shared_copy_scope_dry_run_and_selected_sibling_budget(
             pytest.fail("planning or dry run accessed a directory payload")
 
         guard.setattr(execution_module, "artifact_content_facts", forbidden)
-        guard.setattr(execution_module.shutil, "copytree", forbidden)
         original_iterdir = Path.iterdir
 
         def guarded_iterdir(path):
@@ -7563,43 +7554,34 @@ def test_directory_shared_copy_scope_dry_run_and_selected_sibling_budget(
             plan(project, "collect", dry_run=True)
         ).all_selected_resolved
     assert rows(runtime) == before
-    hashes, copies = [], []
-    real_hash, real_copy = (
-        execution_module.artifact_content_facts,
-        execution_module.shutil.copytree,
-    )
+    hashes = []
+    real_hash = execution_module.artifact_content_facts
 
-    def hash_payload(path, kind):
-        hashes.append((path, kind))
-        return real_hash(path, kind)
+    def hash_payload(path, kind, copy_to=None):
+        hashes.append((path, kind, copy_to))
+        return real_hash(path, kind, copy_to=copy_to)
 
-    def copy_tree(source, destination, *args, **kwargs):
-        if Path(source).parent.name == "maps":
-            copies.append((Path(source), Path(destination)))
-        return real_copy(source, destination, *args, **kwargs)
+    def tree_passes():
+        return [(path, copy_to) for path, kind, copy_to in hashes if kind == "directory"]
 
     monkeypatch.setattr(execution_module, "artifact_content_facts", hash_payload)
-    monkeypatch.setattr(execution_module.shutil, "copytree", copy_tree)
     monkeypatch.setattr(
         execution_module,
         "_DIRECT_REUSED_INPUT_CALLABLE_REFS",
         frozenset({"directory_runtime:read"}),
     )
     assert run(project, "reader", "sub_001").all_selected_resolved
-    canonical_trees = [
-        path
-        for path, kind in hashes
-        if kind == "directory" and path.is_relative_to(runtime / "outputs")
-    ]
-    assert len(canonical_trees) == 1
-    assert "/sub_001/" in canonical_trees[0].as_posix()
-    assert len(copies) == 1
+    # One pass over the canonical tree, and it writes the delivered copy.
+    [(canonical_tree, copied_tree)] = tree_passes()
+    assert canonical_tree.is_relative_to(runtime / "outputs")
+    assert "/sub_001/" in canonical_tree.as_posix()
+    assert copied_tree is not None and not copied_tree.exists()
     hashes.clear()
-    copies.clear()
     assert run(project, "collect").all_selected_resolved
     # Two cohort trees, shared between the second reader and collector; never direct.
-    assert len(copies) == 2
-    assert len([1 for path, kind in hashes if kind == "directory"]) == 4
+    copies = tree_passes()
+    assert len(copies) == 2 and all(copied is not None for _, copied in copies)
+    assert not any(copied.exists() for _, copied in copies)
     dependency_rows = rows(runtime, "artifact_dependencies")
     latest_run = rows(runtime, "workflow_runs")[-1]["run_id"]
     generated_ids = {
@@ -7619,20 +7601,21 @@ def test_directory_shared_copy_scope_dry_run_and_selected_sibling_budget(
             destination.relative_to(workspace).as_posix()
         }
     hashes.clear()
-    copies.clear()
     assert run(project, "collect").all_selected_resolved
-    assert len(hashes) == 1 and hashes[0][1] == "file" and not copies
+    assert len(hashes) == 1 and hashes[0][1:] == ("file", None)
     hashes.clear()
     assert run(project, "mixed", "sub_001").all_selected_resolved
-    assert len(hashes) == 3 and sorted(kind for _, kind in hashes) == [
+    assert len(hashes) == 3 and sorted(kind for _, kind, _ in hashes) == [
         "directory",
         "directory",
         "file",
     ]
-    assert not copies
+    assert all(copy_to is None for _, _, copy_to in hashes)
 
 
-@pytest.mark.parametrize("corruption", ["same_size", "membership", "unconsumed"])
+@pytest.mark.parametrize(
+    "corruption", ["same_size", "membership", "unconsumed", "hardlink"]
+)
 def test_directory_corruption_rejected_before_consumption_or_membership(
     tmp_path, monkeypatch, corruption
 ):
@@ -7647,10 +7630,13 @@ def test_directory_corruption_rejected_before_consumption_or_membership(
     timestamp = root.stat()
     if corruption == "same_size":
         (root / "nested/deep/value.txt").write_text("omega")
+    elif corruption == "hardlink":
+        # Same bytes; a copy would launder the link into an independent file.
+        os.link(root / "nested/deep/value.txt", tmp_path / "outside_link")
     else:
         (root / "new_empty").mkdir()
     os.utime(root, ns=(timestamp.st_atime_ns, timestamp.st_mtime_ns))
-    with pytest.raises(ValidationError, match="(digest|size) mismatch"):
+    with pytest.raises(ValidationError, match="(digest|size) mismatch|single-link"):
         run(project, "mixed" if corruption == "unconsumed" else "reader", "sub_001")
     assert [row for row in rows(runtime) if row["origin"] == "workflow_output"] == [
         row for row in before if row["origin"] == "workflow_output"
@@ -7681,15 +7667,48 @@ def test_directory_selected_consumed_overlap_verifies_occurrence_once(
     hashes = []
     real_hash = execution_module.artifact_content_facts
 
-    def record(path, kind):
-        hashes.append(path)
-        return real_hash(path, kind)
+    def record(path, kind, copy_to=None):
+        hashes.append((path, copy_to))
+        return real_hash(path, kind, copy_to=copy_to)
 
     monkeypatch.setattr(execution_module, "artifact_content_facts", record)
     prepared = execution_module._prepare_reused_inputs(executable)
     assert len(prepared.inputs) == 1
-    assert hashes.count(reused.source_path) == 1
-    assert len(hashes) == 4  # all three canonical siblings, one delivered tree
+    # Three canonical siblings once each; the consumed tree's pass writes its copy.
+    assert len(hashes) == 3
+    assert [copy_to for path, copy_to in hashes if path == reused.source_path] == [
+        prepared.inputs[0].supplied_path
+    ]
+
+
+def test_directory_reused_copies_retained_after_partial_failure(
+    tmp_path, monkeypatch
+):
+    from directory_support import directory_project, run, rows
+    from nipact.runtime import run_job
+
+    project, runtime = directory_project(tmp_path, monkeypatch)
+    assert run(project).all_selected_resolved
+    copies = []
+
+    def reader_sub_001_only(executable, **kwargs):
+        copies.extend(ref.staging_path for ref in executable.reused_outputs)
+        for job in executable.jobs:
+            if (job.step_name, job.address) == ("reader", "sub_001"):
+                run_job(
+                    run_plan_path=executable.run_workspace / "run_plan.json",
+                    job_id=job.job_id,
+                )
+        return 1
+
+    monkeypatch.setattr(execution_module, "_run_snakemake", reader_sub_001_only)
+    outcome = run(project, "collect")
+    # The survivor is committed, but a registry commit alone is not success.
+    assert outcome.failed_jobs and not outcome.all_selected_resolved
+    assert [row["address"] for row in rows(runtime) if row["step_name"] == "reader"] == [
+        "sub_001"
+    ]
+    assert len(copies) == 2 and all(path.is_dir() for path in copies)
 
 
 def test_directory_deterministic_divergence_rolls_back_entire_bundle(
