@@ -56,7 +56,7 @@ def build_parser() -> argparse.ArgumentParser:
     init_parser.add_argument(
         "--demo",
         required=True,
-        help="Packaged demo name. Supported demos: colors, fmri, dfc.",
+        help="Packaged demo name. Supported demos: colors, fmri, dfc, directories.",
     )
     init_parser.add_argument(
         "--project-dir",

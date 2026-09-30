@@ -245,3 +245,44 @@ jobs:
           assert results['result_source_basis']
           print('installed-wheel specification reuse smoke ok')
           PY
+          mkdir -p demos/directories/project demos/directories/runtime
+          nipact init --demo directories --project-dir demos/directories/project --runtime-dir demos/directories/runtime
+          nipact validate --context directories
+          nipact workflow run --context directories --workflow base --step map_summary --dry-run
+          nipact workflow run --context directories --workflow base --step map_summary --cores 1
+          nipact workflow run --context directories --workflow low-label --step map_summary --cores 1
+          nipact validate --context directories
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          import subprocess
+
+          runtime = Path('demos/directories/runtime')
+
+          def trace(workflow, step, output, address):
+              graph = json.loads(subprocess.check_output([
+                  'nipact', 'trace', '--context', 'directories', '--workflow', workflow,
+                  '--step', step, '--output', output, '--address', address, '--json',
+              ], text=True))
+              selected = [artifact for artifact in graph['artifacts'] if artifact['is_selected']]
+              assert len(selected) == 1, selected
+              return graph, selected[0]
+
+          trees = []
+          for address in ('sub_001', 'sub_002'):
+              _, tree = trace('base', 'segment_image', 'maps', address)
+              root = runtime / tree['path']
+              assert root.is_dir(), root
+              assert (tree['kind'], tree['digest_scheme'], tree['extension']) == (
+                  'directory', 'nipact-directory-tree-sha256-v1', None), tree
+              assert sorted(path.name for path in root.iterdir()) == ['label-high.npy', 'label-low.npy']
+              assert tree['file_size'] == sum(path.stat().st_size for path in root.iterdir())
+              trees.append(tree['artifact_id'])
+
+          graph, summary = trace('low-label', 'map_summary', 'summary', 'cohort')
+          edges = [edge for edge in graph['dependencies']
+                   if edge['dependent_artifact_id'] == summary['artifact_id']]
+          assert sorted(edge['source_artifact_id'] for edge in edges) == sorted(trees), edges
+          assert all(edge['is_reused_input'] and edge['source_extension'] is None for edge in edges), edges
+          print('installed-wheel directory example ok')
+          PY
