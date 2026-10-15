@@ -1171,7 +1171,11 @@ def _load_step(path: Path, *, manifest_names: set[str]) -> StepDefinition:
         has_workflow_inputs=bool(inputs),
         label=f"step {step_name} source_inputs",
     )
-    outputs = _parse_outputs(payload["outputs"], label=f"step {step_name} outputs")
+    outputs = _parse_outputs(
+        payload["outputs"],
+        address_scope=address_scope,
+        label=f"step {step_name} outputs",
+    )
     manifest_binding = _parse_manifest_binding(
         payload.get("manifest_binding"),
         manifest_names=manifest_names,
@@ -1282,7 +1286,9 @@ def _parse_source_inputs(
     return tuple(source_inputs)
 
 
-def _parse_outputs(payload: Any, *, label: str) -> dict[str, StepOutput]:
+def _parse_outputs(
+    payload: Any, *, address_scope: str, label: str
+) -> dict[str, StepOutput]:
     if not isinstance(payload, Mapping):
         raise ValidationError(f"{label} must be a mapping")
     if not payload:
@@ -1319,17 +1325,22 @@ def _parse_outputs(payload: Any, *, label: str) -> dict[str, StepOutput]:
                 raise ValidationError(
                     f"{label} {name!r} extension must be a file extension"
                 )
+        output_scope = _allowed_value(
+            _required_string(
+                raw_output, "address_scope", f"{label} {name!r} address_scope"
+            ),
+            allowed=ADDRESS_SCOPES,
+            label=f"{label} {name!r} address_scope",
+        )
+        if output_scope != address_scope:
+            raise ValidationError(
+                f"{label} {name!r} address_scope must match step address_scope"
+            )
         outputs[name] = StepOutput(
             name=name,
             extension=extension,
             kind=kind,
-            address_scope=_allowed_value(
-                _required_string(
-                    raw_output, "address_scope", f"{label} {name!r} address_scope"
-                ),
-                allowed=ADDRESS_SCOPES,
-                label=f"{label} {name!r} address_scope",
-            ),
+            address_scope=output_scope,
         )
     return outputs
 
