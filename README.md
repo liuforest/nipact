@@ -22,10 +22,10 @@ Work in Progress:
 
 ## Installation
 
-The current source-checkout pre-release is `0.0.1a16`. Install release in a clean environment with:
+The current source-checkout pre-release is `0.0.1a17`. Install release in a clean environment with:
 
 ```bash
-python -m pip install nipact==0.0.1a16
+python -m pip install nipact==0.0.1a17
 nipact --version
 ```
 
@@ -78,7 +78,7 @@ nipact specifications results FULL_SNAPSHOT_DIGEST --context analysis
 
 ## Shorter declarations
 
-**Unreleased, available in the current source checkout:** repeated names, output scopes, and empty variant overrides can be omitted. For example, `steps/segment_image.yaml` can contain:
+**Available from `0.0.1a17`:** repeated names, output scopes, and empty variant overrides can be omitted. For example, `steps/segment_image.yaml` can contain:
 
 ```yaml
 step_contract_version: "1"
