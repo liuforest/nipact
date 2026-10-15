@@ -76,6 +76,35 @@ nipact specifications results FULL_SNAPSHOT_DIGEST --context analysis
 
 `freeze`, `run`, and `results` require the current registry schema, V20; see [Registry upgrade to V20](#registry-upgrade-to-v20). V1 supports finite static members, reconciles the selected source scope before each ordinary member execution, executes members sequentially, requires every declared result role for completeness, and treats a rerun as a new attempt. It provides JSON records, not statistical interpretation, campaign scheduling, or campaign management.
 
+## Shorter declarations
+
+**Unreleased, available in the current source checkout:** repeated names, output scopes, and empty variant overrides can be omitted. For example, `steps/segment_image.yaml` can contain:
+
+```yaml
+step_contract_version: "1"
+pattern_kind: pattern_a
+execution_role: transform
+address_scope: entity
+callable: nipact.examples.directory_outputs_demo.runtime:segment_image_directory
+params: {low_threshold: 4.0, high_threshold: 10.0}
+inputs:
+  raw_image: {artifact: image_source.raw_image, dependency_role: source_input}
+outputs:
+  volumes: {extension: .json}
+  maps: {kind: directory}
+```
+
+An omitted `step_name` comes from the step file's stem (`segment_image` here). An omitted `workflow_name` comes from its registration key in `nipact.yaml`, even when the workflow filename differs. File and directory outputs inherit the step's explicit `address_scope` when their own scope is omitted. Written names and output scopes must still match those authorities.
+
+A variant registered as `small-cohort` can contain only:
+
+```yaml
+base_workflow: base
+execution_population: small
+```
+
+The base workflow and population must be declared as usual. Omitting `step_overrides` supplies an empty local mapping, preserving inherited overrides; explicit `{}` has the same meaning. These defaults apply only to absent fields: explicit `null` remains invalid for `step_name`, `workflow_name`, output `address_scope`, and variant `step_overrides`. Existing `inputs: null` and `params: null` still mean empty mappings. Generated demos keep the explicit declarations.
+
 ## Directory outputs
 
 A step output can be a regular file or one complete directory tree, and one step can declare both. Directory outputs are new after `0.0.1a15` and require registry V20.
@@ -90,7 +119,7 @@ outputs:
     address_scope: entity
 ```
 
-**Declaration.** `kind` is `file` (the default) or `directory`. A directory output needs `address_scope` and must not declare `extension`. Omitting `kind` and writing `kind: file` are the same declaration, so existing file steps keep their identities, paths, and reuse. Each output's `address_scope`, for files and directories, must equal its step's `address_scope`; project loading rejects a mismatch in any step file, including a step that no workflow uses.
+**Declaration.** `kind` is `file` (the default) or `directory`. A directory output must not declare `extension`. In the current source checkout, an omitted output `address_scope` inherits the step's scope (see [Shorter declarations](#shorter-declarations)); earlier releases require it explicitly. Omitting `kind` and writing `kind: file` are the same declaration, so existing file steps keep their identities, paths, and reuse. Each output's `address_scope`, for files and directories, must equal its step's `address_scope`; project loading rejects a mismatch in any step file, including a step that no workflow uses.
 
 **Callable contract.** The callable interface is unchanged. For a directory output, `outputs[name]` is a `Path` that does not exist yet; NIPACT creates only its parent, and the callable creates and finishes the tree before returning. For a directory input, `inputs[name]` holds one `Path` per tree, and the callable reads members by relative path, such as `inputs["maps"][0] / "label-high.npy"`. Callables must not modify their inputs.
 

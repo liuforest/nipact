@@ -121,6 +121,120 @@ def test_generated_colors_demo_workflow_files_load(tmp_path: Path) -> None:
     }
 
 
+@pytest.mark.parametrize("demo", ["colors", "fmri", "dfc", "directories"])
+def test_omitted_declaration_fields_preserve_loaded_project(
+    tmp_path: Path, demo: str
+) -> None:
+    project_dir = tmp_path / "project"
+    init_project(
+        demo=demo,
+        project_dir=project_dir,
+        runtime_dir=tmp_path / "runtime",
+        context=demo,
+    )
+    config_path = project_dir / "nipact.yaml"
+    config = _read_yaml(config_path)
+    (project_dir / "workflows/base.yaml").rename(
+        project_dir / "workflows/base-declaration.yaml"
+    )
+    config["workflows"]["base"] = "workflows/base-declaration.yaml"
+    if demo == "colors":
+        config["workflows"]["inherited-qc-target"] = (
+            "workflows/inherited-qc-target.yaml"
+        )
+        _write_yaml(
+            project_dir / "workflows/inherited-qc-target.yaml",
+            {
+                "workflow_name": "inherited-qc-target",
+                "base_workflow": "red-qc-target",
+                "step_overrides": {},
+            },
+        )
+    _write_yaml(config_path, config)
+
+    explicit = load_workflow_project(project_dir=project_dir, context=demo)
+    if demo == "colors":
+        assert explicit.workflows["inherited-qc-target"].step_overrides[
+            "color_candidate_select"
+        ].params["qc_target_theta"] == 0.0
+
+    for step_path in (project_dir / "steps").glob("*.yaml"):
+        payload = _read_yaml(step_path)
+        del payload["step_name"]
+        for output in payload["outputs"].values():
+            del output["address_scope"]
+        _write_yaml(step_path, payload)
+    for workflow_file in config["workflows"].values():
+        workflow_path = project_dir / workflow_file
+        payload = _read_yaml(workflow_path)
+        del payload["workflow_name"]
+        if payload.get("step_overrides") == {}:
+            del payload["step_overrides"]
+        _write_yaml(workflow_path, payload)
+
+    shortened = load_workflow_project(project_dir=project_dir, context=demo)
+    assert shortened == explicit
+
+
+@pytest.mark.parametrize(
+    "declaration,field,values,diagnostic",
+    [
+        (
+            "steps/color_source.yaml", "step_name", [None, "", False],
+            "step color_source.yaml step_name must be a non-empty string",
+        ),
+        (
+            "workflows/base.yaml", "workflow_name", [None, "", False],
+            "workflow base workflow_name must be a non-empty string",
+        ),
+        (
+            "workflows/red-qc-target.yaml", "workflow_name", [None, "", False],
+            "workflow red-qc-target workflow_name must be a non-empty string",
+        ),
+        (
+            "steps/color_source.yaml", "address_scope", [None, "", False],
+            "outputs 'source_color' address_scope must be a non-empty string",
+        ),
+        (
+            "workflows/red-qc-target.yaml", "step_overrides", [None, [], False],
+            "workflow red-qc-target step_overrides must be a mapping",
+        ),
+        (
+            "steps/color_source.yaml", "step_name", ["different-source"],
+            "must match file name",
+        ),
+        (
+            "workflows/base.yaml", "workflow_name", ["different-base"],
+            "must match configured workflow",
+        ),
+        (
+            "workflows/red-qc-target.yaml", "workflow_name", ["different-variant"],
+            "must match configured workflow",
+        ),
+        (
+            "steps/color_source.yaml", "address_scope", ["unsupported"],
+            "address_scope must be one of",
+        ),
+    ],
+)
+def test_loader_rejects_invalid_supplied_defaultable_fields(
+    tmp_path: Path,
+    declaration: str,
+    field: str,
+    values: list[object],
+    diagnostic: str,
+) -> None:
+    project_dir, _runtime_dir = _init_demo(tmp_path)
+    path = project_dir / declaration
+    payload = _read_yaml(path)
+    target = payload["outputs"]["source_color"] if field == "address_scope" else payload
+    for value in values:
+        target[field] = value
+        _write_yaml(path, payload)
+        with pytest.raises(ValidationError, match=diagnostic):
+            _load(project_dir)
+
+
 def test_step_contract_version_is_loaded_and_compiled(tmp_path: Path) -> None:
     project_dir, _runtime_dir = _init_demo(tmp_path)
     step_path = project_dir / "steps/color_source.yaml"
@@ -574,7 +688,7 @@ def test_graph_validation_rejects_bad_references(tmp_path: Path) -> None:
         ({"kind": "directory", "extension": None, "address_scope": "entity"}, False),
         ({"kind": "directory", "extension": ".zip", "address_scope": "entity"}, False),
         ({"kind": "folder", "address_scope": "entity"}, False),
-        ({"kind": "directory"}, False),
+        ({"kind": "directory"}, True),
     ],
 )
 def test_output_kind_loader_and_compiled_graph(tmp_path, monkeypatch, output, valid):
