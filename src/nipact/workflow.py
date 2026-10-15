@@ -33,7 +33,6 @@ STEP_FIELDS = frozenset(
 )
 REQUIRED_STEP_FIELDS = frozenset(
     {
-        "step_name",
         "pattern_kind",
         "execution_role",
         "address_scope",
@@ -48,13 +47,11 @@ MANIFEST_BINDING_FIELDS = frozenset({"role", "manifest"})
 BASE_WORKFLOW_FIELDS = frozenset(
     {"workflow_name", "execution_population", "steps"}
 )
-REQUIRED_BASE_WORKFLOW_FIELDS = frozenset({"workflow_name", "steps"})
+REQUIRED_BASE_WORKFLOW_FIELDS = frozenset({"steps"})
 VARIANT_WORKFLOW_FIELDS = frozenset(
     {"workflow_name", "base_workflow", "execution_population", "step_overrides"}
 )
-REQUIRED_VARIANT_WORKFLOW_FIELDS = frozenset(
-    {"workflow_name", "base_workflow", "step_overrides"}
-)
+REQUIRED_VARIANT_WORKFLOW_FIELDS = frozenset({"base_workflow"})
 WORKFLOW_STEP_FIELDS = frozenset({"step_name", "output_name"})
 REQUIRED_WORKFLOW_STEP_FIELDS = frozenset({"step_name"})
 OVERRIDE_FIELDS = frozenset({"params"})
@@ -1137,6 +1134,7 @@ def _load_step(path: Path, *, manifest_names: set[str]) -> StepDefinition:
         required=REQUIRED_STEP_FIELDS,
         label=f"step {path.name}",
     )
+    payload.setdefault("step_name", path.stem)
     step_name = validate_path_token(
         _required_string(payload, "step_name", f"step {path.name} step_name"),
         label="step_name",
@@ -1302,7 +1300,7 @@ def _parse_outputs(
         _check_fields(
             raw_output,
             allowed=OUTPUT_FIELDS,
-            required=frozenset({"address_scope"}),
+            required=frozenset(),
             label=f"{label} {name!r}",
         )
         kind = raw_output.get("kind", "file")
@@ -1325,13 +1323,15 @@ def _parse_outputs(
                 raise ValidationError(
                     f"{label} {name!r} extension must be a file extension"
                 )
-        output_scope = _allowed_value(
-            _required_string(
-                raw_output, "address_scope", f"{label} {name!r} address_scope"
-            ),
-            allowed=ADDRESS_SCOPES,
-            label=f"{label} {name!r} address_scope",
-        )
+        output_scope = address_scope
+        if "address_scope" in raw_output:
+            output_scope = _allowed_value(
+                _required_string(
+                    raw_output, "address_scope", f"{label} {name!r} address_scope"
+                ),
+                allowed=ADDRESS_SCOPES,
+                label=f"{label} {name!r} address_scope",
+            )
         if output_scope != address_scope:
             raise ValidationError(
                 f"{label} {name!r} address_scope must match step address_scope"
@@ -1393,6 +1393,7 @@ def _parse_params(payload: Any, *, label: str) -> dict[str, Any]:
 
 def _load_workflow(path: Path, *, configured_name: str) -> WorkflowDefinition:
     payload = _load_yaml_mapping(path, label=str(path))
+    payload.setdefault("workflow_name", configured_name)
     workflow_name = validate_path_token(
         _required_string(payload, "workflow_name", f"workflow {configured_name} workflow_name"),
         label="workflow_name",
@@ -1444,7 +1445,7 @@ def _load_workflow(path: Path, *, configured_name: str) -> WorkflowDefinition:
         steps=(),
         step_outputs={},
         step_overrides=_parse_overrides(
-            payload["step_overrides"],
+            payload.get("step_overrides", {}),
             label=f"workflow {workflow_name} step_overrides",
         ),
         source_path=path,
