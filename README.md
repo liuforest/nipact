@@ -90,7 +90,7 @@ outputs:
     address_scope: entity
 ```
 
-**Declaration.** `kind` is `file` (the default) or `directory`. A directory output needs `address_scope` and must not declare `extension`. Omitting `kind` and writing `kind: file` are the same declaration, so existing file steps keep their identities, paths, and reuse.
+**Declaration.** `kind` is `file` (the default) or `directory`. A directory output needs `address_scope` and must not declare `extension`. Omitting `kind` and writing `kind: file` are the same declaration, so existing file steps keep their identities, paths, and reuse. Each output's `address_scope`, for files and directories, must equal its step's `address_scope`; project loading rejects a mismatch in any step file, including a step that no workflow uses.
 
 **Callable contract.** The callable interface is unchanged. For a directory output, `outputs[name]` is a `Path` that does not exist yet; NIPACT creates only its parent, and the callable creates and finishes the tree before returning. For a directory input, `inputs[name]` holds one `Path` per tree, and the callable reads members by relative path, such as `inputs["maps"][0] / "label-high.npy"`. Callables must not modify their inputs.
 

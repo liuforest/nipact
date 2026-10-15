@@ -527,7 +527,6 @@ def _build_executable_run_plan(
 ) -> ExecutableRunPlan:
     """Finalize one exact job/reuse graph from prepared source authority."""
     selected_step = _plan_step(plan, plan.selected_step_name)
-    _validated_step_outputs(selected_step)
     selected_output = selected_step.outputs[plan.selected_output_name]
     run_workspace = (
         loaded.runtime_root
@@ -2817,7 +2816,7 @@ def _build_jobs(
         loaded.runtime_root / REGISTRY_DB_PATH
     ) as registry_session:
         for step in plan.steps:
-            outputs = _validated_step_outputs(step)
+            outputs = step.outputs
             addresses = _step_addresses(plan, step)
             for address in addresses:
                 if (step.step_name, address) not in selected_coordinates:
@@ -3535,30 +3534,15 @@ def _step_addresses(
     plan: WorkflowPlan,
     step: WorkflowPlanStep,
 ) -> tuple[str, ...]:
-    output_scope = next(iter(_validated_step_outputs(step).values())).address_scope
-    if output_scope == "entity":
+    if step.address_scope == "entity":
         population = _required_execution_population(plan)
         return tuple(
             validate_path_token(entity_id, label="entity_id")
             for entity_id in population.entity_ids
         )
-    if output_scope == "cohort":
+    if step.address_scope == "cohort":
         return ("cohort",)
-    raise ValidationError(f"unsupported address_scope: {output_scope!r}")
-
-
-def _validated_step_outputs(step: WorkflowPlanStep) -> dict[str, Any]:
-    output_scopes = {output.address_scope for output in step.outputs.values()}
-    if len(output_scopes) != 1:
-        raise ValidationError(
-            f"step {step.step_name!r} outputs must share one address_scope"
-        )
-    output_scope = next(iter(output_scopes))
-    if output_scope != step.address_scope:
-        raise ValidationError(
-            f"step {step.step_name!r} output address_scope must match step address_scope"
-        )
-    return dict(step.outputs)
+    raise ValidationError(f"unsupported address_scope: {step.address_scope!r}")
 
 
 def _job_id(step_name: str, address: str, outputs: dict[str, Any]) -> str:

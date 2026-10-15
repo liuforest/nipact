@@ -304,6 +304,34 @@ def test_population_free_cohort_only_workflow_is_valid(tmp_path: Path) -> None:
     assert plan.manifest_bindings == ()
 
 
+def test_loader_rejects_output_scope_mismatch_in_unused_step(tmp_path: Path) -> None:
+    project_dir, _runtime_dir = _init_demo(tmp_path)
+    _write_yaml(
+        project_dir / "steps/unused_summary.yaml",
+        {
+            "step_name": "unused_summary",
+            "step_contract_version": "1",
+            "pattern_kind": "analysis",
+            "execution_role": "analysis",
+            "address_scope": "cohort",
+            "callable": (
+                "nipact.examples.colors_processing_demo.runtime:"
+                "color_sector_analysis_file"
+            ),
+            "outputs": {
+                "counts": {"extension": ".json", "address_scope": "cohort"},
+                "table": {"extension": ".json", "address_scope": "entity"},
+            },
+        },
+    )
+
+    with pytest.raises(
+        ValidationError,
+        match="outputs 'table' address_scope must match step address_scope",
+    ):
+        _load(project_dir)
+
+
 def test_loader_rejects_reserved_source_population_role(tmp_path: Path) -> None:
     project_dir, _runtime_dir = _init_demo(tmp_path)
     step_path = project_dir / "steps/color_source.yaml"
