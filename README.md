@@ -22,10 +22,10 @@ Work in Progress:
 
 ## Installation
 
-The current source-checkout pre-release is `0.0.1a17`. Install release in a clean environment with:
+The current source-checkout pre-release is `0.0.1a18`. Install release in a clean environment with:
 
 ```bash
-python -m pip install nipact==0.0.1a17
+python -m pip install nipact==0.0.1a18
 nipact --version
 ```
 
@@ -61,7 +61,7 @@ specifications:
   analysis-curve: specifications/analysis-curve.yaml
 ```
 
-Specification sets and libraries remain explicitly registered with `specifications` and `specification_libraries`. The current source checkout rejects the old `sources`, `steps`, `workflows` and `manifests` configuration keys; this layout change is unreleased.
+Specification sets and libraries remain explicitly registered with `specifications` and `specification_libraries`. The current source checkout rejects the old `sources`, `steps`, `workflows` and `manifests` configuration keys; this layout change is available from `0.0.1a18`.
 
 To migrate an existing project, inventory the direct declaration files first and check that the old `sources.index`, `steps.directory`, workflow map and manifest map exactly match the conventional names and paths. Then remove those four obsolete top-level sections, preserving `context`, `paths.runtime`, specification registrations, filenames, scientific declarations and nonempty overrides. Move unwanted declarations outside the direct discovery directories; a nested `parked/` directory is supported. Removing repeated names, output scopes and empty local overrides is optional for projects already using the conventional layout. Run `nipact validate --context CONTEXT --project-dir /path/to/project`; add `--outputs` when you want to re-hash accepted output contents.
 
