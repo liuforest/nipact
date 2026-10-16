@@ -95,6 +95,11 @@ def build_parser() -> argparse.ArgumentParser:
         required=True,
         help="Context name expected in nipact.yaml.",
     )
+    validate_parser.add_argument(
+        "--outputs",
+        action="store_true",
+        help="Re-hash all accepted workflow outputs, including directory contents.",
+    )
 
     gui_parser = subparsers.add_parser(
         "gui",
@@ -1122,6 +1127,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             result = validate_project(
                 project_dir=project_dir,
                 context=args.context,
+                verify_outputs=args.outputs,
             )
             print(f"context={result.context}")
             print(f"project_root={_display_path(result.project_root)}")
@@ -1137,8 +1143,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             elif result.registry_error is not None:
                 print(f"registry  invalid  {' '.join(result.registry_error.split())}")
             else:
+                verification = (
+                    "all accepted output contents verified"
+                    if args.outputs
+                    else "contents not re-hashed; use --outputs"
+                )
                 print(
-                    f"registry  {result.published_outputs} published outputs  valid  contents verified"
+                    f"registry  {result.published_outputs} published outputs  valid  {verification}"
                 )
             if result.success:
                 _print_pass("PASS: validate")

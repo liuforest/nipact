@@ -5301,7 +5301,7 @@ def test_targeted_run_unaffected_by_same_size_corruption_outside_closure(
     assert c_payload == {"address": "sub_001", "value": "alpha-b-c"}
 
 
-def test_workflow_run_skips_exhaustive_validation_but_validate_remains_exhaustive(
+def test_workflow_run_skips_exhaustive_validation_but_validate_outputs_is_exhaustive(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
@@ -5368,6 +5368,25 @@ def test_workflow_run_skips_exhaustive_validation_but_validate_remains_exhaustiv
         main(
             [
                 "validate",
+                "--project-dir",
+                str(project_dir),
+                "--context",
+                "cache",
+            ]
+        )
+        == 0
+    )
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    assert "contents not re-hashed; use --outputs" in captured.out
+    assert "PASS: validate" in captured.out
+    assert hashed_paths == []
+
+    assert (
+        main(
+            [
+                "validate",
+                "--outputs",
                 "--project-dir",
                 str(project_dir),
                 "--context",

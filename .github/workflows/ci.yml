@@ -149,7 +149,7 @@ jobs:
           nipact --version
           nipact --help
           nipact init --demo colors --project-dir demos/colors/project --runtime-dir demos/colors/runtime
-          nipact validate --context colors
+          nipact validate --context colors --outputs
           nipact workflow list --context colors
           nipact workflow steps --context colors --workflow base
           nipact workflow plan --context colors --workflow base --step color_sector_analysis
@@ -247,11 +247,11 @@ jobs:
           PY
           mkdir -p demos/directories/project demos/directories/runtime
           nipact init --demo directories --project-dir demos/directories/project --runtime-dir demos/directories/runtime
-          nipact validate --context directories
+          nipact validate --context directories --outputs
           nipact workflow run --context directories --workflow base --step map_summary --dry-run
           nipact workflow run --context directories --workflow base --step map_summary --cores 1
           nipact workflow run --context directories --workflow low-label --step map_summary --cores 1
-          nipact validate --context directories
+          nipact validate --context directories --outputs
           python - <<'PY'
           import json
           from pathlib import Path

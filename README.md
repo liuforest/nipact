@@ -121,6 +121,8 @@ The base workflow and population must be declared as usual. Omitting `step_overr
 
 Malformed declarations remain visible in `nipact validate`, which lists each step, workflow and manifest as `valid`, `invalid` or `unavailable` and exits nonzero if any declaration or registry check fails. Unavailable declarations name the original invalid file. Commands that load declarations warn about unusable files and can select unrelated valid workflows; selecting an unusable workflow fails with its root cause. A runtime without a registry reports `registry  not initialized`.
 
+By default, validation checks registry metadata, retained output contracts, canonical paths, output existence and kind, and regular-file size without reading output contents or walking directory payloads. `nipact validate --outputs` also re-hashes every accepted workflow output in the context, including older outputs with no current published membership and all directory contents. Both modes check that same accepted-output scope; the count on the registry line is the number of current published outputs. A same-size file alteration or a change inside a directory can pass default validation and fail with `--outputs`.
+
 ## Directory outputs
 
 A step output can be a regular file or one complete directory tree, and one step can declare both. Directory outputs are new after `0.0.1a15` and require registry V20.
@@ -143,7 +145,7 @@ outputs:
 
 **Content identity.** Every member is content, including hidden files and empty directories; timestamps, permissions, and ownership are not. Symbolic links, hard-linked files, special files, and member names that are not valid UTF-8 are rejected. The digest scheme `nipact-directory-tree-sha256-v1` is fixed by the kind. `file_size`, shown as payload bytes, is the sum of member file sizes. A directory's canonical path under `outputs/v1/` has no suffix.
 
-**Reuse and cost.** A consumer depends on the whole tree. A reused tree consumed by fresh work is verified and copied in one pass, with one copy per tree per workflow invocation. After the whole invocation succeeds, NIPACT removes its copies; cleanup errors produce warnings and may leave copies behind. A failed invocation keeps its copies. Each specification member has its own invocation and cleanup. A rerun that only reuses a selected result verifies its complete sibling bundle, including every tree. `nipact validate` hashes every accepted output in the context, so it reads all stored trees.
+**Reuse and cost.** A consumer depends on the whole tree. A reused tree consumed by fresh work is verified and copied in one pass, with one copy per tree per workflow invocation. After the whole invocation succeeds, NIPACT removes its copies; cleanup errors produce warnings and may leave copies behind. A failed invocation keeps its copies. Each specification member has its own invocation and cleanup. A rerun that only reuses a selected result verifies its complete sibling bundle, including every tree. `nipact validate --outputs` hashes every accepted output in the context, so it reads all stored trees; default validation checks their roots without walking their contents.
 
 **Limits.** Directories cannot be `sources.yaml` sources. There are no per-member dependencies and no partial-tree reuse, and reused directories are not delivered in place. Staging and `outputs/` must be on the same filesystem, and extremely deep trees (about 1,000 nested levels) are unsupported.
 
@@ -175,7 +177,7 @@ nipact workflow run \
 - Snakemake schedules a disposable `directory()` container, and the callable writes `payload/` inside it, so scheduler bookkeeping never enters the artifact.
 - Registry V20 adds artifact `kind` and `digest_scheme` and allows a NULL extension for directories.
 - Measured I/O: on two sessions of real segmentation maps (1.11 GB of directory payload; local ext4 with 98 GB RAM; Snakemake 9.14.6), verifying while copying cut logical reused-input preparation reads from 3.32 GB to 1.11 GB. Copy bytes retained after success fell from 1.11 GB to 0. Warm preparation took 0.84 s instead of 1.36 s. With the payload evicted from the page cache it took 2.12 s instead of 1.86 s, 14% slower, and this was accepted. These are delivery timings on one host, not processing times.
-- Deferred for separate decisions: declared in-place delivery of reused inputs, narrower verification on zero-fresh reruns, a quick metadata-only `validate`, sharing verification across specification members, and copy-on-write copies.
+- Deferred for separate decisions: declared in-place delivery of reused inputs, narrower verification on zero-fresh reruns, sharing verification across specification members, and copy-on-write copies.
 
 ## Registry upgrade to V20
 

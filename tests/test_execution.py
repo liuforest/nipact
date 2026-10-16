@@ -1417,7 +1417,7 @@ def test_execute_run_plan_publishes_selected_outputs_without_real_snakemake(
     assert main(["validate", "--project-dir", str(project_dir), "--context", "colors"]) == 0
     cli_output = capsys.readouterr().out
     assert (
-        f"registry  {len(run_plan.published_outputs)} published outputs  valid  contents verified"
+        f"registry  {len(run_plan.published_outputs)} published outputs  valid  contents not re-hashed; use --outputs"
         in cli_output
     )
 
@@ -1580,7 +1580,7 @@ def test_tiny_non_colors_run_registers_used_sources_and_trace(
         == 0
     )
     assert (
-        "registry  4 published outputs  valid  contents verified"
+        "registry  4 published outputs  valid  contents not re-hashed; use --outputs"
         in capsys.readouterr().out
     )
 
