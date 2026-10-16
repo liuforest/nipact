@@ -124,18 +124,6 @@ def _write_generic_prepared_project(
             "paths": {
                 "runtime": "../generic_runtime",
             },
-            "sources": {
-                "index": "sources.yaml",
-            },
-            "manifests": {
-                "subjects": "manifests/subjects.yaml",
-            },
-            "steps": {
-                "directory": "steps",
-            },
-            "workflows": {
-                "main": "workflows/main.yaml",
-            },
         },
     )
     _write_yaml(
@@ -229,7 +217,7 @@ def _assert_validate_passes(
     assert "validated_manifests=2" in output
     assert "parsed_workflow_files=2" in output
     assert "parsed_step_files=8" in output
-    assert "source_entities=200" in output
+    assert "source_entities=0" in output
     assert "published_outputs=0" in output
     assert "PASS: validate" in output
 
@@ -474,13 +462,7 @@ def test_init_creates_project_runtime_databases_and_validates(
         assert step_payload["step_contract_version"] == "1"
 
     config = _read_project_config(project_dir)
-    assert config["sources"] == {
-        "index": "sources.yaml",
-    }
-    assert config["manifests"] == {
-        "init": "manifests/init.yaml",
-        "demo-40": "manifests/demo-40.yaml",
-    }
+    assert config == {"context": "colors", "paths": {"runtime": "../runtime"}}
     source_index = yaml.safe_load(
         (project_dir / "sources.yaml").read_text(encoding="utf-8")
     )
@@ -576,6 +558,18 @@ def test_init_creates_project_runtime_databases_and_validates(
 
     _assert_validate_passes(project_dir, capsys)
 
+    _write_yaml(
+        project_dir / "workflows/extra.yaml",
+        {"base_workflow": "base"},
+    )
+    assert (
+        main(["validate", "--project-dir", str(project_dir), "--context", "colors"])
+        == 0
+    )
+    output = capsys.readouterr().out
+    assert "parsed_workflow_files=3" in output
+    assert "PASS: validate" in output
+
 
 def test_registry_manifest_values_deduplicate_and_reject_key_collisions(
     tmp_path: Path,
@@ -660,8 +654,7 @@ def test_init_creates_prepared_neuro_demo_project_and_registry(
         assert step_payload["step_contract_version"] == "1"
 
     config = _read_project_config(project_dir)
-    assert config["sources"] == {"index": "sources.yaml"}
-    assert config["manifests"] == template.manifest_paths()
+    assert config == {"context": demo, "paths": {"runtime": f"../{demo}_runtime"}}
     assert sorted(
         path.relative_to(runtime_dir).as_posix()
         for path in runtime_dir.glob("data/**/*.npy")
@@ -925,18 +918,10 @@ def test_registry_projection_observation_and_membership_constraints(
 
 
 def _move_init_manifest_outside_project(project_dir: Path, runtime_dir: Path) -> None:
-    config = _read_project_config(project_dir)
-    manifests = config["manifests"]
-    assert isinstance(manifests, dict)
-    manifests["init"] = "../outside.yaml"
-    _write_project_config(project_dir, config)
-
-
-def _change_source_content(project_dir: Path, runtime_dir: Path) -> None:
-    source_path = runtime_dir / "data/color_source.json"
-    source_payload = json.loads(source_path.read_text(encoding="utf-8"))
-    source_payload["records"][0]["value"] = 0.123
-    source_path.write_text(json.dumps(source_payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    manifest_path = project_dir / "manifests/init.yaml"
+    outside_path = project_dir.parent / "outside.yaml"
+    manifest_path.rename(outside_path)
+    manifest_path.symlink_to(outside_path)
 
 
 def _insert_projection_with_missing_upstream(project_dir: Path, runtime_dir: Path) -> None:
@@ -995,24 +980,13 @@ def _set_published_output_path(runtime_dir: Path, output_artifact_path: str) -> 
     [
         pytest.param(
             lambda project_dir, runtime_dir: (project_dir / "manifests/init.yaml").unlink(),
-            "missing manifest file",
+            "references unknown manifest: init",
             id="missing-manifest",
         ),
-        # Leaves the Colors template shape, so the generic loader guard fires.
         pytest.param(
             _move_init_manifest_outside_project,
             "must stay inside project dir",
             id="manifest-escape",
-        ),
-        pytest.param(
-            lambda project_dir, runtime_dir: (runtime_dir / "data/color_source.json").unlink(),
-            "missing JSON file",
-            id="missing-source-data",
-        ),
-        pytest.param(
-            _change_source_content,
-            "source data content",
-            id="changed-source-content",
         ),
         pytest.param(
             lambda project_dir, runtime_dir: (runtime_dir / "database/registry.db").write_text(

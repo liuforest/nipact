@@ -162,18 +162,6 @@ def uppercase_text_file(*, inputs, outputs, params, address):
             "paths": {
                 "runtime": "../mini_runtime",
             },
-            "sources": {
-                "index": "sources.yaml",
-            },
-            "manifests": {
-                "subjects": "manifests/subjects.yaml",
-            },
-            "steps": {
-                "directory": "steps",
-            },
-            "workflows": {
-                "main": "workflows/main.yaml",
-            },
         },
     )
     _write_yaml(
@@ -353,19 +341,6 @@ def consume_qc_file(*, inputs, outputs, params, address):
             "context": "multi",
             "paths": {
                 "runtime": "../multi_runtime",
-            },
-            "sources": {
-                "index": "sources.yaml",
-            },
-            "manifests": {
-                "subjects": "manifests/subjects.yaml",
-            },
-            "steps": {
-                "directory": "steps",
-            },
-            "workflows": {
-                "import_raw": "workflows/import_raw.yaml",
-                "consume_qc": "workflows/consume_qc.yaml",
             },
         },
     )

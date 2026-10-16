@@ -378,13 +378,6 @@ def write_compact_colors_project(tmp_path: Path) -> tuple[Path, Path]:
         "nipact.yaml": {
             "context": "colors",
             "paths": {"runtime": "../runtime"},
-            "sources": {"index": "sources.yaml"},
-            "manifests": {"init": "manifests/init.yaml"},
-            "steps": {"directory": "steps"},
-            "workflows": {
-                "base": "workflows/base.yaml",
-                "red-qc-target": "workflows/red-qc-target.yaml",
-            },
         },
         "sources.yaml": {"global": {"colors_source": "data/color_source.json"}},
         "manifests/init.yaml": {

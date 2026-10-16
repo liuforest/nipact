@@ -68,17 +68,6 @@ def project_config(*, context: str, runtime: str) -> dict[str, Any]:
         "paths": {
             "runtime": runtime,
         },
-        "sources": {
-            "index": SOURCE_INDEX_PATH,
-        },
-        "workflows": {
-            BASE_WORKFLOW_NAME: "workflows/base.yaml",
-            VARIANT_WORKFLOW_NAME: "workflows/low-label.yaml",
-        },
-        "steps": {
-            "directory": "steps",
-        },
-        "manifests": manifest_paths(),
     }
 
 

@@ -105,19 +105,6 @@ def later(*, inputs, outputs, params, address):
         {
             "context": "adapter",
             "paths": {"runtime": "../runtime"},
-            "sources": {"index": "sources.yaml"},
-            "manifests": {
-                "subjects": "manifests/subjects.yaml",
-                "selected": "manifests/selected.yaml",
-                "empty_fit": "manifests/empty_fit.yaml",
-            },
-            "steps": {"directory": "steps"},
-            "workflows": {
-                "base": "workflows/base.yaml",
-                "alternative": "workflows/alternative.yaml",
-                "direct_a": "workflows/direct_a.yaml",
-                "direct_b": "workflows/direct_b.yaml",
-            },
         },
     )
     _write_yaml(

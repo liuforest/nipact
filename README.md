@@ -49,6 +49,20 @@ Run the Python tests:
 python -m pytest
 ```
 
+## Project layout
+
+The current source checkout reads `sources.yaml` and direct `.yaml` files in `steps/`, `workflows/` and `manifests/`. File stems name steps, workflows and manifests; nested directories can hold parked files. Keep the context and runtime explicit in `nipact.yaml`:
+
+```yaml
+context: analysis
+paths:
+  runtime: ../runtime
+specifications:
+  analysis-curve: specifications/analysis-curve.yaml
+```
+
+Specification sets and libraries remain explicitly registered with `specifications` and `specification_libraries`. The current source checkout rejects the old `sources`, `steps`, `workflows` and `manifests` configuration keys; this layout change is unreleased.
+
 ## Specification sets
 
 The current source checkout includes specification sets as an optional finite overlay on ordinary workflows. A project can continue to define and run only steps and workflows; specification declarations are loaded only when a `specifications` command selects a registered key or an explicit file.
@@ -94,9 +108,9 @@ outputs:
   maps: {kind: directory}
 ```
 
-An omitted `step_name` comes from the step file's stem (`segment_image` here). An omitted `workflow_name` comes from its registration key in `nipact.yaml`, even when the workflow filename differs. File and directory outputs inherit the step's explicit `address_scope` when their own scope is omitted. Written names and output scopes must still match those authorities.
+An omitted `step_name` comes from the step file's stem (`segment_image` here). An omitted `workflow_name` comes from the workflow file's stem. File and directory outputs inherit the step's explicit `address_scope` when their own scope is omitted. Written names and output scopes must still match those authorities.
 
-A variant registered as `small-cohort` can contain only:
+A variant in `workflows/small-cohort.yaml` can contain only:
 
 ```yaml
 base_workflow: base
