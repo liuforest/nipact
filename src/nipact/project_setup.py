@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
 from dataclasses import dataclass
 import json
 import os
@@ -20,7 +19,7 @@ from .examples.fmri_preprocessing_demo import project_template as fmri_template
 from .errors import ValidationError
 from .hashing import sha256_digest, short_hash
 from .identity import validate_path_token
-from .manifest import Manifest, load_manifest
+from .manifest import Manifest
 from . import registry
 
 
@@ -200,117 +199,14 @@ def _init_prepared_demo_project(
 
 
 def validate_project(*, project_dir: Path, context: str) -> ValidateResult:
-    context = _validate_context(context)
-    project_root = project_dir.expanduser().resolve()
-    if not project_root.is_dir():
-        raise ProjectSetupError(f"project dir does not exist: {project_dir}")
-
-    config = _read_yaml_mapping(project_root / "nipact.yaml")
-    if config.get("context") != context:
-        raise ProjectSetupError(f"context mismatch in nipact.yaml: expected {context!r}")
-
-    runtime_root = _resolve_runtime_root(project_root, config)
+    loaded_workflow_project = _load_workflow_project(project_dir, context=context)
+    project_root = loaded_workflow_project.project_root
+    runtime_root = loaded_workflow_project.runtime_root
+    context = loaded_workflow_project.context
     if not runtime_root.is_dir():
         raise ProjectSetupError(f"runtime dir does not exist: {runtime_root}")
     _validate_project_runtime_roots(project_root, runtime_root)
 
-    if _is_colors_template_candidate(config):
-        return _validate_colors_project(
-            project_root=project_root,
-            runtime_root=runtime_root,
-            context=context,
-            config=config,
-        )
-    return _validate_generic_prepared_project(
-        project_root=project_root,
-        runtime_root=runtime_root,
-        context=context,
-    )
-
-
-def _validate_colors_project(
-    *,
-    project_root: Path,
-    runtime_root: Path,
-    context: str,
-    config: dict[str, Any],
-) -> ValidateResult:
-    manifest_paths, step_dir, workflow_paths = _validate_project_config(
-        project_root,
-        config,
-    )
-    manifests = _validate_manifest_files(manifest_paths)
-    _validate_yaml_directory(
-        step_dir,
-        expected_names=set(colors_template.step_files()),
-    )
-    _validate_yaml_files(
-        workflow_paths,
-        expected_names=set(colors_template.workflow_files()),
-        label="workflow reference",
-    )
-    loaded_workflow_project = _load_workflow_project(project_root, context=context)
-    step_count = len(loaded_workflow_project.steps)
-    workflow_count = len(loaded_workflow_project.workflows)
-    _validate_colors_source_declarations(loaded_workflow_project)
-
-    source_path = _resolve_runtime_file(
-        runtime_root,
-        colors_template.SOURCE_ARTIFACT_PATH,
-        "source data",
-    )
-    registry_db_path = _resolve_runtime_file(
-        runtime_root,
-        registry.REGISTRY_DB_PATH,
-        "registry database",
-    )
-
-    source_payload = _read_json_mapping(source_path)
-    try:
-        source_entities = colors_template.validate_source_payload(
-            source_payload,
-            manifests=manifests,
-        )
-    except ValidationError as exc:
-        raise ProjectSetupError(str(exc)) from exc
-    source_digest = _json_digest(source_payload)
-    if source_digest != _json_digest(colors_template.source_payload()):
-        raise ProjectSetupError("source data content does not match colors demo")
-
-    try:
-        registry_counts = registry.validate_registry_db(
-            registry_db_path,
-            project_root=project_root,
-            runtime_root=runtime_root,
-            manifest_paths=manifest_paths,
-            context=context,
-            manifests=manifests,
-            loaded_workflow_project=loaded_workflow_project,
-        )
-    except ValidationError as exc:
-        raise ProjectSetupError(str(exc)) from exc
-    if registry_counts["manifests"] != len(manifests):
-        raise ProjectSetupError("registry manifest row count mismatch")
-
-    return ValidateResult(
-        project_root=project_root,
-        runtime_root=runtime_root,
-        context=context,
-        manifest_count=len(manifests),
-        workflow_count=workflow_count,
-        step_count=step_count,
-        source_entities=source_entities,
-        published_outputs=registry_counts["published_outputs"],
-    )
-
-
-def _validate_generic_prepared_project(
-    *,
-    project_root: Path,
-    runtime_root: Path,
-    context: str,
-) -> ValidateResult:
-    loaded_workflow_project = _load_workflow_project(project_root, context=context)
     published_outputs = 0
     registry_db_path = runtime_root / registry.REGISTRY_DB_PATH
     if registry_db_path.exists():
@@ -348,34 +244,6 @@ def _load_workflow_project(project_root: Path, *, context: str) -> Any:
         )
     except ValidationError as exc:
         raise ProjectSetupError(str(exc)) from exc
-
-
-def _is_colors_template_candidate(config: Mapping[str, Any]) -> bool:
-    manifests_config = config.get("manifests")
-    workflows_config = config.get("workflows")
-    steps_config = config.get("steps")
-    if not isinstance(manifests_config, Mapping):
-        return False
-    if not isinstance(workflows_config, Mapping):
-        return False
-    if not isinstance(steps_config, Mapping):
-        return False
-    if steps_config.get("directory") != "steps":
-        return False
-    return _contains_expected_paths(
-        manifests_config,
-        colors_template.manifest_paths(),
-    ) and _contains_expected_paths(
-        workflows_config,
-        {name: f"workflows/{name}.yaml" for name in colors_template.workflow_files()},
-    )
-
-
-def _contains_expected_paths(
-    config: Mapping[str, Any],
-    expected: Mapping[str, str],
-) -> bool:
-    return all(config.get(name) == path for name, path in expected.items())
 
 
 def _prepared_demo_template(demo: str) -> Any | None:
@@ -461,187 +329,12 @@ def _runtime_config_value(project_root: Path, runtime_root: Path, runtime_arg: P
         return str(runtime_root)
 
 
-def _validate_project_config(
-    project_root: Path,
-    config: dict[str, Any],
-) -> tuple[dict[str, Path], Path, dict[str, Path]]:
-    manifests_config = config.get("manifests")
-    if not isinstance(manifests_config, dict):
-        raise ProjectSetupError("nipact.yaml missing manifests")
-    manifest_paths: dict[str, Path] = {}
-    expected_manifest_paths = colors_template.manifest_paths()
-    extra_manifests = sorted(set(manifests_config) - set(expected_manifest_paths))
-    if extra_manifests:
-        raise ProjectSetupError(
-            "nipact.yaml contains unexpected manifest reference(s): "
-            + ", ".join(extra_manifests)
-        )
-    for name in sorted(expected_manifest_paths):
-        entry = manifests_config.get(name)
-        if not isinstance(entry, str) or not entry:
-            raise ProjectSetupError(f"nipact.yaml missing manifest reference: {name}")
-        manifest_paths[name] = _resolve_project_file(
-            project_root,
-            entry,
-            f"manifest reference {name!r}",
-        )
-
-    steps_config = config.get("steps")
-    if (
-        not isinstance(steps_config, dict)
-        or not isinstance(steps_config.get("directory"), str)
-        or not steps_config["directory"]
-    ):
-        raise ProjectSetupError("nipact.yaml missing steps.directory")
-    step_dir = _resolve_project_file(
-        project_root,
-        steps_config["directory"],
-        "steps.directory",
-    )
-
-    workflows_config = config.get("workflows")
-    if not isinstance(workflows_config, dict):
-        raise ProjectSetupError("nipact.yaml missing workflows")
-    expected_workflow_files = colors_template.workflow_files()
-    extra_workflows = sorted(set(workflows_config) - set(expected_workflow_files))
-    if extra_workflows:
-        raise ProjectSetupError(
-            "nipact.yaml contains unexpected workflow reference(s): "
-            + ", ".join(extra_workflows)
-        )
-    workflow_paths: dict[str, Path] = {}
-    for name in sorted(expected_workflow_files):
-        raw_path = workflows_config.get(name)
-        if not isinstance(raw_path, str) or not raw_path:
-            raise ProjectSetupError(f"nipact.yaml missing workflow reference: {name}")
-        workflow_paths[name] = _resolve_project_file(
-            project_root,
-            raw_path,
-            f"workflow reference {name!r}",
-        )
-    return manifest_paths, step_dir, workflow_paths
-
-
-def _validate_colors_source_declarations(loaded_workflow_project: Any) -> None:
-    expected_global = {
-        colors_template.SOURCE_BINDING_NAME: colors_template.SOURCE_ARTIFACT_PATH,
-    }
-    if loaded_workflow_project.source_index.global_bindings != expected_global:
-        raise ProjectSetupError("colors source declarations do not match expected source index")
-    if loaded_workflow_project.source_index.entity_bindings != {}:
-        raise ProjectSetupError("colors source declarations must not include entity bindings")
-    try:
-        source_step = loaded_workflow_project.steps["color_source"]
-    except KeyError as exc:
-        raise ProjectSetupError(
-            "colors source declarations are missing color_source step"
-        ) from exc
-    if source_step.source_inputs != (colors_template.SOURCE_BINDING_NAME,):
-        raise ProjectSetupError(
-            "colors source declarations do not match color_source source_inputs"
-        )
-
-
-def _resolve_project_file(project_root: Path, raw_path: Any, label: str) -> Path:
-    if not isinstance(raw_path, str):
-        raise ProjectSetupError(f"{label} must be a string")
-    relative_path = Path(raw_path).expanduser()
-    if relative_path.is_absolute():
-        raise ProjectSetupError(f"{label} must be relative to project dir")
-    resolved = (project_root / relative_path).resolve()
-    if not _path_contains_or_same(project_root, resolved):
-        raise ProjectSetupError(f"{label} must stay inside project dir")
-    return resolved
-
-
 def _path_contains_or_same(parent: Path, child: Path) -> bool:
     try:
         child.relative_to(parent)
     except ValueError:
         return False
     return True
-
-
-def _validate_manifest_files(manifest_paths: dict[str, Path]) -> dict[str, Manifest]:
-    manifests: dict[str, Manifest] = {}
-    for name in sorted(colors_template.manifest_paths()):
-        try:
-            manifests[name] = load_manifest(manifest_paths[name])
-        except ValidationError as exc:
-            raise ProjectSetupError(str(exc)) from exc
-    return manifests
-
-
-def _validate_yaml_directory(path: Path, *, expected_names: set[str]) -> int:
-    if not path.is_dir():
-        raise ProjectSetupError(f"missing directory: {path}")
-    files = {file.stem: file for file in path.glob("*.yaml")}
-    missing = sorted(expected_names - set(files))
-    if missing:
-        raise ProjectSetupError(f"missing YAML files in {path.name}: {', '.join(missing)}")
-    extra = sorted(set(files) - expected_names)
-    if extra:
-        raise ProjectSetupError(f"unexpected YAML files in {path.name}: {', '.join(extra)}")
-    for file in files.values():
-        _read_yaml_mapping(file)
-    return len(files)
-
-
-def _validate_yaml_files(
-    paths: dict[str, Path],
-    *,
-    expected_names: set[str],
-    label: str,
-) -> int:
-    missing = sorted(expected_names - set(paths))
-    if missing:
-        raise ProjectSetupError(f"missing configured YAML files: {', '.join(missing)}")
-    for name in expected_names:
-        if not paths[name].is_file():
-            raise ProjectSetupError(f"{label} {name!r} does not exist: {paths[name]}")
-        _read_yaml_mapping(paths[name])
-    return len(paths)
-
-
-def _resolve_runtime_file(runtime_root: Path, relative_path: str, label: str) -> Path:
-    resolved = (runtime_root / relative_path).resolve()
-    if not _path_contains_or_same(runtime_root, resolved):
-        raise ProjectSetupError(f"{label} must stay inside runtime dir")
-    return resolved
-
-
-def _resolve_runtime_root(project_root: Path, config: dict[str, Any]) -> Path:
-    paths = config.get("paths")
-    if not isinstance(paths, dict) or not isinstance(paths.get("runtime"), str) or not paths["runtime"]:
-        raise ProjectSetupError("nipact.yaml missing paths.runtime")
-    runtime_path = Path(paths["runtime"]).expanduser()
-    if runtime_path.is_absolute():
-        return runtime_path.resolve()
-    return (project_root / runtime_path).resolve()
-
-
-def _read_yaml_mapping(path: Path) -> dict[str, Any]:
-    if not path.is_file():
-        raise ProjectSetupError(f"missing YAML file: {path}")
-    try:
-        payload = yaml.safe_load(path.read_text(encoding="utf-8"))
-    except yaml.YAMLError as exc:
-        raise ProjectSetupError(f"invalid YAML file {path}: {exc}") from exc
-    if not isinstance(payload, dict):
-        raise ProjectSetupError(f"YAML file must contain a mapping: {path}")
-    return payload
-
-
-def _read_json_mapping(path: Path) -> dict[str, Any]:
-    if not path.is_file():
-        raise ProjectSetupError(f"missing JSON file: {path}")
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError as exc:
-        raise ProjectSetupError(f"invalid JSON file {path}: {exc}") from exc
-    if not isinstance(payload, dict):
-        raise ProjectSetupError(f"JSON file must contain an object: {path}")
-    return payload
 
 
 def _write_yaml(path: Path, payload: dict[str, Any]) -> None:

@@ -76,7 +76,6 @@ IDENTITY_STATUSES = frozenset(
 )
 TERMINAL_STEP_KINDS = frozenset({"pattern_a", "pattern_b_barrier", "analysis"})
 MANIFEST_BINDING_SOURCES = frozenset({"explicit", "defaulted", "requested"})
-SOURCE_CONFIG_FIELDS = frozenset({"index"})
 SOURCE_INDEX_FIELDS = frozenset({"global", "entities"})
 SOURCE_PATH_PREFIX = "data/"
 PATH_GLOB_CHARS = frozenset("*?[]{}")
@@ -213,38 +212,34 @@ def load_workflow_project(*, project_dir: Path, context: str) -> LoadedWorkflowP
         raise ValidationError(f"project dir does not exist: {project_dir}")
 
     config = _load_yaml_mapping(project_root / "nipact.yaml", label="nipact.yaml")
+    _check_fields(
+        config,
+        allowed=frozenset({"context", "paths", "specifications", "specification_libraries"}),
+        required=frozenset(),
+        label="nipact.yaml",
+    )
     parse_specification_registrations(config)
     if _required_string(config, "context", "nipact.yaml context") != context:
         raise ValidationError(f"context mismatch in nipact.yaml: expected {context!r}")
     runtime_root = _runtime_root(project_root, config)
     source_index = _load_source_index(
-        _configured_source_index(project_root, config),
+        _resolve_project_path(project_root, "sources.yaml", label="sources.yaml"),
         runtime_root=runtime_root,
     )
 
-    manifest_paths = _configured_project_files(
-        project_root=project_root,
-        config=config,
-        section="manifests",
-        label="manifest reference",
-    )
+    manifest_paths = _discover_project_files(project_root, "manifests")
     manifests = {
         name: _load_manifest(path, label=f"manifest {name!r}")
         for name, path in sorted(manifest_paths.items())
     }
 
-    step_dir = _configured_step_dir(project_root, config)
-    steps = _load_steps(step_dir, manifests=manifests)
-
-    workflow_paths = _configured_project_files(
-        project_root=project_root,
-        config=config,
-        section="workflows",
-        label="workflow reference",
-    )
+    steps = {
+        name: _load_step(path, name=name, manifest_names=set(manifests))
+        for name, path in _discover_project_files(project_root, "steps").items()
+    }
     raw_workflows = {
-        name: _load_workflow(path, configured_name=name)
-        for name, path in sorted(workflow_paths.items())
+        name: _load_workflow(path, name=name)
+        for name, path in _discover_project_files(project_root, "workflows").items()
     }
     workflows = _resolve_workflows(raw_workflows, steps=steps)
     _validate_execution_population_names(workflows, manifests=manifests)
@@ -905,41 +900,6 @@ def _runtime_root(project_root: Path, config: Mapping[str, Any]) -> Path:
     return (project_root / runtime_path).resolve()
 
 
-def _configured_source_index(project_root: Path, config: Mapping[str, Any]) -> Path:
-    sources = config.get("sources")
-    if not isinstance(sources, Mapping):
-        raise ValidationError("nipact.yaml missing sources.index")
-    _check_fields(
-        sources,
-        allowed=SOURCE_CONFIG_FIELDS,
-        required=SOURCE_CONFIG_FIELDS,
-        label="nipact.yaml sources",
-    )
-    return _resolve_strict_project_path(
-        project_root,
-        sources["index"],
-        label="sources.index",
-    )
-
-
-def _resolve_strict_project_path(project_root: Path, raw_path: Any, *, label: str) -> Path:
-    if not isinstance(raw_path, str) or not raw_path:
-        raise ValidationError(f"{label} must be a non-empty string")
-    if "\\" in raw_path:
-        raise ValidationError(f"{label} must use POSIX project-relative path")
-    if any(char in raw_path for char in PATH_GLOB_CHARS):
-        raise ValidationError(f"{label} cannot contain glob patterns")
-    relative_path = Path(raw_path)
-    if relative_path.is_absolute():
-        raise ValidationError(f"{label} must be relative to project dir")
-    if any(part == ".." for part in relative_path.parts):
-        raise ValidationError(f"{label} cannot contain path traversal tokens")
-    resolved = (project_root / relative_path).resolve()
-    if not _path_contains_or_same(project_root, resolved):
-        raise ValidationError(f"{label} must stay inside project dir")
-    return resolved
-
-
 def _load_source_index(path: Path, *, runtime_root: Path) -> SourceIndex:
     payload = _load_yaml_mapping(path, label=str(path))
     _check_fields(
@@ -1040,41 +1000,34 @@ def _parse_source_runtime_path(payload: Any, *, runtime_root: Path, label: str) 
     return payload
 
 
-def _configured_project_files(
-    *,
-    project_root: Path,
-    config: Mapping[str, Any],
-    section: str,
-    label: str,
-) -> dict[str, Path]:
-    payload = config.get(section)
-    if not isinstance(payload, Mapping):
-        raise ValidationError(f"nipact.yaml missing {section}")
-    if not payload:
-        raise ValidationError(f"nipact.yaml {section} cannot be empty")
-
-    paths: dict[str, Path] = {}
-    for raw_name, raw_path in sorted(payload.items()):
-        name = validate_path_token(raw_name, label=f"{section} name")
-        paths[name] = _resolve_project_path(
-            project_root,
-            raw_path,
-            label=f"{label} {name!r}",
-        )
-    return paths
-
-
-def _configured_step_dir(project_root: Path, config: Mapping[str, Any]) -> Path:
-    steps = config.get("steps")
-    if not isinstance(steps, Mapping):
-        raise ValidationError("nipact.yaml missing steps.directory")
-    raw_path = steps.get("directory")
-    if not isinstance(raw_path, str) or not raw_path:
-        raise ValidationError("nipact.yaml missing steps.directory")
-    path = _resolve_project_path(project_root, raw_path, label="steps.directory")
+def _discover_project_files(project_root: Path, directory: str) -> dict[str, Path]:
+    path = _resolve_project_path(project_root, directory, label=f"{directory} directory")
     if not path.is_dir():
-        raise ValidationError(f"missing steps directory: {path}")
-    return path
+        raise ValidationError(f"missing {directory} directory: {path}")
+
+    files: dict[str, Path] = {}
+    names: dict[str, str] = {}
+    for entry in sorted(path.iterdir()):
+        if entry.name.startswith(".") or entry.suffix not in {".yaml", ".yml", ".YAML"}:
+            continue
+        if entry.suffix != ".yaml":
+            raise ValidationError(f"declaration {entry}: rename to use the .yaml extension")
+        name = validate_path_token(entry.stem, label=f"{directory} name")
+        folded_name = name.casefold()
+        if folded_name in names:
+            raise ValidationError(
+                f"case-insensitive declaration name collision: {names[folded_name]} and {entry}"
+            )
+        names[folded_name] = str(entry)
+        resolved = entry.resolve()
+        if not _path_contains_or_same(project_root, resolved):
+            raise ValidationError(f"declaration {entry} must stay inside project dir")
+        if not resolved.is_file():
+            raise ValidationError(f"declaration must be a regular file: {entry}")
+        files[name] = resolved
+    if not files:
+        raise ValidationError(f"missing {directory} YAML files in {path}")
+    return files
 
 
 def _resolve_project_path(project_root: Path, raw_path: Any, *, label: str) -> Path:
@@ -1104,29 +1057,7 @@ def _load_manifest(path: Path, *, label: str) -> Manifest:
         raise ValidationError(f"{label}: {exc}") from exc
 
 
-def _load_steps(
-    step_dir: Path,
-    *,
-    manifests: Mapping[str, Manifest],
-) -> dict[str, StepDefinition]:
-    files = sorted(step_dir.glob("*.yaml"))
-    if not files:
-        raise ValidationError(f"missing step YAML files in {step_dir}")
-
-    steps: dict[str, StepDefinition] = {}
-    for path in files:
-        step = _load_step(path, manifest_names=set(manifests))
-        if step.name in steps:
-            raise ValidationError(f"duplicate step_name: {step.name}")
-        if step.name != path.stem:
-            raise ValidationError(
-                f"step_name {step.name!r} must match file name {path.name!r}"
-            )
-        steps[step.name] = step
-    return steps
-
-
-def _load_step(path: Path, *, manifest_names: set[str]) -> StepDefinition:
+def _load_step(path: Path, *, name: str, manifest_names: set[str]) -> StepDefinition:
     payload = _load_yaml_mapping(path, label=str(path))
     _check_fields(
         payload,
@@ -1134,11 +1065,15 @@ def _load_step(path: Path, *, manifest_names: set[str]) -> StepDefinition:
         required=REQUIRED_STEP_FIELDS,
         label=f"step {path.name}",
     )
-    payload.setdefault("step_name", path.stem)
+    payload.setdefault("step_name", name)
     step_name = validate_path_token(
         _required_string(payload, "step_name", f"step {path.name} step_name"),
         label="step_name",
     )
+    if step_name != name:
+        raise ValidationError(
+            f"step_name {step_name!r} must match file name {name + '.yaml'!r}"
+        )
     callable_ref = _required_string(payload, "callable", f"step {step_name} callable")
     _validate_callable(callable_ref, label=f"step {step_name} callable")
     step_contract_version = _required_string(
@@ -1391,16 +1326,16 @@ def _parse_params(payload: Any, *, label: str) -> dict[str, Any]:
     return params
 
 
-def _load_workflow(path: Path, *, configured_name: str) -> WorkflowDefinition:
+def _load_workflow(path: Path, *, name: str) -> WorkflowDefinition:
     payload = _load_yaml_mapping(path, label=str(path))
-    payload.setdefault("workflow_name", configured_name)
+    payload.setdefault("workflow_name", name)
     workflow_name = validate_path_token(
-        _required_string(payload, "workflow_name", f"workflow {configured_name} workflow_name"),
+        _required_string(payload, "workflow_name", f"workflow {name} workflow_name"),
         label="workflow_name",
     )
-    if workflow_name != configured_name:
+    if workflow_name != name:
         raise ValidationError(
-            f"workflow_name {workflow_name!r} must match configured workflow {configured_name!r}"
+            f"workflow_name {workflow_name!r} must match file name {name + '.yaml'!r}"
         )
 
     base_workflow = payload.get("base_workflow")

@@ -762,10 +762,6 @@ def test_specification_projection_preserves_cross_workflow_reuse_and_lineage(
 ) -> None:
     fixture = registry_v18_fixture
     prepare_v20(fixture, route="fresh")
-    config_path = fixture.project_dir / "nipact.yaml"
-    config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
-    workflows = config["workflows"]
-    assert isinstance(workflows, dict)
     for workflow_name in ("producer_alias", "consumer_alias"):
         workflow_path = fixture.project_dir / f"workflows/{workflow_name}.yaml"
         workflow_path.write_text(
@@ -779,11 +775,6 @@ def test_specification_projection_preserves_cross_workflow_reuse_and_lineage(
             ),
             encoding="utf-8",
         )
-        workflows[workflow_name] = f"workflows/{workflow_name}.yaml"
-    config_path.write_text(
-        yaml.safe_dump(config, sort_keys=False),
-        encoding="utf-8",
-    )
     analysis_path = fixture.project_dir / "steps/fixture_analysis.yaml"
     analysis = yaml.safe_load(analysis_path.read_text(encoding="utf-8"))
     del analysis["outputs"]["detail"]
@@ -1644,9 +1635,6 @@ def test_directory_specification_bidirectional_reuse_and_source_basis(
     alternate = yaml.safe_load((project / "workflows/main.yaml").read_text())
     alternate["workflow_name"] = "other"
     (project / "workflows/other.yaml").write_text(yaml.safe_dump(alternate))
-    config = yaml.safe_load((project / "nipact.yaml").read_text())
-    config["workflows"]["other"] = "workflows/other.yaml"
-    (project / "nipact.yaml").write_text(yaml.safe_dump(config))
     reused = execute_run_plan(
         build_run_plan(
             project_dir=project,

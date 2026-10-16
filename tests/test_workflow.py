@@ -64,10 +64,33 @@ def _graph(
     )
 
 
-def test_generated_colors_demo_workflow_files_load(tmp_path: Path) -> None:
+def test_loader_discovers_direct_files_and_preserves_symlink_names(tmp_path: Path) -> None:
     project_dir, _runtime_dir = _init_demo(tmp_path)
+    for directory in ("steps", "workflows", "manifests"):
+        folder = project_dir / directory
+        (folder / ".#draft.yaml").write_text("malformed: [", encoding="utf-8")
+        (folder / "notes.txt").write_text("malformed: [", encoding="utf-8")
+        (folder / "parked").mkdir()
+        (folder / "parked/bad.yaml").write_text("malformed: [", encoding="utf-8")
+    for relative, field in (
+        ("steps/color_source.yaml", "step_name"),
+        ("workflows/base.yaml", "workflow_name"),
+    ):
+        path = project_dir / relative
+        payload = _read_yaml(path)
+        del payload[field]
+        target = path.parent / "parked/different-name.yaml"
+        _write_yaml(target, payload)
+        path.unlink()
+        path.symlink_to(target)
 
     loaded = _load(project_dir)
+    assert loaded.steps["color_source"].source_path == (
+        project_dir / "steps/parked/different-name.yaml"
+    )
+    assert loaded.workflows["base"].source_path == (
+        project_dir / "workflows/parked/different-name.yaml"
+    )
 
     assert loaded.source_index.path == project_dir / "sources.yaml"
     assert loaded.source_index.global_bindings == {
@@ -121,6 +144,117 @@ def test_generated_colors_demo_workflow_files_load(tmp_path: Path) -> None:
     }
 
 
+@pytest.mark.parametrize(
+    "case,diagnostic",
+    [
+        ("legacy-layout", "unknown field\\(s\\): manifests, sources, steps, workflows"),
+        ("typo", "unknown field\\(s\\): specification"),
+        ("context", "context must be a non-empty string"),
+        ("runtime", "missing paths.runtime"),
+        ("sources-missing", "missing YAML file: .*sources.yaml"),
+        ("sources-empty", "source index must declare at least one source binding"),
+        *[
+            (
+                f"{directory}-{state}",
+                f"missing {directory} " + ("directory" if state == "missing" else "YAML files"),
+            )
+            for directory in ("steps", "workflows", "manifests")
+            for state in ("missing", "empty")
+        ],
+    ],
+)
+def test_loader_rejects_invalid_project_layout(
+    tmp_path: Path, case: str, diagnostic: str
+) -> None:
+    project_dir, _runtime_dir = _init_demo(tmp_path)
+    config_path = project_dir / "nipact.yaml"
+    config = _read_yaml(config_path)
+    if case == "legacy-layout":
+        config.update(
+            {
+                "sources": {"index": "sources.yaml"},
+                "steps": {"directory": "steps"},
+                "workflows": {
+                    "base": "workflows/base.yaml",
+                    "red-qc-target": "workflows/red-qc-target.yaml",
+                },
+                "manifests": {
+                    "init": "manifests/init.yaml",
+                    "demo-40": "manifests/demo-40.yaml",
+                },
+            }
+        )
+    elif case == "typo":
+        config["specification"] = {}
+    elif case == "context":
+        del config["context"]
+    elif case == "runtime":
+        del config["paths"]["runtime"]
+    elif case == "sources-missing":
+        (project_dir / "sources.yaml").unlink()
+    elif case == "sources-empty":
+        _write_yaml(project_dir / "sources.yaml", {})
+    else:
+        directory, state = case.split("-")
+        folder = project_dir / directory
+        for path in folder.iterdir():
+            path.unlink()
+        if state == "missing":
+            folder.rmdir()
+    _write_yaml(config_path, config)
+
+    with pytest.raises(ValidationError, match=diagnostic):
+        _load(project_dir)
+
+
+@pytest.mark.parametrize(
+    "case,diagnostic",
+    [
+        ("yml-only", "rename to use the .yaml extension"),
+        ("uppercase-extension", "rename to use the .yaml extension"),
+        ("unsafe-stem", "contains unsupported characters: _draft"),
+        ("casefold-pair", "name collision: .*Color_source.yaml and .*color_source.yaml"),
+        ("directory", "must be a regular file: .*draft.yaml"),
+        ("broken-link", "must be a regular file: .*draft.yaml"),
+        ("escaping-link", "must stay inside project dir"),
+        ("escaping-directory", "steps directory must stay inside project dir"),
+    ],
+)
+def test_loader_rejects_invalid_discovered_declaration(
+    tmp_path: Path, case: str, diagnostic: str
+) -> None:
+    project_dir, _runtime_dir = _init_demo(tmp_path)
+    steps = project_dir / "steps"
+    if case == "yml-only":
+        workflows = project_dir / "workflows"
+        for path in workflows.iterdir():
+            path.unlink()
+        (workflows / "draft.yml").write_text("{}", encoding="utf-8")
+    elif case == "uppercase-extension":
+        (project_dir / "manifests/draft.YAML").write_text("{}", encoding="utf-8")
+    elif case == "unsafe-stem":
+        (steps / "_draft.yaml").write_text("{}", encoding="utf-8")
+    elif case == "casefold-pair":
+        (steps / "Color_source.yaml").write_text(
+            (steps / "color_source.yaml").read_text(encoding="utf-8"), encoding="utf-8"
+        )
+    elif case == "directory":
+        (steps / "draft.yaml").mkdir()
+    elif case == "broken-link":
+        (steps / "draft.yaml").symlink_to(steps / "absent")
+    elif case == "escaping-link":
+        outside = tmp_path / "outside.yaml"
+        outside.write_text("{}", encoding="utf-8")
+        (steps / "draft.yaml").symlink_to(outside)
+    else:
+        outside = tmp_path / "outside-steps"
+        steps.rename(outside)
+        steps.symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(ValidationError, match=diagnostic):
+        _load(project_dir)
+
+
 @pytest.mark.parametrize("demo", ["colors", "fmri", "dfc", "directories"])
 def test_omitted_declaration_fields_preserve_loaded_project(
     tmp_path: Path, demo: str
@@ -132,16 +266,7 @@ def test_omitted_declaration_fields_preserve_loaded_project(
         runtime_dir=tmp_path / "runtime",
         context=demo,
     )
-    config_path = project_dir / "nipact.yaml"
-    config = _read_yaml(config_path)
-    (project_dir / "workflows/base.yaml").rename(
-        project_dir / "workflows/base-declaration.yaml"
-    )
-    config["workflows"]["base"] = "workflows/base-declaration.yaml"
     if demo == "colors":
-        config["workflows"]["inherited-qc-target"] = (
-            "workflows/inherited-qc-target.yaml"
-        )
         _write_yaml(
             project_dir / "workflows/inherited-qc-target.yaml",
             {
@@ -150,7 +275,6 @@ def test_omitted_declaration_fields_preserve_loaded_project(
                 "step_overrides": {},
             },
         )
-    _write_yaml(config_path, config)
 
     explicit = load_workflow_project(project_dir=project_dir, context=demo)
     if demo == "colors":
@@ -164,8 +288,7 @@ def test_omitted_declaration_fields_preserve_loaded_project(
         for output in payload["outputs"].values():
             del output["address_scope"]
         _write_yaml(step_path, payload)
-    for workflow_file in config["workflows"].values():
-        workflow_path = project_dir / workflow_file
+    for workflow_path in (project_dir / "workflows").glob("*.yaml"):
         payload = _read_yaml(workflow_path)
         del payload["workflow_name"]
         if payload.get("step_overrides") == {}:
@@ -205,11 +328,11 @@ def test_omitted_declaration_fields_preserve_loaded_project(
         ),
         (
             "workflows/base.yaml", "workflow_name", ["different-base"],
-            "must match configured workflow",
+            "must match file name",
         ),
         (
             "workflows/red-qc-target.yaml", "workflow_name", ["different-variant"],
-            "must match configured workflow",
+            "must match file name",
         ),
         (
             "steps/color_source.yaml", "address_scope", ["unsupported"],
@@ -286,21 +409,17 @@ def test_loader_rejects_invalid_step_contract_version(
         _load(project_dir)
 
 
-def test_loader_rejects_missing_workflow_file(tmp_path: Path) -> None:
+def test_loader_rejects_missing_base_workflow(tmp_path: Path) -> None:
     project_dir, _runtime_dir = _init_demo(tmp_path)
     (project_dir / "workflows/base.yaml").unlink()
 
-    with pytest.raises(ValidationError, match="missing YAML file"):
+    with pytest.raises(ValidationError, match="unknown base_workflow: base"):
         _load(project_dir)
 
 
 def test_loader_merges_chained_workflow_inheritance(tmp_path: Path) -> None:
     project_dir, _runtime_dir = _init_demo(tmp_path)
-    config_path = project_dir / "nipact.yaml"
-    config = _read_yaml(config_path)
-    config["workflows"]["mid-qc-target"] = "workflows/mid-qc-target.yaml"
-    config["workflows"]["leaf-qc-target"] = "workflows/leaf-qc-target.yaml"
-    _write_yaml(config_path, config)
+    original = _load(project_dir)
     _write_yaml(
         project_dir / "workflows/mid-qc-target.yaml",
         {
@@ -323,6 +442,9 @@ def test_loader_merges_chained_workflow_inheritance(tmp_path: Path) -> None:
     )
 
     loaded = _load(project_dir)
+    assert {
+        name: loaded.workflows[name] for name in original.workflows
+    } == original.workflows
     base = loaded.workflows["base"]
     leaf = loaded.workflows["leaf-qc-target"]
 
@@ -379,10 +501,6 @@ def test_compile_requires_execution_population_for_entity_path(tmp_path: Path) -
 
 def test_population_free_cohort_only_workflow_is_valid(tmp_path: Path) -> None:
     project_dir, _runtime_dir = _init_demo(tmp_path)
-    config_path = project_dir / "nipact.yaml"
-    config = _read_yaml(config_path)
-    config["workflows"]["cohort-only"] = "workflows/cohort-only.yaml"
-    _write_yaml(config_path, config)
     _write_yaml(
         project_dir / "steps/cohort_summary.yaml",
         {

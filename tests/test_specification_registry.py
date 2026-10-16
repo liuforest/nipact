@@ -147,7 +147,6 @@ def configure_specification_project(fixture: RegistryV18Fixture) -> Path:
 
     config_path = fixture.project_dir / "nipact.yaml"
     config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
-    config["manifests"]["expanded"] = "manifests/expanded.yaml"
     config["specifications"] = {"compact": "specifications/compact.yaml"}
     config_path.write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
     return specification_path

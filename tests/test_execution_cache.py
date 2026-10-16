@@ -220,19 +220,6 @@ def step_apply_file(*, inputs, outputs, params, address):
             "paths": {
                 "runtime": "../runtime",
             },
-            "sources": {
-                "index": "sources.yaml",
-            },
-            "manifests": {
-                "subjects": "manifests/subjects.yaml",
-            },
-            "steps": {
-                "directory": "steps",
-            },
-            "workflows": {
-                "main": "workflows/main.yaml",
-                "derivative": "workflows/derivative.yaml",
-            },
         },
     )
     _write_yaml(
@@ -562,10 +549,6 @@ def _write_workflow_variant(
     base_workflow: str,
     step_overrides: dict[str, object] | None = None,
 ) -> None:
-    config_path = project_dir / "nipact.yaml"
-    config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
-    config["workflows"][workflow_name] = f"workflows/{workflow_name}.yaml"
-    _write_yaml(config_path, config)
     _write_yaml(
         project_dir / f"workflows/{workflow_name}.yaml",
         {
@@ -596,10 +579,6 @@ def _write_sibling_workflow(
 ) -> None:
     # A base-style workflow with no base_workflow pointer: an independent sibling
     # of `main`/`derivative`, listing a subset of the global step pool.
-    config_path = project_dir / "nipact.yaml"
-    config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
-    config["workflows"][workflow_name] = f"workflows/{workflow_name}.yaml"
-    _write_yaml(config_path, config)
     _write_yaml(
         project_dir / f"workflows/{workflow_name}.yaml",
         {
@@ -1313,10 +1292,6 @@ def test_manifest_labels_are_nonidentity_but_collection_input_name_is_identity(
         (project_dir / "manifests/subjects.yaml").read_text(encoding="utf-8")
     )
     _write_yaml(project_dir / "manifests/renamed.yaml", manifest_payload)
-    config_path = project_dir / "nipact.yaml"
-    config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
-    config["manifests"]["renamed"] = "manifests/renamed.yaml"
-    _write_yaml(config_path, config)
     workflow_path = project_dir / "workflows/main.yaml"
     workflow = yaml.safe_load(workflow_path.read_text(encoding="utf-8"))
     workflow["execution_population"] = "renamed"
@@ -1381,10 +1356,6 @@ def test_dependency_free_workflow_output_remains_reusable_as_an_input(
             },
         },
     )
-    config_path = project_dir / "nipact.yaml"
-    config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
-    config["workflows"]["constant_flow"] = "workflows/constant_flow.yaml"
-    _write_yaml(config_path, config)
     _write_yaml(
         project_dir / "workflows/constant_flow.yaml",
         {
@@ -2594,10 +2565,6 @@ def test_changed_scientific_manifest_is_reconciled_by_real_execution(
         training_path,
         {"description": "Training subset", "entities": ["sub_001"]},
     )
-    config_path = project_dir / "nipact.yaml"
-    config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
-    config["manifests"]["training"] = "manifests/training.yaml"
-    _write_yaml(config_path, config)
     fit_path = project_dir / "steps/fit_transform.yaml"
     fit_step = yaml.safe_load(fit_path.read_text(encoding="utf-8"))
     fit_step["manifest_binding"]["manifest"] = "training"

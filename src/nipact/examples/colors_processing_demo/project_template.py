@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from typing import Any
 
-from ...errors import ValidationError
 from ...manifest import Manifest, build_manifest
 from .demo_names import (
     ANALYSIS_COHORT_NAME,
@@ -75,40 +74,6 @@ def build_manifests() -> dict[str, Manifest]:
     }
 
 
-def validate_source_payload(
-    payload: dict[str, Any],
-    *,
-    manifests: dict[str, Manifest],
-) -> int:
-    records = payload.get("records")
-    if not isinstance(records, list):
-        raise ValidationError("source data records must be a list")
-    entity_ids = [
-        record.get("entity_id")
-        for record in records
-        if isinstance(record, dict)
-    ]
-    analysis_manifest = manifests[ANALYSIS_COHORT_NAME]
-    expected_ids = list(analysis_manifest.entity_ids)
-    if entity_ids != expected_ids:
-        raise ValidationError("source data entity IDs do not match colors demo manifest")
-    metadata = payload.get("metadata")
-    if (
-        not isinstance(metadata, dict)
-        or metadata.get("entity_count") != analysis_manifest.entity_count
-    ):
-        raise ValidationError("source data metadata has invalid entity count")
-    source_ids = set(entity_ids)
-    for name, manifest in manifests.items():
-        missing = sorted(set(manifest.entity_ids) - source_ids)
-        if missing:
-            preview = ", ".join(missing[:5])
-            raise ValidationError(
-                f"manifest {name!r} references unknown source entity_id values: {preview}"
-            )
-    return len(entity_ids)
-
-
 def manifest_paths() -> dict[str, str]:
     return dict(MANIFEST_PATHS)
 
@@ -127,17 +92,6 @@ def project_config(*, context: str, runtime: str) -> dict[str, Any]:
         "paths": {
             "runtime": runtime,
         },
-        "sources": {
-            "index": SOURCE_INDEX_PATH,
-        },
-        "workflows": {
-            "base": "workflows/base.yaml",
-            "red-qc-target": "workflows/red-qc-target.yaml",
-        },
-        "steps": {
-            "directory": "steps",
-        },
-        "manifests": manifest_paths(),
     }
 
 
