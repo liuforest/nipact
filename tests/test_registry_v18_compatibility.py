@@ -203,8 +203,13 @@ def test_migrated_registry_preserves_current_readers_and_trace(
 ) -> None:
     fixture = synthesized_v20_fixture
     result = validate_project(project_dir=fixture.project_dir, context=fixture.context)
-    assert (result.manifest_count, result.workflow_count, result.step_count) == (1, 2, 3)
-    assert (result.source_entities, result.published_outputs) == (1, 4)
+    records = [record for rows in result.declarations.values() for record in rows]
+    assert {
+        kind: sum(record.kind == kind for record in records)
+        for kind in ("manifest", "workflow", "step")
+    } == {"manifest": 1, "workflow": 2, "step": 3}
+    assert all(record.status == "valid" for record in records)
+    assert result.success and result.published_outputs == 4
     graph = build_trace_graph_for_artifact_id(
         fixture.registry_path,
         artifact_id=fixture.selected_artifact_id,

@@ -36,13 +36,13 @@ from nipact.registry import (
     record_workflow_run,
     resolve_registered_artifact_path,
 )
-from nipact.project_setup import ProjectSetupError, validate_project
+from nipact.project_setup import validate_project
 from nipact.source_authority import (
     LogicalSourceCoordinate,
     SourceDeclaration,
     observe_source_authority,
 )
-from nipact.workflow import load_workflow_project
+from nipact.workflow import LoadedWorkflowProject, SourceIndex, load_workflow_project
 
 from conftest import publish_compact_colors
 
@@ -681,8 +681,20 @@ def test_accepted_artifact_validation_hashes_shared_occurrence_once(
         )
         for artifact_id in (10, 11)
     ]
-    loaded_project = SimpleNamespace(
-        steps={"example": SimpleNamespace(outputs={"result": SimpleNamespace(extension=".json")})}
+    loaded_project = LoadedWorkflowProject(
+        project_root=tmp_path,
+        context="colors",
+        runtime_root=tmp_path,
+        source_index=SourceIndex(tmp_path / "sources.yaml", {}, {}),
+        manifests={},
+        manifest_paths={},
+        workflows={},
+        declarations={},
+        steps={
+            "example": SimpleNamespace(
+                outputs={"result": SimpleNamespace(extension=".json")}
+            )
+        },
     )
     hash_calls = 0
     real_sha256_file_digest = registry.artifact_content_facts
@@ -756,8 +768,20 @@ def test_accepted_artifact_validation_checks_size_and_extension(
         )
     )
     row[field_index] = bad_value
-    loaded_project = SimpleNamespace(
-        steps={"example": SimpleNamespace(outputs={"result": SimpleNamespace(extension=".json")})}
+    loaded_project = LoadedWorkflowProject(
+        project_root=tmp_path,
+        context="colors",
+        runtime_root=tmp_path,
+        source_index=SourceIndex(tmp_path / "sources.yaml", {}, {}),
+        manifests={},
+        manifest_paths={},
+        workflows={},
+        declarations={},
+        steps={
+            "example": SimpleNamespace(
+                outputs={"result": SimpleNamespace(extension=".json")}
+            )
+        },
     )
 
     with pytest.raises(ValidationError, match=message):
@@ -811,8 +835,10 @@ def test_project_validation_covers_accepted_artifact_without_membership(
             if artifact_state == "missing"
             else "published output artifact digest mismatch"
         )
-        with pytest.raises(ProjectSetupError, match=message):
-            validate_project(project_dir=project_dir, context="colors")
+        result = validate_project(project_dir=project_dir, context="colors")
+        assert not result.success
+        assert message in result.registry_error
+        assert result.published_outputs is None
 
 
 def test_selected_resolution_membership_invariant_covers_all_outcomes() -> None:
@@ -1197,3 +1223,43 @@ def _example_retained_contract():
             ),
         )
     )
+
+
+@pytest.mark.parametrize("kind", ["workflow", "step"])
+@pytest.mark.parametrize("state", ["invalid", "absent"])
+def test_registry_validation_distinguishes_unusable_from_absent_declarations(
+    tmp_path,
+    monkeypatch,
+    kind,
+    state,
+):
+    project_dir, runtime_dir, _ = publish_compact_colors(tmp_path, monkeypatch)
+    registry_path = runtime_dir / REGISTRY_DB_PATH
+    if kind == "step":
+        # Retain accepted artifacts without memberships so only the accepted-output
+        # declaration check can diagnose the missing or invalid step.
+        with sqlite3.connect(registry_path) as conn:
+            conn.execute("DELETE FROM published_outputs")
+    path = project_dir / (
+        "workflows/base.yaml"
+        if kind == "workflow"
+        else "steps/color_sector_analysis.yaml"
+    )
+    if state == "invalid":
+        path.write_text("malformed: [\n")
+    else:
+        path.unlink()
+    before = registry_path.read_bytes()
+    result = validate_project(project_dir=project_dir, context="colors")
+    assert not result.success and result.published_outputs is None
+    assert registry_path.read_bytes() == before
+    if state == "invalid":
+        assert "cannot check" in result.registry_error
+        assert (
+            path.name in result.registry_error
+            and "invalid YAML" in result.registry_error
+        )
+        assert "unknown" not in result.registry_error
+    else:
+        assert "unknown" in result.registry_error
+        assert "cannot check" not in result.registry_error

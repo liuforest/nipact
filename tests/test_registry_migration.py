@@ -936,8 +936,13 @@ def test_registry_dependent_commands_reject_v19_before_any_mutation(
     assert main(argv) == 1
 
     captured = capsys.readouterr()
-    assert captured.out == ""
-    assert captured.err == f"error: {_MIGRATION_GUIDANCE}\n"
+    if command == "validate":
+        assert f"registry  invalid  {_MIGRATION_GUIDANCE}" in captured.out.splitlines()
+        assert captured.out.endswith("FAIL: validate\n")
+        assert captured.err == ""
+    else:
+        assert captured.out == ""
+        assert captured.err == f"error: {_MIGRATION_GUIDANCE}\n"
     assert _runtime_inventory(fixture.runtime_dir) == before
     assert not (fixture.runtime_dir / "runs").exists()
     assert not (fixture.runtime_dir / RUNTIME_LOCK_FILENAME).exists()
@@ -978,9 +983,21 @@ def test_v18_requires_the_named_pre_directory_binary_without_mutation(
     before = _runtime_inventory(fixture.runtime_dir)
     argv = ["registry", "migrate"] if command == "migrate" else ["validate"]
     assert main([*argv, *_project_args(fixture)]) == 1
-    error = capsys.readouterr().err
+    captured = capsys.readouterr()
+    if command == "validate":
+        error = next(
+            line
+            for line in captured.out.splitlines()
+            if line.startswith("registry  invalid  ")
+        )
+        assert captured.out.endswith("FAIL: validate\n")
+        assert captured.err == ""
+    else:
+        error = captured.err
     assert "schema version 18 requires the pre-directory release" in error
     assert "c4ae3b2467a9e99cc6c25f20ebbc3c9081e73743" in error
-    assert "nipact registry migrate --context CONTEXT --project-dir PROJECT_DIR" in error
+    assert (
+        "nipact registry migrate --context CONTEXT --project-dir PROJECT_DIR" in error
+    )
     assert "with that binary for 18 to 19, then with this release for 19 to 20" in error
     assert _runtime_inventory(fixture.runtime_dir) == before

@@ -427,6 +427,45 @@ def test_workflow_graph_command_prints_json_only(
         "analysis_cohort",
     }
 
+    (project_dir / "workflows/draft.yaml").write_text("steps: [\n")
+    assert (
+        main(
+            [
+                "workflow",
+                "graph",
+                *_workflow_base_args(project_dir),
+                "--workflow",
+                "base",
+                "--step",
+                "color_sector_analysis",
+            ]
+        )
+        == 0
+    )
+    captured = capsys.readouterr()
+    assert json.loads(captured.out) == graph
+    assert captured.err.count("WARNING:") == 1
+    assert "workflows/draft.yaml" in captured.err
+    assert "nipact validate" in captured.err
+
+    assert (
+        main(
+            [
+                "workflow",
+                "steps",
+                *_workflow_base_args(project_dir),
+                "--workflow",
+                "draft",
+            ]
+        )
+        == 1
+    )
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "workflow 'draft' is invalid" in captured.err
+    assert "draft.yaml" in captured.err and "invalid YAML" in captured.err
+    assert "unknown workflow" not in captured.err
+
 
 def test_workflow_run_command_executes_step(
     tmp_path: Path,

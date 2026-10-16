@@ -505,7 +505,7 @@ def replay_specification_member(
             workflow_selector=member.row.workflow_selector,
         )
     except ValidationError as exc:
-        raise ValidationError(_REPLAY_MISMATCH) from exc
+        raise ValidationError(f"{_REPLAY_MISMATCH}: {exc}") from exc
     if _dump_json(_effective_payload(current)) != _dump_json(
         _effective_payload(member.row.effective_declaration)
     ):

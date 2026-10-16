@@ -530,8 +530,11 @@ def test_build_run_plan_loads_once_and_delegates_arguments(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    project_dir = tmp_path / "project"
-    loaded = object()
+    project_dir, _ = _write_tiny_non_colors_project(tmp_path, monkeypatch)
+    loaded = execution_module.load_workflow_project(
+        project_dir=project_dir,
+        context="mini",
+    )
     expected = object()
     load_calls: list[tuple[Path, str]] = []
     delegate_calls: list[tuple[object, str, str, str | None, bool]] = []
@@ -1413,7 +1416,10 @@ def test_execute_run_plan_publishes_selected_outputs_without_real_snakemake(
     }
     assert main(["validate", "--project-dir", str(project_dir), "--context", "colors"]) == 0
     cli_output = capsys.readouterr().out
-    assert f"published_outputs={len(run_plan.published_outputs)}" in cli_output
+    assert (
+        f"registry  {len(run_plan.published_outputs)} published outputs  valid  contents verified"
+        in cli_output
+    )
 
 
 def test_tiny_non_colors_run_registers_used_sources_and_trace(
@@ -1573,7 +1579,10 @@ def test_tiny_non_colors_run_registers_used_sources_and_trace(
         )
         == 0
     )
-    assert "published_outputs=4" in capsys.readouterr().out
+    assert (
+        "registry  4 published outputs  valid  contents verified"
+        in capsys.readouterr().out
+    )
 
 
 def test_run_snakemake_command_omits_keep_incomplete(

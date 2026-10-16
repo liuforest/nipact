@@ -5377,7 +5377,9 @@ def test_workflow_run_skips_exhaustive_validation_but_validate_remains_exhaustiv
         == 1
     )
     captured = capsys.readouterr()
-    assert "published output artifact digest mismatch" in captured.err
+    assert captured.err == ""
+    assert "published output artifact digest mismatch" in captured.out
+    assert "FAIL: validate" in captured.out
     assert unrelated_path in hashed_paths
 
 

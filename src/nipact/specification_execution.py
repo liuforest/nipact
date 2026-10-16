@@ -39,7 +39,11 @@ from .specification_canonical import (
 )
 from .specification_compiler import compile_specification
 from .specification_loading import SpecificationSource, load_specification_project
-from .workflow import LoadedWorkflowProject, load_workflow_project
+from .workflow import (
+    LoadedWorkflowProject,
+    load_workflow_project,
+    warn_unusable_declarations,
+)
 
 
 SpecificationTerminalOutcome = SpecificationAttemptOutcome
@@ -244,6 +248,7 @@ def _run_specification_members(
             project_dir=resolved.project_root,
             context=resolved.context,
         )
+        warn_unusable_declarations(loaded)
         _require_loaded_boundary(loaded=loaded, resolved=resolved)
 
         results: list[SpecificationMemberRunResult] = []

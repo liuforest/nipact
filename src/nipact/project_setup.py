@@ -6,7 +6,7 @@ from dataclasses import dataclass
 import json
 import os
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import yaml
 
@@ -21,6 +21,9 @@ from .hashing import sha256_digest, short_hash
 from .identity import validate_path_token
 from .manifest import Manifest
 from . import registry
+
+if TYPE_CHECKING:
+    from .workflow import DeclarationRecord
 
 
 _PROJECT_DIRECTORIES = ("manifests", "steps", "workflows")
@@ -60,11 +63,18 @@ class ValidateResult:
     project_root: Path
     runtime_root: Path
     context: str
-    manifest_count: int
-    workflow_count: int
-    step_count: int
-    source_entities: int
-    published_outputs: int
+    declarations: dict[tuple[str, str], tuple[DeclarationRecord, ...]]
+    registry_initialized: bool
+    registry_error: str | None
+    published_outputs: int | None
+
+    @property
+    def success(self) -> bool:
+        return self.registry_error is None and all(
+            record.status == "valid"
+            for records in self.declarations.values()
+            for record in records
+        )
 
 
 def init_project(
@@ -207,7 +217,8 @@ def validate_project(*, project_dir: Path, context: str) -> ValidateResult:
         raise ProjectSetupError(f"runtime dir does not exist: {runtime_root}")
     _validate_project_runtime_roots(project_root, runtime_root)
 
-    published_outputs = 0
+    published_outputs = None
+    registry_error = None
     registry_db_path = runtime_root / registry.REGISTRY_DB_PATH
     if registry_db_path.exists():
         try:
@@ -218,18 +229,24 @@ def validate_project(*, project_dir: Path, context: str) -> ValidateResult:
                 loaded_workflow_project=loaded_workflow_project,
             )
         except ValidationError as exc:
-            raise ProjectSetupError(str(exc)) from exc
-        published_outputs = registry_counts["published_outputs"]
+            registry_error = str(exc)
+        else:
+            published_outputs = registry_counts["published_outputs"]
     return ValidateResult(
         project_root=project_root,
         runtime_root=runtime_root,
         context=context,
-        manifest_count=len(loaded_workflow_project.manifests),
-        workflow_count=len(loaded_workflow_project.workflows),
-        step_count=len(loaded_workflow_project.steps),
-        source_entities=len(
-            loaded_workflow_project.source_index.entity_bindings
+        declarations=dict(
+            sorted(
+                loaded_workflow_project.declarations.items(),
+                key=lambda item: (
+                    {"step": 0, "workflow": 1, "manifest": 2}[item[0][0]],
+                    item[0][1],
+                ),
+            )
         ),
+        registry_initialized=registry_db_path.exists(),
+        registry_error=registry_error,
         published_outputs=published_outputs,
     )
 

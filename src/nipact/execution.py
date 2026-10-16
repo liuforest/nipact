@@ -100,6 +100,7 @@ from .workflow import (
     WorkflowPlanStep,
     compile_workflow_plan,
     load_workflow_project,
+    warn_unusable_declarations,
 )
 
 RunStatusCallback = Callable[[str], None]
@@ -448,6 +449,7 @@ def build_run_plan(
 ) -> StructuralRunPlan:
     """Build frozen structural declarations and a metadata-only forecast."""
     loaded = load_workflow_project(project_dir=project_dir, context=context)
+    warn_unusable_declarations(loaded)
     return _build_run_plan_from_loaded_project(
         loaded=loaded,
         workflow_name=workflow_name,

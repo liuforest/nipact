@@ -1,3 +1,4 @@
+import re
 from pathlib import Path
 from typing import Any
 
@@ -38,6 +39,15 @@ def _write_yaml(path: Path, payload: dict[str, Any]) -> None:
 
 def _load(project_dir: Path):
     return load_workflow_project(project_dir=project_dir, context="colors")
+
+
+def _assert_invalid(project_dir: Path, kind: str, name: str, diagnostic: str) -> None:
+    loaded = _load(project_dir)
+    issue = loaded.declaration_issue(kind, name)
+    assert issue is not None and issue.status == "invalid"
+    assert issue.path.name in issue.error
+    assert re.search(diagnostic, issue.error)
+    assert name not in getattr(loaded, {"step": "steps", "workflow": "workflows"}[kind])
 
 
 def _compile(
@@ -213,9 +223,12 @@ def test_loader_rejects_invalid_project_layout(
         ("yml-only", "rename to use the .yaml extension"),
         ("uppercase-extension", "rename to use the .yaml extension"),
         ("unsafe-stem", "contains unsupported characters: _draft"),
-        ("casefold-pair", "name collision: .*Color_source.yaml and .*color_source.yaml"),
-        ("directory", "must be a regular file: .*draft.yaml"),
-        ("broken-link", "must be a regular file: .*draft.yaml"),
+        (
+            "casefold-pair",
+            "name collision: .*Color_source.yaml and .*color_source.yaml",
+        ),
+        ("directory", "must be a regular file"),
+        ("broken-link", "must be a regular file"),
         ("escaping-link", "must stay inside project dir"),
         ("escaping-directory", "steps directory must stay inside project dir"),
     ],
@@ -251,8 +264,27 @@ def test_loader_rejects_invalid_discovered_declaration(
         steps.rename(outside)
         steps.symlink_to(outside, target_is_directory=True)
 
-    with pytest.raises(ValidationError, match=diagnostic):
-        _load(project_dir)
+    if case == "escaping-directory":
+        with pytest.raises(ValidationError, match=diagnostic):
+            _load(project_dir)
+        return
+    loaded = _load(project_dir)
+    invalid = [
+        record
+        for records in loaded.declarations.values()
+        for record in records
+        if record.status == "invalid"
+    ]
+    assert invalid and all(re.search(diagnostic, record.error) for record in invalid)
+    assert all(record.path.name in record.error for record in invalid)
+    if case == "casefold-pair":
+        assert {record.name for record in invalid} == {"Color_source", "color_source"}
+        assert "color_source" not in loaded.steps
+    elif case == "yml-only":
+        assert [(record.kind, record.name) for record in invalid] == [
+            ("workflow", "draft")
+        ]
+        assert loaded.workflows == {}
 
 
 @pytest.mark.parametrize("demo", ["colors", "fmri", "dfc", "directories"])
@@ -354,8 +386,8 @@ def test_loader_rejects_invalid_supplied_defaultable_fields(
     for value in values:
         target[field] = value
         _write_yaml(path, payload)
-        with pytest.raises(ValidationError, match=diagnostic):
-            _load(project_dir)
+        kind = "step" if declaration.startswith("steps/") else "workflow"
+        _assert_invalid(project_dir, kind, path.stem, diagnostic)
 
 
 def test_step_contract_version_is_loaded_and_compiled(tmp_path: Path) -> None:
@@ -384,11 +416,12 @@ def test_loader_rejects_missing_step_contract_version(tmp_path: Path) -> None:
     del payload["step_contract_version"]
     _write_yaml(step_path, payload)
 
-    with pytest.raises(
-        ValidationError,
-        match="missing required field.*step_contract_version",
-    ):
-        _load(project_dir)
+    _assert_invalid(
+        project_dir,
+        "step",
+        "color_source",
+        "missing required field.*step_contract_version",
+    )
 
 
 @pytest.mark.parametrize("value", [1, True, ""])
@@ -402,19 +435,21 @@ def test_loader_rejects_invalid_step_contract_version(
     payload["step_contract_version"] = value
     _write_yaml(step_path, payload)
 
-    with pytest.raises(
-        ValidationError,
-        match="step color_source step_contract_version must be a non-empty string",
-    ):
-        _load(project_dir)
+    _assert_invalid(
+        project_dir,
+        "step",
+        "color_source",
+        "step color_source step_contract_version must be a non-empty string",
+    )
 
 
 def test_loader_rejects_missing_base_workflow(tmp_path: Path) -> None:
     project_dir, _runtime_dir = _init_demo(tmp_path)
     (project_dir / "workflows/base.yaml").unlink()
 
-    with pytest.raises(ValidationError, match="unknown base_workflow: base"):
-        _load(project_dir)
+    _assert_invalid(
+        project_dir, "workflow", "red-qc-target", "unknown base_workflow: base"
+    )
 
 
 def test_loader_merges_chained_workflow_inheritance(tmp_path: Path) -> None:
@@ -484,8 +519,7 @@ def test_loader_rejects_unknown_execution_population(tmp_path: Path) -> None:
     payload["execution_population"] = "missing"
     _write_yaml(workflow_path, payload)
 
-    with pytest.raises(ValidationError, match="unknown execution_population"):
-        _load(project_dir)
+    _assert_invalid(project_dir, "workflow", "base", "unknown execution_population")
 
 
 def test_compile_requires_execution_population_for_entity_path(tmp_path: Path) -> None:
@@ -557,11 +591,12 @@ def test_loader_rejects_output_scope_mismatch_in_unused_step(tmp_path: Path) -> 
         },
     )
 
-    with pytest.raises(
-        ValidationError,
-        match="outputs 'table' address_scope must match step address_scope",
-    ):
-        _load(project_dir)
+    _assert_invalid(
+        project_dir,
+        "step",
+        "unused_summary",
+        "outputs 'table' address_scope must match step address_scope",
+    )
 
 
 def test_loader_rejects_reserved_source_population_role(tmp_path: Path) -> None:
@@ -574,8 +609,9 @@ def test_loader_rejects_reserved_source_population_role(tmp_path: Path) -> None:
     }
     _write_yaml(step_path, payload)
 
-    with pytest.raises(ValidationError, match="role 'source_population' is reserved"):
-        _load(project_dir)
+    _assert_invalid(
+        project_dir, "step", "color_source", "role 'source_population' is reserved"
+    )
 
 
 def test_loader_requires_scientific_manifest_for_collection_input(tmp_path: Path) -> None:
@@ -585,8 +621,12 @@ def test_loader_requires_scientific_manifest_for_collection_input(tmp_path: Path
     del payload["manifest_binding"]
     _write_yaml(step_path, payload)
 
-    with pytest.raises(ValidationError, match="requires a scientific manifest_binding"):
-        _load(project_dir)
+    _assert_invalid(
+        project_dir,
+        "step",
+        "color_cohort_fit",
+        "requires a scientific manifest_binding",
+    )
 
 
 def test_compile_rejects_scientific_manifest_outside_execution_population(
@@ -623,14 +663,15 @@ def test_loader_rejects_input_from_later_workflow_step(tmp_path: Path) -> None:
     }
     _write_yaml(step_path, payload)
 
-    with pytest.raises(
-        ValidationError,
-        match=(
+    _assert_invalid(
+        project_dir,
+        "workflow",
+        "base",
+        (
             "step 'color_features' input 'color_sector_analysis.sector_counts' "
             "does not reference an earlier workflow output"
         ),
-    ):
-        _load(project_dir)
+    )
 
 
 def test_graph_projection_has_stable_ids_and_terminal_kind(tmp_path: Path) -> None:
@@ -815,8 +856,8 @@ def test_output_kind_loader_and_compiled_graph(tmp_path, monkeypatch, output, va
     project, runtime = directory_project(tmp_path, monkeypatch)
     change_step(project, "source_text", outputs={"raw_text": output})
     if not valid:
-        with pytest.raises(ValidationError):
-            load_workflow_project(project_dir=project, context="mini")
+        loaded = load_workflow_project(project_dir=project, context="mini")
+        assert loaded.declaration_issue("step", "source_text").status == "invalid"
         return
     loaded = load_workflow_project(project_dir=project, context="mini")
     graph = workflow_plan_to_graph(
@@ -891,3 +932,186 @@ def test_explicit_file_kind_keeps_public_request_and_frozen_bytes(
     )
     assert current.canonical_json == request.canonical_json
     assert current.request_bundle_digest == request.request_bundle_digest
+
+
+@pytest.mark.parametrize(
+    "declaration,case",
+    [
+        ("workflows/draft.yaml", "yaml"),
+        ("workflows/draft.yaml", "date"),
+        ("manifests/draft.yaml", "date"),
+        ("workflows/draft.yaml", "unicode"),
+        ("manifests/draft.yaml", "unicode"),
+        ("steps/draft.yaml", "read"),
+        ("manifests/draft.yaml", "read"),
+        ("workflows/draft.yaml", "fields"),
+        ("manifests/draft.yaml", "fields"),
+        *[("steps/draft.yaml", field) for field in ("inputs", "outputs", "params")],
+        ("workflows/draft.yaml", "step_overrides"),
+    ],
+)
+def test_loader_isolates_read_and_mapping_errors(
+    tmp_path, monkeypatch, declaration, case
+):
+    project_dir, _ = _init_demo(tmp_path)
+    original = _load(project_dir)
+    path = project_dir / declaration
+    if case == "unicode":
+        path.write_bytes(b"\xff")
+    elif case == "date":
+        path.write_text("draft: 2026-13-01\n")
+    elif case in {"yaml", "read"}:
+        path.write_text("malformed: [\n")
+        if case == "read":
+            read_text = Path.read_text
+
+            def fail_read(self, *args, **kwargs):
+                if self == path:
+                    raise OSError("declaration read failed")
+                return read_text(self, *args, **kwargs)
+
+            monkeypatch.setattr(Path, "read_text", fail_read)
+    elif case == "fields":
+        _write_yaml(path, {"description": "draft", 1: "mixed", False: "keys"})
+    elif case == "step_overrides":
+        _write_yaml(path, {"base_workflow": "base", case: {"color_source": {}, 1: {}}})
+    else:
+        payload = _read_yaml(project_dir / "steps/color_features.yaml")
+        payload["step_name"] = "draft"
+        payload[case] = {"mixed": {}, 1: {}}
+        _write_yaml(path, payload)
+
+    loaded = _load(project_dir)
+    issue = loaded.declaration_issue(declaration.split("/")[0][:-1], "draft")
+    assert issue.status == "invalid" and str(path) in issue.error
+    expected = (
+        "keys must be strings"
+        if case not in {"yaml", "date", "unicode", "read"}
+        else {
+            "yaml": "invalid YAML",
+            "date": "month must be in 1..12",
+            "unicode": "decode",
+            "read": "declaration read failed",
+        }[case]
+    )
+    assert expected in issue.error
+    assert loaded.steps == original.steps
+    assert loaded.workflows == original.workflows
+    assert loaded.manifests == original.manifests
+    assert loaded.manifest_paths == original.manifest_paths
+
+
+def test_loader_rejects_both_same_stem_extensions_without_fallback(tmp_path):
+    project_dir, _ = _init_demo(tmp_path)
+    base = project_dir / "workflows/base.yaml"
+    base.with_suffix(".yml").write_text(base.read_text())
+    loaded = _load(project_dir)
+    records = loaded.declarations[("workflow", "base")]
+    assert {record.path.suffix for record in records} == {".yaml", ".yml"}
+    assert all(
+        record.status == "invalid" and "collision" in record.error for record in records
+    )
+    assert "base" not in loaded.workflows
+    assert loaded.declaration_issue("workflow", "red-qc-target").status == "unavailable"
+
+
+@pytest.mark.parametrize(
+    "root",
+    [
+        "step",
+        "manifest",
+        "workflow",
+        "missing-source",
+        "missing-step",
+        "missing-manifest",
+        "cycle",
+    ],
+)
+def test_loader_propagates_root_errors_without_partial_workflows(tmp_path, root):
+    project_dir, _ = _init_demo(tmp_path)
+    original = _load(project_dir)
+    _write_yaml(
+        project_dir / "workflows/independent.yaml",
+        {
+            "execution_population": "init",
+            "steps": [
+                {"step_name": "color_local_transform", "output_name": "local_color"}
+            ],
+        },
+    )
+    # The independent chain uses only the first three valid steps.
+    independent = _read_yaml(project_dir / "workflows/independent.yaml")
+    independent["steps"] = ["color_source", "color_features", *independent["steps"]]
+    _write_yaml(project_dir / "workflows/independent.yaml", independent)
+    _write_yaml(
+        project_dir / "workflows/leaf.yaml",
+        {"base_workflow": "red-qc-target", "execution_population": "init"},
+    )
+    if root == "cycle":
+        _write_yaml(
+            project_dir / "workflows/base.yaml", {"base_workflow": "red-qc-target"}
+        )
+        expected_kind, expected_name = "workflow", "base"
+    elif root == "missing-source":
+        path = project_dir / "steps/color_cohort_fit.yaml"
+        payload = _read_yaml(path)
+        next(iter(payload["inputs"].values()))["artifact"] = "absent.result"
+        _write_yaml(path, payload)
+        expected_kind, expected_name = "step", "color_cohort_fit"
+    elif root == "missing-step":
+        payload = _read_yaml(project_dir / "workflows/base.yaml")
+        payload["steps"].append("absent")
+        _write_yaml(project_dir / "workflows/base.yaml", payload)
+        expected_kind, expected_name = "workflow", "base"
+    elif root == "missing-manifest":
+        payload = _read_yaml(project_dir / "steps/color_cohort_fit.yaml")
+        payload["manifest_binding"]["manifest"] = "absent"
+        _write_yaml(project_dir / "steps/color_cohort_fit.yaml", payload)
+        expected_kind, expected_name = "step", "color_cohort_fit"
+    else:
+        expected_kind, expected_name = {
+            "step": ("step", "color_cohort_fit"),
+            "manifest": ("manifest", "demo-40"),
+            "workflow": ("workflow", "base"),
+        }[root]
+        (project_dir / f"{expected_kind}s/{expected_name}.yaml").write_text(
+            "malformed: [\n"
+        )
+
+    loaded = _load(project_dir)
+    issue = loaded.declaration_issue(expected_kind, expected_name)
+    assert issue.status == "invalid" and issue.path.name in issue.error
+    assert loaded.workflows["independent"].steps == original.workflows["base"].steps[:3]
+    assert all(
+        loaded.steps[name] == original.steps[name]
+        for name in loaded.workflows["independent"].steps
+    )
+    for name in ("base", "red-qc-target", "leaf"):
+        status = loaded.declaration_issue("workflow", name)
+        expected_status = (
+            "invalid"
+            if (name == "base" and expected_kind == "workflow")
+            or (root == "cycle" and name == "red-qc-target")
+            else "unavailable"
+        )
+        assert status.status == expected_status
+        if root != "cycle":
+            assert status.error == issue.error
+        assert name not in loaded.workflows
+    if expected_kind in {"step", "manifest"}:
+        for name in (
+            "color_cohort_fit",
+            "color_cohort_apply",
+            "color_sector_label",
+            "color_sector_analysis",
+        ):
+            record = loaded.declarations[("step", name)][0]
+            assert record.error == issue.error
+    # Even an earlier target cannot select a partially usable workflow.
+    with pytest.raises(
+        ValidationError,
+        match=re.escape(issue.error) if root != "cycle" else "inheritance cycle",
+    ):
+        compile_workflow_plan(
+            loaded, workflow_name="base", step_name="color_local_transform"
+        )
