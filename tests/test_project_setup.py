@@ -219,7 +219,10 @@ def _assert_validate_passes(
     assert len([line for line in lines if line.startswith("workflow ")]) == 2
     assert len([line for line in lines if line.startswith("step ")]) == 8
     assert all(" valid" in line for line in lines[3:-2])
-    assert "registry  0 published outputs  valid  contents verified" in output
+    assert (
+        "registry  0 published outputs  valid  contents not re-hashed; use --outputs"
+        in output
+    )
     assert "PASS: validate" in output
 
 
@@ -726,7 +729,10 @@ def test_init_creates_prepared_neuro_demo_project_and_registry(
     assert len([line for line in lines if line.startswith("manifest ")]) == 1
     assert len([line for line in lines if line.startswith("workflow ")]) == 1
     assert len([line for line in lines if line.startswith("step ")]) == step_count
-    assert "registry  0 published outputs  valid  contents verified" in validate_output
+    assert (
+        "registry  0 published outputs  valid  contents not re-hashed; use --outputs"
+        in validate_output
+    )
     assert "PASS: validate" in validate_output
 
 
@@ -770,21 +776,26 @@ def test_validate_accepts_registered_published_output(
     project_dir, runtime_dir = _init_demo(tmp_path, capsys)
     _insert_published_output(runtime_dir)
 
-    assert (
-        main(
-            [
-                "validate",
-                "--project-dir",
-                str(project_dir),
-                "--context",
-                "colors",
-            ]
+    for flags, verification in (
+        ([], "contents not re-hashed; use --outputs"),
+        (["--outputs"], "all accepted output contents verified"),
+    ):
+        assert (
+            main(
+                [
+                    "validate",
+                    "--project-dir",
+                    str(project_dir),
+                    "--context",
+                    "colors",
+                    *flags,
+                ]
+            )
+            == 0
         )
-        == 0
-    )
-    output = capsys.readouterr().out
-    assert "registry  1 published outputs  valid  contents verified" in output
-    assert "PASS: validate" in output
+        output = capsys.readouterr().out
+        assert f"registry  1 published outputs  valid  {verification}" in output
+        assert "PASS: validate" in output
 
 
 def test_registry_projection_observation_and_membership_constraints(
@@ -1061,5 +1072,8 @@ def test_validate_lists_all_declaration_statuses_and_one_line_errors(tmp_path, c
     for row in rows:
         if row[2] != "valid":
             assert "demo-40.yaml" in row[3]
-    assert "registry  0 published outputs  valid  contents verified" in captured.out
+    assert (
+        "registry  0 published outputs  valid  contents not re-hashed; use --outputs"
+        in captured.out
+    )
     assert captured.out.endswith("FAIL: validate\n")

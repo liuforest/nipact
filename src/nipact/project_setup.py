@@ -208,7 +208,9 @@ def _init_prepared_demo_project(
     )
 
 
-def validate_project(*, project_dir: Path, context: str) -> ValidateResult:
+def validate_project(
+    *, project_dir: Path, context: str, verify_outputs: bool = False
+) -> ValidateResult:
     loaded_workflow_project = _load_workflow_project(project_dir, context=context)
     project_root = loaded_workflow_project.project_root
     runtime_root = loaded_workflow_project.runtime_root
@@ -227,6 +229,7 @@ def validate_project(*, project_dir: Path, context: str) -> ValidateResult:
                 context=context,
                 runtime_root=runtime_root,
                 loaded_workflow_project=loaded_workflow_project,
+                verify_outputs=verify_outputs,
             )
         except ValidationError as exc:
             registry_error = str(exc)

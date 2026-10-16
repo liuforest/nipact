@@ -1148,6 +1148,7 @@ def validate_prepared_registry_db(
     context: str,
     runtime_root: Path,
     loaded_workflow_project: Any,
+    verify_outputs: bool = False,
 ) -> dict[str, int]:
     """Validate the small registry surface needed by generic prepared projects."""
     _validate_storage_layout(runtime_root)
@@ -1221,6 +1222,7 @@ def validate_prepared_registry_db(
         loaded_workflow_project=loaded_workflow_project,
         contracts=contracts,
         verified_occurrences=verified_occurrences,
+        verify_outputs=verify_outputs,
     )
     return {"published_outputs": int(published_outputs)}
 
@@ -4427,6 +4429,7 @@ def _validate_accepted_workflow_output_rows(
     loaded_workflow_project: Any,
     contracts: dict[str, ValidatedStoredRequestBundleProjectionV3],
     verified_occurrences: set[tuple[Path, str, str, str, int]],
+    verify_outputs: bool = False,
 ) -> None:
     for row in rows:
         _validate_accepted_workflow_output_row(
@@ -4436,6 +4439,7 @@ def _validate_accepted_workflow_output_rows(
             loaded_workflow_project=loaded_workflow_project,
             contracts=contracts,
             verified_occurrences=verified_occurrences,
+            verify_outputs=verify_outputs,
         )
 
 
@@ -4447,6 +4451,7 @@ def _validate_accepted_workflow_output_row(
     loaded_workflow_project: Any,
     contracts: dict[str, ValidatedStoredRequestBundleProjectionV3],
     verified_occurrences: set[tuple[Path, str, str, str, int]],
+    verify_outputs: bool = False,
 ) -> None:
     (
         artifact_id,
@@ -4537,6 +4542,8 @@ def _validate_accepted_workflow_output_row(
         return
     if kind == "file" and resolved_path.stat().st_size != file_size:
         raise ValidationError("published output artifact file size mismatch")
+    if not verify_outputs:
+        return
     digest, size = artifact_content_facts(resolved_path, kind)
     if size != file_size:
         raise ValidationError("published output artifact file size mismatch")

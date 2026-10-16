@@ -634,7 +634,9 @@ def test_project_validation_accepts_cross_workflow_membership_path(
         "artifact_content_facts",
         count_shared_artifact_hashes,
     )
-    result = validate_project(project_dir=project_dir, context="colors")
+    result = validate_project(
+        project_dir=project_dir, context="colors", verify_outputs=True
+    )
     assert result.published_outputs == len(_run_plan.published_outputs) + 1
     assert target_hashes == 1
 
@@ -712,6 +714,7 @@ def test_accepted_artifact_validation_hashes_shared_occurrence_once(
         loaded_workflow_project=loaded_project,
         contracts={request_bundle_digest: _example_retained_contract()},
         verified_occurrences=set(),
+        verify_outputs=True,
     )
 
     assert hash_calls == 1
@@ -826,19 +829,25 @@ def test_project_validation_covers_accepted_artifact_without_membership(
     elif artifact_state == "corrupt":
         artifact_path.write_bytes(b"x" * artifact_path.stat().st_size)
 
-    if artifact_state == "intact":
-        result = validate_project(project_dir=project_dir, context="colors")
-        assert result.published_outputs == len(run_plan.published_outputs) - 1
-    else:
-        message = (
-            "missing published output artifact"
-            if artifact_state == "missing"
-            else "published output artifact digest mismatch"
+    for verify_outputs in (False, True):
+        result = validate_project(
+            project_dir=project_dir, context="colors", verify_outputs=verify_outputs
         )
-        result = validate_project(project_dir=project_dir, context="colors")
-        assert not result.success
-        assert message in result.registry_error
-        assert result.published_outputs is None
+        if artifact_state == "missing" or (
+            artifact_state == "corrupt" and verify_outputs
+        ):
+            message = (
+                "missing published output artifact"
+                if artifact_state == "missing"
+                else "published output artifact digest mismatch"
+            )
+            assert not result.success
+            assert message in result.registry_error
+            assert result.published_outputs is None
+        else:
+            assert result.success
+            assert result.registry_error is None
+            assert result.published_outputs == len(run_plan.published_outputs) - 1
 
 
 def test_selected_resolution_membership_invariant_covers_all_outcomes() -> None:
@@ -1174,7 +1183,7 @@ def test_retained_file_directory_contracts_coexist_after_public_transition(
     old = next(row for row in before if row["output_name"] == "empty")
     change_step(project, "mixed", outputs=original["outputs"])
 
-    def validate():
+    def validate(*, verify_outputs=False):
         return registry.validate_prepared_registry_db(
             runtime / "database/registry.db",
             context="mini",
@@ -1182,11 +1191,41 @@ def test_retained_file_directory_contracts_coexist_after_public_transition(
             loaded_workflow_project=load_workflow_project(
                 project_dir=project, context="mini"
             ),
+            verify_outputs=verify_outputs,
         )
 
     validate()  # old membership uses its retained file contract
     assert run(project, address="sub_001").published_count == 3
-    validate()  # both generations, after membership replacement
+    old_tree = next(row for row in before if row["output_name"] == "maps")
+    assert old_tree["artifact_id"] not in {
+        row["artifact_id"] for row in rows(runtime, "published_outputs")
+    }
+    validate(verify_outputs=True)
+    member = runtime / old_tree["path"] / "nested/deep/value.txt"
+    original_bytes = member.read_bytes()
+    # Default validation checks roots without reading output payloads.
+    with monkeypatch.context() as guard:
+
+        def forbidden(*args, **kwargs):
+            pytest.fail("default validation accessed an output payload")
+
+        guard.setattr(registry, "artifact_content_facts", forbidden)
+        original_iterdir = Path.iterdir
+
+        def guarded_iterdir(path):
+            if path.is_relative_to(runtime / "outputs"):
+                forbidden()
+            return original_iterdir(path)
+
+        guard.setattr(Path, "iterdir", guarded_iterdir)
+        validate()  # both generations, after membership replacement
+        member.write_bytes(b"x" * len(original_bytes))
+        validate()  # same-size corruption in an older accepted tree
+    with pytest.raises(
+        ValidationError, match="published output artifact digest mismatch"
+    ):
+        validate(verify_outputs=True)
+    member.write_bytes(original_bytes)
     assert [
         row
         for row in rows(runtime)
