@@ -82,16 +82,10 @@ def test_loader_discovers_direct_files_and_preserves_symlink_names(tmp_path: Pat
         (folder / "notes.txt").write_text("malformed: [", encoding="utf-8")
         (folder / "parked").mkdir()
         (folder / "parked/bad.yaml").write_text("malformed: [", encoding="utf-8")
-    for relative, field in (
-        ("steps/color_source.yaml", "step_name"),
-        ("workflows/base.yaml", "workflow_name"),
-    ):
+    for relative in ("steps/color_source.yaml", "workflows/base.yaml"):
         path = project_dir / relative
-        payload = _read_yaml(path)
-        del payload[field]
         target = path.parent / "parked/different-name.yaml"
-        _write_yaml(target, payload)
-        path.unlink()
+        path.rename(target)
         path.symlink_to(target)
 
     loaded = _load(project_dir)
@@ -288,7 +282,7 @@ def test_loader_rejects_invalid_discovered_declaration(
 
 
 @pytest.mark.parametrize("demo", ["colors", "fmri", "dfc", "directories"])
-def test_omitted_declaration_fields_preserve_loaded_project(
+def test_explicit_declaration_fields_preserve_loaded_project(
     tmp_path: Path, demo: str
 ) -> None:
     project_dir = tmp_path / "project"
@@ -301,34 +295,36 @@ def test_omitted_declaration_fields_preserve_loaded_project(
     if demo == "colors":
         _write_yaml(
             project_dir / "workflows/inherited-qc-target.yaml",
-            {
-                "workflow_name": "inherited-qc-target",
-                "base_workflow": "red-qc-target",
-                "step_overrides": {},
-            },
+            {"base_workflow": "red-qc-target"},
         )
 
-    explicit = load_workflow_project(project_dir=project_dir, context=demo)
+    shortened = load_workflow_project(project_dir=project_dir, context=demo)
     if demo == "colors":
-        assert explicit.workflows["inherited-qc-target"].step_overrides[
-            "color_candidate_select"
-        ].params["qc_target_theta"] == 0.0
+        assert (
+            shortened.workflows["inherited-qc-target"]
+            .step_overrides["color_candidate_select"]
+            .params["qc_target_theta"]
+            == 0.0
+        )
 
     for step_path in (project_dir / "steps").glob("*.yaml"):
         payload = _read_yaml(step_path)
-        del payload["step_name"]
+        assert "step_name" not in payload
+        payload["step_name"] = step_path.stem
         for output in payload["outputs"].values():
-            del output["address_scope"]
+            assert "address_scope" not in output
+            output["address_scope"] = payload["address_scope"]
         _write_yaml(step_path, payload)
     for workflow_path in (project_dir / "workflows").glob("*.yaml"):
         payload = _read_yaml(workflow_path)
-        del payload["workflow_name"]
-        if payload.get("step_overrides") == {}:
-            del payload["step_overrides"]
+        assert "workflow_name" not in payload
+        payload["workflow_name"] = workflow_path.stem
+        if "base_workflow" in payload:
+            payload.setdefault("step_overrides", {})
         _write_yaml(workflow_path, payload)
 
-    shortened = load_workflow_project(project_dir=project_dir, context=demo)
-    assert shortened == explicit
+    explicit = load_workflow_project(project_dir=project_dir, context=demo)
+    assert explicit == shortened
 
 
 @pytest.mark.parametrize(

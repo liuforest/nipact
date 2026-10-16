@@ -74,7 +74,6 @@ def project_config(*, context: str, runtime: str) -> dict[str, Any]:
 def step_files() -> dict[str, dict[str, Any]]:
     return {
         "image_source": {
-            "step_name": "image_source",
             "step_contract_version": "1",
             "pattern_kind": "pattern_a",
             "execution_role": "source_import",
@@ -87,12 +86,10 @@ def step_files() -> dict[str, dict[str, Any]]:
             "outputs": {
                 "raw_image": {
                     "extension": ".npy",
-                    "address_scope": "entity",
                 },
             },
         },
         "segment_image": {
-            "step_name": "segment_image",
             "step_contract_version": "1",
             "pattern_kind": "pattern_a",
             "execution_role": "transform",
@@ -114,16 +111,13 @@ def step_files() -> dict[str, dict[str, Any]]:
             "outputs": {
                 "volumes": {
                     "extension": ".json",
-                    "address_scope": "entity",
                 },
                 "maps": {
                     "kind": "directory",
-                    "address_scope": "entity",
                 },
             },
         },
         "map_summary": {
-            "step_name": SELECTED_STEP_NAME,
             "step_contract_version": "1",
             "pattern_kind": "analysis",
             "execution_role": "analysis",
@@ -148,7 +142,6 @@ def step_files() -> dict[str, dict[str, Any]]:
             "outputs": {
                 SELECTED_OUTPUT_NAME: {
                     "extension": ".json",
-                    "address_scope": "cohort",
                 },
             },
         },
@@ -158,7 +151,6 @@ def step_files() -> dict[str, dict[str, Any]]:
 def workflow_files() -> dict[str, dict[str, Any]]:
     return {
         BASE_WORKFLOW_NAME: {
-            "workflow_name": BASE_WORKFLOW_NAME,
             "execution_population": ANALYSIS_COHORT_NAME,
             "steps": [
                 "image_source",
@@ -173,7 +165,6 @@ def workflow_files() -> dict[str, dict[str, Any]]:
             ],
         },
         VARIANT_WORKFLOW_NAME: {
-            "workflow_name": VARIANT_WORKFLOW_NAME,
             "base_workflow": BASE_WORKFLOW_NAME,
             "step_overrides": {
                 SELECTED_STEP_NAME: {
@@ -193,6 +184,9 @@ def project_readme_text() -> str:
         "This is a tiny generated fixture for exercising mixed file and directory "
         "outputs, provider validation of directory members, and reuse of directory "
         "artifacts by a cohort-level analysis.\n"
+        "\nProject declarations use `sources.yaml` and direct YAML files in "
+        "`steps/`, `workflows/`, and `manifests/`. Step and workflow names come "
+        "from filenames; outputs inherit their step's `address_scope`.\n"
     )
 
 

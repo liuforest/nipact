@@ -63,6 +63,8 @@ specifications:
 
 Specification sets and libraries remain explicitly registered with `specifications` and `specification_libraries`. The current source checkout rejects the old `sources`, `steps`, `workflows` and `manifests` configuration keys; this layout change is unreleased.
 
+To migrate an existing project, inventory the direct declaration files first and check that the old `sources.index`, `steps.directory`, workflow map and manifest map exactly match the conventional names and paths. Then remove those four obsolete top-level sections, preserving `context`, `paths.runtime`, specification registrations, filenames, scientific declarations and nonempty overrides. Move unwanted declarations outside the direct discovery directories; a nested `parked/` directory is supported. Removing repeated names, output scopes and empty local overrides is optional for projects already using the conventional layout. Run `nipact validate --context CONTEXT --project-dir /path/to/project`; add `--outputs` when you want to re-hash accepted output contents.
+
 ## Specification sets
 
 The current source checkout includes specification sets as an optional finite overlay on ordinary workflows. A project can continue to define and run only steps and workflows; specification declarations are loaded only when a `specifications` command selects a registered key or an explicit file.
@@ -117,7 +119,7 @@ base_workflow: base
 execution_population: small
 ```
 
-The base workflow and population must be declared as usual. Omitting `step_overrides` supplies an empty local mapping, preserving inherited overrides; explicit `{}` has the same meaning. These defaults apply only to absent fields: explicit `null` remains invalid for `step_name`, `workflow_name`, output `address_scope`, and variant `step_overrides`. Existing `inputs: null` and `params: null` still mean empty mappings. Generated demos keep the explicit declarations.
+The base workflow and population must be declared as usual. Omitting `step_overrides` supplies an empty local mapping, preserving inherited overrides; explicit `{}` has the same meaning. These defaults apply only to absent fields: explicit `null` remains invalid for `step_name`, `workflow_name`, output `address_scope`, and variant `step_overrides`. Existing `inputs: null` and `params: null` still mean empty mappings. In the current source checkout, generated demos omit repeated names and output scopes while retaining their nonempty variant overrides.
 
 Malformed declarations remain visible in `nipact validate`, which lists each step, workflow and manifest as `valid`, `invalid` or `unavailable` and exits nonzero if any declaration or registry check fails. Unavailable declarations name the original invalid file. Commands that load declarations warn about unusable files and can select unrelated valid workflows; selecting an unusable workflow fails with its root cause. A runtime without a registry reports `registry  not initialized`.
 
@@ -127,17 +129,17 @@ By default, validation checks registry metadata, retained output contracts, cano
 
 A step output can be a regular file or one complete directory tree, and one step can declare both. Directory outputs are new after `0.0.1a15` and require registry V20.
 
+For a step with `address_scope: entity`, both outputs inherit that scope:
+
 ```yaml
 outputs:
   volumes:
     extension: .json
-    address_scope: entity
   maps:
     kind: directory
-    address_scope: entity
 ```
 
-**Declaration.** `kind` is `file` (the default) or `directory`. A directory output must not declare `extension`. In the current source checkout, an omitted output `address_scope` inherits the step's scope (see [Shorter declarations](#shorter-declarations)); earlier releases require it explicitly. Omitting `kind` and writing `kind: file` are the same declaration, so existing file steps keep their identities, paths, and reuse. Each output's `address_scope`, for files and directories, must equal its step's `address_scope`; NIPACT marks a mismatch invalid in any step file, including a step that no workflow uses.
+**Declaration.** `kind` is `file` (the default) or `directory`. A directory output must not declare `extension`. From `0.0.1a17`, an omitted output `address_scope` inherits the step's scope (see [Shorter declarations](#shorter-declarations)); earlier releases require it explicitly. Omitting `kind` and writing `kind: file` are the same declaration, so existing file steps keep their identities, paths, and reuse. Each output's `address_scope`, for files and directories, must equal its step's `address_scope`; NIPACT marks a mismatch invalid in any step file, including a step that no workflow uses.
 
 **Callable contract.** The callable interface is unchanged. For a directory output, `outputs[name]` is a `Path` that does not exist yet; NIPACT creates only its parent, and the callable creates and finishes the tree before returning. For a directory input, `inputs[name]` holds one `Path` per tree, and the callable reads members by relative path, such as `inputs["maps"][0] / "label-high.npy"`. Callables must not modify their inputs.
 
