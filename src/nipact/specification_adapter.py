@@ -63,6 +63,7 @@ def apply_provisional_member(
     if type(member) is not ProvisionalMember:
         raise ValidationError("member must be a ProvisionalMember")
 
+    loaded.require_usable("workflow", member.workflow_name)
     try:
         selected_workflow = loaded.workflows[member.workflow_name]
     except KeyError as exc:
@@ -247,6 +248,7 @@ def _require_manifest(
     *,
     label: str,
 ) -> None:
+    loaded.require_usable("manifest", manifest_name)
     if manifest_name not in loaded.manifests or manifest_name not in loaded.manifest_paths:
         raise ValidationError(f"{label} references unknown manifest: {manifest_name}")
 

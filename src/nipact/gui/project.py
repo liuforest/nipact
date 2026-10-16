@@ -8,7 +8,11 @@ from pathlib import Path
 from nipact.errors import ValidationError
 from nipact.project_context import resolve_project_context
 from nipact.registry import read_registry_summary
-from nipact.workflow import LoadedWorkflowProject, load_workflow_project
+from nipact.workflow import (
+    LoadedWorkflowProject,
+    load_workflow_project,
+    warn_unusable_declarations,
+)
 
 
 @dataclass(frozen=True)
@@ -24,6 +28,7 @@ def resolve_gui_project(*, project_dir: Path, context: str) -> GuiProject:
     """Resolve a GUI project without running colors-specific validation."""
     resolved = resolve_project_context(project_dir=project_dir, context=context)
     loaded = load_workflow_project(project_dir=project_dir, context=context)
+    warn_unusable_declarations(loaded)
     if loaded.runtime_root != resolved.runtime_root:
         raise ValidationError("workflow project runtime root changed during load")
     read_registry_summary(resolved.registry_path, context=context)

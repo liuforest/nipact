@@ -4345,10 +4345,22 @@ def _validate_published_output_rows(
             address = validate_path_token(address, label="published output address")
         except ValidationError as exc:
             raise ValidationError("registry.db published output address is invalid") from exc
+        issue = loaded_workflow_project.declaration_issue(
+            "workflow", membership_workflow_name
+        )
+        if issue is not None:
+            raise ValidationError(
+                f"cannot check published output until workflow {membership_workflow_name!r} is usable: {issue.error}"
+            )
         if membership_workflow_name not in loaded_workflow_project.workflows:
             raise ValidationError("registry.db published output references unknown workflow")
         if step_name not in workflow_steps[membership_workflow_name]:
             raise ValidationError("registry.db published output references unknown workflow step")
+        issue = loaded_workflow_project.declaration_issue("step", step_name)
+        if issue is not None:
+            raise ValidationError(
+                f"cannot check published output until step {step_name!r} is usable: {issue.error}"
+            )
         step = loaded_workflow_project.steps.get(step_name)
         if step is None or output_name not in step.outputs:
             raise ValidationError("registry.db published output references unknown step output")
@@ -4466,6 +4478,11 @@ def _validate_accepted_workflow_output_row(
         address = validate_path_token(address, label="accepted artifact address")
     except ValidationError as exc:
         raise ValidationError("registry.db accepted artifact address is invalid") from exc
+    issue = loaded_workflow_project.declaration_issue("step", step_name)
+    if issue is not None:
+        raise ValidationError(
+            f"cannot check accepted artifact until step {step_name!r} is usable: {issue.error}"
+        )
     step = loaded_workflow_project.steps.get(step_name)
     if step is None or output_name not in step.outputs:
         raise ValidationError("registry.db accepted artifact references unknown step output")

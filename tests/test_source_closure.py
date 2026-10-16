@@ -110,6 +110,7 @@ def _loaded(
     entity_bindings: dict[str, dict[str, str]] | None = None,
 ) -> LoadedWorkflowProject:
     return LoadedWorkflowProject(
+        declarations={},
         project_root=tmp_path / "project",
         context="study",
         runtime_root=tmp_path / "runtime",

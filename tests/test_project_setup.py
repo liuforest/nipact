@@ -214,11 +214,12 @@ def _assert_validate_passes(
         == 0
     )
     output = capsys.readouterr().out
-    assert "validated_manifests=2" in output
-    assert "parsed_workflow_files=2" in output
-    assert "parsed_step_files=8" in output
-    assert "source_entities=0" in output
-    assert "published_outputs=0" in output
+    lines = output.splitlines()
+    assert len([line for line in lines if line.startswith("manifest ")]) == 2
+    assert len([line for line in lines if line.startswith("workflow ")]) == 2
+    assert len([line for line in lines if line.startswith("step ")]) == 8
+    assert all(" valid" in line for line in lines[3:-2])
+    assert "registry  0 published outputs  valid  contents verified" in output
     assert "PASS: validate" in output
 
 
@@ -410,7 +411,10 @@ def _assert_validate_fails(
         )
         == 1
     )
-    assert expected_error in capsys.readouterr().err
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    assert expected_error in captured.out
+    assert "FAIL: validate" in captured.out
 
 
 def _assert_generic_validate_passes(
@@ -418,8 +422,6 @@ def _assert_generic_validate_passes(
     capsys: pytest.CaptureFixture[str],
     *,
     context: str = "mini",
-    published_outputs: int = 0,
-    source_entities: int = 1,
 ) -> None:
     assert (
         main(
@@ -434,11 +436,11 @@ def _assert_generic_validate_passes(
         == 0
     )
     output = capsys.readouterr().out
-    assert "validated_manifests=1" in output
-    assert "parsed_workflow_files=1" in output
-    assert "parsed_step_files=1" in output
-    assert f"source_entities={source_entities}" in output
-    assert f"published_outputs={published_outputs}" in output
+    assert "manifest  subjects" in output
+    assert "workflow  main" in output
+    assert "step      source_text" in output
+    assert "registry  not initialized" in output
+    assert not (project_dir.parent / "generic_runtime/database/registry.db").exists()
     assert "PASS: validate" in output
 
 
@@ -567,7 +569,9 @@ def test_init_creates_project_runtime_databases_and_validates(
         == 0
     )
     output = capsys.readouterr().out
-    assert "parsed_workflow_files=3" in output
+    assert (
+        len([line for line in output.splitlines() if line.startswith("workflow ")]) == 3
+    )
     assert "PASS: validate" in output
 
 
@@ -718,17 +722,11 @@ def test_init_creates_prepared_neuro_demo_project_and_registry(
         == 0
     )
     validate_output = capsys.readouterr().out
-    assert "validated_manifests=1" in validate_output
-    assert "parsed_workflow_files=1" in validate_output
-    assert f"parsed_step_files={step_count}" in validate_output
-    expected_source_entities = len(
-        template.source_index_payload().get("entities", {})
-    )
-    assert (
-        f"source_entities={expected_source_entities}"
-        in validate_output
-    )
-    assert "published_outputs=0" in validate_output
+    lines = validate_output.splitlines()
+    assert len([line for line in lines if line.startswith("manifest ")]) == 1
+    assert len([line for line in lines if line.startswith("workflow ")]) == 1
+    assert len([line for line in lines if line.startswith("step ")]) == step_count
+    assert "registry  0 published outputs  valid  contents verified" in validate_output
     assert "PASS: validate" in validate_output
 
 
@@ -785,7 +783,7 @@ def test_validate_accepts_registered_published_output(
         == 0
     )
     output = capsys.readouterr().out
-    assert "published_outputs=1" in output
+    assert "registry  1 published outputs  valid  contents verified" in output
     assert "PASS: validate" in output
 
 
@@ -1041,3 +1039,27 @@ def test_validate_rejects_corrupted_project(
     corrupt(project_dir, runtime_dir)
 
     _assert_validate_fails(project_dir, capsys, expected_error)
+
+
+def test_validate_lists_all_declaration_statuses_and_one_line_errors(tmp_path, capsys):
+    project_dir, _ = _init_demo(tmp_path, capsys)
+    (project_dir / "manifests/demo-40.yaml").write_text("entities: [\n")
+    assert (
+        main(["validate", "--project-dir", str(project_dir), "--context", "colors"])
+        == 1
+    )
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    rows = [line.split(maxsplit=3) for line in captured.out.splitlines()[3:-2]]
+    assert len(rows) == 12
+    assert {(row[0], row[1], row[2]) for row in rows} >= {
+        ("manifest", "demo-40", "invalid"),
+        ("step", "color_cohort_fit", "unavailable"),
+        ("workflow", "base", "unavailable"),
+        ("step", "color_source", "valid"),
+    }
+    for row in rows:
+        if row[2] != "valid":
+            assert "demo-40.yaml" in row[3]
+    assert "registry  0 published outputs  valid  contents verified" in captured.out
+    assert captured.out.endswith("FAIL: validate\n")

@@ -674,3 +674,49 @@ def test_member_and_direct_workflows_reuse_exact_ordinary_sibling_bundles(
             "AND step_name = 'model'"
         ).fetchone()[0]
     assert model_artifacts == 4
+
+
+@pytest.mark.parametrize("selection", ["workflow", "population", "binding"])
+def test_adapter_and_frozen_replay_preserve_declaration_root_causes(
+    tmp_path, monkeypatch, selection
+):
+    from nipact.specification_canonical import (
+        canonicalize_specification_snapshot,
+        replay_specification_member,
+    )
+    from nipact.specification_compiler import ProvisionalCompilation
+
+    project_dir, _ = _write_project(tmp_path, monkeypatch)
+    loaded = load_workflow_project(project_dir=project_dir, context="adapter")
+    member = _member()
+    if selection == "binding":
+        member = replace(
+            member,
+            writes=tuple(
+                write
+                for write in member.writes
+                if not isinstance(write, ExecutionPopulationWrite)
+            ),
+        )
+    snapshot = canonicalize_specification_snapshot(
+        loaded=loaded,
+        compilation=ProvisionalCompilation(
+            set_key="root-errors", members=(member,), equivalent_member_groups=()
+        ),
+    )
+    path = project_dir / (
+        "steps/later.yaml" if selection == "workflow" else "manifests/selected.yaml"
+    )
+    path.write_text("malformed: [\n")
+    loaded = load_workflow_project(project_dir=project_dir, context="adapter")
+    with pytest.raises(ValidationError) as raised:
+        apply_provisional_member(loaded=loaded, member=member)
+    assert path.name in str(raised.value) and "YAML" in str(raised.value)
+    assert "unknown" not in str(raised.value)
+    with pytest.raises(
+        ValidationError, match="restore the matching project revision"
+    ) as raised:
+        replay_specification_member(
+            loaded=loaded, snapshot=snapshot, member_key=member.member_key
+        )
+    assert path.name in str(raised.value) and "YAML" in str(raised.value)

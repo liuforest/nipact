@@ -796,9 +796,11 @@ def _run_workflow_command(args: argparse.Namespace) -> int | None:
         compile_workflow_plan,
         load_workflow_project,
         workflow_plan_to_graph,
+        warn_unusable_declarations,
     )
 
     loaded = load_workflow_project(project_dir=project_dir, context=args.context)
+    warn_unusable_declarations(loaded)
 
     if args.workflow_command == "list":
         for workflow_name in sorted(loaded.workflows):
@@ -807,9 +809,7 @@ def _run_workflow_command(args: argparse.Namespace) -> int | None:
         return
 
     if args.workflow_command == "steps":
-        workflow = loaded.workflows.get(args.workflow)
-        if workflow is None:
-            raise ValidationError(f"unknown workflow: {args.workflow}")
+        workflow = loaded.workflow(args.workflow)
         for step_name in workflow.steps:
             if step_name in workflow.step_outputs:
                 print(f"step={step_name} output={workflow.step_outputs[step_name]}")
@@ -1126,12 +1126,25 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(f"context={result.context}")
             print(f"project_root={_display_path(result.project_root)}")
             print(f"runtime_root={_display_path(result.runtime_root)}")
-            print(f"validated_manifests={result.manifest_count}")
-            print(f"parsed_workflow_files={result.workflow_count}")
-            print(f"parsed_step_files={result.step_count}")
-            print(f"source_entities={result.source_entities}")
-            print(f"published_outputs={result.published_outputs}")
-            _print_pass("PASS: validate")
+            for records in result.declarations.values():
+                for record in records:
+                    reason = (
+                        f"  {' '.join(record.error.split())}" if record.error else ""
+                    )
+                    print(f"{record.kind:<9} {record.name:<24} {record.status}{reason}")
+            if not result.registry_initialized:
+                print("registry  not initialized")
+            elif result.registry_error is not None:
+                print(f"registry  invalid  {' '.join(result.registry_error.split())}")
+            else:
+                print(
+                    f"registry  {result.published_outputs} published outputs  valid  contents verified"
+                )
+            if result.success:
+                _print_pass("PASS: validate")
+            else:
+                print("FAIL: validate")
+                return 1
         elif args.command == "gui":
             _run_gui_command(args)
         elif args.command == "trace":

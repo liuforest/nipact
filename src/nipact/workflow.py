@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
-from dataclasses import dataclass
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass, replace
 from importlib import import_module
 from pathlib import Path, PurePosixPath
+import sys
 from typing import Any
 
 import yaml
@@ -145,6 +146,15 @@ class SourceIndex:
 
 
 @dataclass(frozen=True)
+class DeclarationRecord:
+    kind: str
+    name: str
+    path: Path
+    status: str = "valid"
+    error: str | None = None
+
+
+@dataclass(frozen=True)
 class LoadedWorkflowProject:
     project_root: Path
     context: str
@@ -154,6 +164,47 @@ class LoadedWorkflowProject:
     manifest_paths: dict[str, Path]
     steps: dict[str, StepDefinition]
     workflows: dict[str, WorkflowDefinition]
+    declarations: dict[tuple[str, str], tuple[DeclarationRecord, ...]]
+
+    def declaration_issue(self, kind: str, name: str) -> DeclarationRecord | None:
+        return next(
+            (
+                record
+                for record in self.declarations.get((kind, name), ())
+                if record.status != "valid"
+            ),
+            None,
+        )
+
+    def require_usable(self, kind: str, name: str) -> None:
+        issue = self.declaration_issue(kind, name)
+        if issue is not None:
+            raise ValidationError(f"{kind} {name!r} is {issue.status}: {issue.error}")
+
+    def workflow(self, name: str) -> WorkflowDefinition:
+        self.require_usable("workflow", name)
+        try:
+            return self.workflows[name]
+        except KeyError as exc:
+            raise ValidationError(f"unknown workflow: {name}") from exc
+
+
+def warn_unusable_declarations(loaded: LoadedWorkflowProject) -> None:
+    issues = [
+        record
+        for records in loaded.declarations.values()
+        for record in records
+        if record.status != "valid"
+    ]
+    if issues:
+        details = "; ".join(
+            f"{record.path.relative_to(loaded.project_root)} ({record.status})"
+            for record in issues
+        )
+        print(
+            f"WARNING: unusable declarations: {details}; run nipact validate",
+            file=sys.stderr,
+        )
 
 
 @dataclass(frozen=True)
@@ -227,22 +278,99 @@ def load_workflow_project(*, project_dir: Path, context: str) -> LoadedWorkflowP
         runtime_root=runtime_root,
     )
 
-    manifest_paths = _discover_project_files(project_root, "manifests")
-    manifests = {
-        name: _load_manifest(path, label=f"manifest {name!r}")
-        for name, path in sorted(manifest_paths.items())
+    declarations: dict[tuple[str, str], tuple[DeclarationRecord, ...]] = {}
+    candidates = {
+        kind: _discover_project_files(project_root, directory, kind=kind)
+        for kind, directory in (
+            ("manifest", "manifests"),
+            ("step", "steps"),
+            ("workflow", "workflows"),
+        )
     }
+    for records in candidates.values():
+        for record in records:
+            key = (record.kind, record.name)
+            declarations[key] = (*declarations.get(key, ()), record)
 
-    steps = {
-        name: _load_step(path, name=name, manifest_names=set(manifests))
-        for name, path in _discover_project_files(project_root, "steps").items()
+    def load_kind(kind: str, parser: Callable[[Path, str], Any]) -> dict[str, Any]:
+        values: dict[str, Any] = {}
+        for record in candidates[kind]:
+            if record.status != "valid":
+                continue
+            try:
+                values[record.name] = parser(record.path.resolve(), record.name)
+            except ValidationError as exc:
+                _set_declaration_issue(
+                    declarations, kind, record.name, "invalid", str(exc)
+                )
+        return values
+
+    manifest_names = {record.name for record in candidates["manifest"]}
+    step_names = {record.name for record in candidates["step"]}
+    manifests = load_kind(
+        "manifest", lambda path, name: _load_manifest(path, label=f"manifest {name!r}")
+    )
+    manifest_paths = {
+        record.name: record.path.resolve()
+        for record in candidates["manifest"]
+        if record.name in manifests
     }
-    raw_workflows = {
-        name: _load_workflow(path, name=name)
-        for name, path in _discover_project_files(project_root, "workflows").items()
-    }
-    workflows = _resolve_workflows(raw_workflows, steps=steps)
-    _validate_execution_population_names(workflows, manifests=manifests)
+    steps = load_kind(
+        "step",
+        lambda path, name: _load_step(path, name=name, manifest_names=manifest_names),
+    )
+    for name, step in tuple(steps.items()):
+        missing = next(
+            (
+                item.source_step_name
+                for item in step.inputs.values()
+                if item.source_step_name not in step_names
+            ),
+            None,
+        )
+        if missing is not None:
+            _set_declaration_issue(
+                declarations,
+                "step",
+                name,
+                "invalid",
+                f"step {name!r} references unknown source step: {missing}",
+            )
+            del steps[name]
+    while True:
+        unavailable = []
+        for name, step in steps.items():
+            dependencies = [
+                ("step", item.source_step_name) for item in step.inputs.values()
+            ]
+            if step.manifest_binding is not None:
+                dependencies.append(("manifest", step.manifest_binding.manifest_name))
+            for key in dependencies:
+                issue = next(
+                    (
+                        record
+                        for record in declarations[key]
+                        if record.status != "valid"
+                    ),
+                    None,
+                )
+                if issue is not None:
+                    _set_declaration_issue(
+                        declarations, "step", name, "unavailable", issue.error
+                    )
+                    unavailable.append(name)
+                    break
+        if not unavailable:
+            break
+        for name in unavailable:
+            del steps[name]
+
+    raw_workflows = load_kind(
+        "workflow", lambda path, name: _load_workflow(path, name=name)
+    )
+    workflows = _resolve_workflows(
+        raw_workflows, steps=steps, declarations=declarations
+    )
 
     return LoadedWorkflowProject(
         project_root=project_root,
@@ -253,6 +381,7 @@ def load_workflow_project(*, project_dir: Path, context: str) -> LoadedWorkflowP
         manifest_paths=manifest_paths,
         steps=steps,
         workflows=workflows,
+        declarations=declarations,
     )
 
 
@@ -265,10 +394,7 @@ def compile_workflow_plan(
     """Compile one runnable workflow step into a read-only dependency plan."""
     workflow_name = validate_path_token(workflow_name, label="workflow_name")
     selected_step_name = validate_path_token(step_name, label="step_name")
-    try:
-        workflow = loaded.workflows[workflow_name]
-    except KeyError as exc:
-        raise ValidationError(f"unknown workflow: {workflow_name}") from exc
+    workflow = loaded.workflow(workflow_name)
     try:
         selected_output_name = workflow.step_outputs[selected_step_name]
     except KeyError as exc:
@@ -940,6 +1066,7 @@ def _parse_source_binding_mapping(
         return {}
     if not isinstance(payload, Mapping):
         raise ValidationError(f"{label} must be a mapping")
+    _check_string_keys(payload, label=label)
     bindings: dict[str, str] = {}
     for raw_name, raw_path in sorted(payload.items()):
         name = validate_path_token(raw_name, label="source binding")
@@ -961,6 +1088,7 @@ def _parse_entity_source_bindings(
         return {}
     if not isinstance(payload, Mapping):
         raise ValidationError(f"{label} must be a mapping")
+    _check_string_keys(payload, label=label)
     entities: dict[str, dict[str, str]] = {}
     for raw_address, raw_bindings in sorted(payload.items()):
         address = validate_path_token(raw_address, label="source entity address")
@@ -1000,34 +1128,68 @@ def _parse_source_runtime_path(payload: Any, *, runtime_root: Path, label: str) 
     return payload
 
 
-def _discover_project_files(project_root: Path, directory: str) -> dict[str, Path]:
+def _set_declaration_issue(
+    declarations: dict[tuple[str, str], tuple[DeclarationRecord, ...]],
+    kind: str,
+    name: str,
+    status: str,
+    error: str | None,
+) -> None:
+    key = (kind, name)
+    declarations[key] = tuple(
+        replace(
+            record,
+            status=status,
+            error=(f"{record.path}: {error}" if status == "invalid" else error),
+        )
+        for record in declarations[key]
+    )
+
+
+def _discover_project_files(
+    project_root: Path, directory: str, *, kind: str
+) -> list[DeclarationRecord]:
     path = _resolve_project_path(project_root, directory, label=f"{directory} directory")
     if not path.is_dir():
         raise ValidationError(f"missing {directory} directory: {path}")
-
-    files: dict[str, Path] = {}
-    names: dict[str, str] = {}
-    for entry in sorted(path.iterdir()):
-        if entry.name.startswith(".") or entry.suffix not in {".yaml", ".yml", ".YAML"}:
-            continue
-        if entry.suffix != ".yaml":
-            raise ValidationError(f"declaration {entry}: rename to use the .yaml extension")
-        name = validate_path_token(entry.stem, label=f"{directory} name")
-        folded_name = name.casefold()
-        if folded_name in names:
-            raise ValidationError(
-                f"case-insensitive declaration name collision: {names[folded_name]} and {entry}"
-            )
-        names[folded_name] = str(entry)
-        resolved = entry.resolve()
-        if not _path_contains_or_same(project_root, resolved):
-            raise ValidationError(f"declaration {entry} must stay inside project dir")
-        if not resolved.is_file():
-            raise ValidationError(f"declaration must be a regular file: {entry}")
-        files[name] = resolved
-    if not files:
+    entries = [
+        entry
+        for entry in sorted(path.iterdir())
+        if not entry.name.startswith(".") and entry.suffix in {".yaml", ".yml", ".YAML"}
+    ]
+    if not entries:
         raise ValidationError(f"missing {directory} YAML files in {path}")
-    return files
+    groups: dict[str, list[Path]] = {}
+    for entry in entries:
+        groups.setdefault(entry.stem.casefold(), []).append(entry)
+    records: list[DeclarationRecord] = []
+    for entry in entries:
+        error = None
+        try:
+            collisions = groups[entry.stem.casefold()]
+            if len(collisions) > 1:
+                raise ValidationError(
+                    "case-insensitive declaration name collision: "
+                    + " and ".join(str(item) for item in collisions)
+                )
+            if entry.suffix != ".yaml":
+                raise ValidationError("rename to use the .yaml extension")
+            validate_path_token(entry.stem, label=f"{directory} name")
+            resolved = entry.resolve()
+            if not _path_contains_or_same(project_root, resolved):
+                raise ValidationError("declaration must stay inside project dir")
+            if not resolved.is_file():
+                raise ValidationError("declaration must be a regular file")
+        except (OSError, RuntimeError) as exc:
+            error = f"{entry}: cannot resolve declaration: {exc}"
+        except ValidationError as exc:
+            error = f"{entry}: {exc}"
+        records.append(
+            DeclarationRecord(
+                kind, entry.stem, entry, "invalid" if error else "valid", error
+            )
+        )
+    return records
 
 
 def _resolve_project_path(project_root: Path, raw_path: Any, *, label: str) -> Path:
@@ -1148,6 +1310,7 @@ def _parse_inputs(payload: Any, *, label: str) -> dict[str, StepInput]:
     if not isinstance(payload, Mapping):
         raise ValidationError(f"{label} must be a mapping")
 
+    _check_string_keys(payload, label=label)
     inputs: dict[str, StepInput] = {}
     for raw_name, raw_input in sorted(payload.items()):
         name = validate_path_token(raw_name, label="input name")
@@ -1227,6 +1390,7 @@ def _parse_outputs(
     if not payload:
         raise ValidationError(f"{label} cannot be empty")
 
+    _check_string_keys(payload, label=label)
     outputs: dict[str, StepOutput] = {}
     for raw_name, raw_output in sorted(payload.items()):
         name = validate_path_token(raw_name, label="output name")
@@ -1319,6 +1483,7 @@ def _parse_params(payload: Any, *, label: str) -> dict[str, Any]:
         return {}
     if not isinstance(payload, Mapping):
         raise ValidationError(f"{label} must be a mapping")
+    _check_string_keys(payload, label=label)
     params: dict[str, Any] = {}
     for raw_name, value in sorted(payload.items()):
         name = validate_path_token(raw_name, label="param name")
@@ -1462,6 +1627,7 @@ def _parse_workflow_step_outputs(payload: Any, *, label: str) -> dict[str, str]:
 def _parse_overrides(payload: Any, *, label: str) -> dict[str, WorkflowStepOverride]:
     if not isinstance(payload, Mapping):
         raise ValidationError(f"{label} must be a mapping")
+    _check_string_keys(payload, label=label)
     overrides: dict[str, WorkflowStepOverride] = {}
     for raw_step_name, raw_override in sorted(payload.items()):
         step_name = validate_path_token(raw_step_name, label="override step_name")
@@ -1484,27 +1650,79 @@ def _resolve_workflows(
     raw_workflows: Mapping[str, WorkflowDefinition],
     *,
     steps: Mapping[str, StepDefinition],
+    declarations: dict[tuple[str, str], tuple[DeclarationRecord, ...]],
 ) -> dict[str, WorkflowDefinition]:
     resolved: dict[str, WorkflowDefinition] = {}
-    resolving: set[str] = set()
+    resolving: list[str] = []
 
-    def resolve(name: str) -> WorkflowDefinition:
+    def resolve(name: str) -> WorkflowDefinition | None:
         if name in resolved:
             return resolved[name]
         if name in resolving:
-            raise ValidationError(f"workflow inheritance cycle includes {name!r}")
-        if name not in raw_workflows:
-            raise ValidationError(f"unknown workflow: {name}")
+            for member in resolving[resolving.index(name) :]:
+                _set_declaration_issue(
+                    declarations,
+                    "workflow",
+                    member,
+                    "invalid",
+                    f"workflow inheritance cycle includes {name!r}",
+                )
+            return None
+        if declarations[("workflow", name)][0].status != "valid":
+            return None
+        resolving.append(name)
+        try:
+            workflow = resolve_valid(raw_workflows[name])
+            if workflow is not None:
+                resolved[name] = workflow
+            return workflow
+        except ValidationError as exc:
+            _set_declaration_issue(declarations, "workflow", name, "invalid", str(exc))
+            return None
+        finally:
+            resolving.pop()
 
-        resolving.add(name)
-        workflow = raw_workflows[name]
+    def dependency(workflow: WorkflowDefinition, kind: str, name: str) -> bool:
+        issue = next(
+            (
+                record
+                for record in declarations[(kind, name)]
+                if record.status != "valid"
+            ),
+            None,
+        )
+        if issue is not None:
+            # Cycle members already own an invalid error; descendants inherit its root.
+            if declarations[("workflow", workflow.name)][0].status == "valid":
+                _set_declaration_issue(
+                    declarations, "workflow", workflow.name, "unavailable", issue.error
+                )
+            return False
+        return True
+
+    def resolve_valid(workflow: WorkflowDefinition) -> WorkflowDefinition | None:
+        manifest_name = workflow.execution_population_name
+        if (
+            manifest_name is not None
+            and ("manifest", manifest_name) not in declarations
+        ):
+            raise ValidationError(
+                f"workflow {workflow.name!r} references unknown execution_population: {manifest_name}"
+            )
+        for step_name in workflow.steps:
+            if ("step", step_name) not in declarations:
+                raise ValidationError(
+                    f"workflow {workflow.name!r} references unknown step: {step_name}"
+                )
         if workflow.base_workflow is not None:
-            if workflow.base_workflow not in raw_workflows:
+            if ("workflow", workflow.base_workflow) not in declarations:
                 raise ValidationError(
                     f"workflow {workflow.name!r} references unknown base_workflow: "
                     f"{workflow.base_workflow}"
                 )
             base = resolve(workflow.base_workflow)
+            if not dependency(workflow, "workflow", workflow.base_workflow):
+                return None
             step_overrides = dict(base.step_overrides)
             for step_name, override in workflow.step_overrides.items():
                 if step_name not in base.steps:
@@ -1536,28 +1754,18 @@ def _resolve_workflows(
                 source_path=workflow.source_path,
             )
 
+        dependencies = [("step", step_name) for step_name in workflow.steps]
+        if workflow.execution_population_name is not None:
+            dependencies.append(("manifest", workflow.execution_population_name))
+        for kind, name in dependencies:
+            if not dependency(workflow, kind, name):
+                return None
         _validate_workflow_references(workflow, steps=steps)
-        resolved[name] = workflow
-        resolving.remove(name)
         return workflow
 
     for name in sorted(raw_workflows):
         resolve(name)
     return resolved
-
-
-def _validate_execution_population_names(
-    workflows: Mapping[str, WorkflowDefinition],
-    *,
-    manifests: Mapping[str, Manifest],
-) -> None:
-    for workflow in workflows.values():
-        manifest_name = workflow.execution_population_name
-        if manifest_name is not None and manifest_name not in manifests:
-            raise ValidationError(
-                f"workflow {workflow.name!r} references unknown "
-                f"execution_population: {manifest_name}"
-            )
 
 
 def _validate_workflow_references(
@@ -1741,6 +1949,11 @@ def _validate_callable(value: str, *, label: str) -> None:
         raise ValidationError(f"{label} does not resolve to a callable")
 
 
+def _check_string_keys(payload: Mapping[object, Any], *, label: str) -> None:
+    if any(not isinstance(key, str) for key in payload):
+        raise ValidationError(f"{label} mapping keys must be strings")
+
+
 def _check_fields(
     payload: Mapping[str, Any],
     *,
@@ -1748,6 +1961,7 @@ def _check_fields(
     required: frozenset[str],
     label: str,
 ) -> None:
+    _check_string_keys(payload, label=label)
     keys = set(payload)
     unknown = sorted(keys - allowed)
     if unknown:
@@ -1771,11 +1985,15 @@ def _allowed_value(value: str, *, allowed: frozenset[str], label: str) -> str:
 
 
 def _load_yaml_mapping(path: Path, *, label: str) -> dict[str, Any]:
-    if not path.is_file():
-        raise ValidationError(f"missing YAML file: {path}")
     try:
-        payload = yaml.safe_load(path.read_text(encoding="utf-8"))
-    except yaml.YAMLError as exc:
+        if not path.is_file():
+            raise ValidationError(f"missing YAML file: {path}")
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as exc:
+        raise ValidationError(f"invalid YAML file {path}: {exc}") from exc
+    try:
+        payload = yaml.safe_load(text)
+    except (yaml.YAMLError, ValueError) as exc:
         raise ValidationError(f"invalid YAML file {path}: {exc}") from exc
     if not isinstance(payload, dict):
         raise ValidationError(f"{label} must contain a mapping")

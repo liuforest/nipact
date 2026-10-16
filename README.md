@@ -119,6 +119,8 @@ execution_population: small
 
 The base workflow and population must be declared as usual. Omitting `step_overrides` supplies an empty local mapping, preserving inherited overrides; explicit `{}` has the same meaning. These defaults apply only to absent fields: explicit `null` remains invalid for `step_name`, `workflow_name`, output `address_scope`, and variant `step_overrides`. Existing `inputs: null` and `params: null` still mean empty mappings. Generated demos keep the explicit declarations.
 
+Malformed declarations remain visible in `nipact validate`, which lists each step, workflow and manifest as `valid`, `invalid` or `unavailable` and exits nonzero if any declaration or registry check fails. Unavailable declarations name the original invalid file. Commands that load declarations warn about unusable files and can select unrelated valid workflows; selecting an unusable workflow fails with its root cause. A runtime without a registry reports `registry  not initialized`.
+
 ## Directory outputs
 
 A step output can be a regular file or one complete directory tree, and one step can declare both. Directory outputs are new after `0.0.1a15` and require registry V20.
@@ -133,7 +135,7 @@ outputs:
     address_scope: entity
 ```
 
-**Declaration.** `kind` is `file` (the default) or `directory`. A directory output must not declare `extension`. In the current source checkout, an omitted output `address_scope` inherits the step's scope (see [Shorter declarations](#shorter-declarations)); earlier releases require it explicitly. Omitting `kind` and writing `kind: file` are the same declaration, so existing file steps keep their identities, paths, and reuse. Each output's `address_scope`, for files and directories, must equal its step's `address_scope`; project loading rejects a mismatch in any step file, including a step that no workflow uses.
+**Declaration.** `kind` is `file` (the default) or `directory`. A directory output must not declare `extension`. In the current source checkout, an omitted output `address_scope` inherits the step's scope (see [Shorter declarations](#shorter-declarations)); earlier releases require it explicitly. Omitting `kind` and writing `kind: file` are the same declaration, so existing file steps keep their identities, paths, and reuse. Each output's `address_scope`, for files and directories, must equal its step's `address_scope`; NIPACT marks a mismatch invalid in any step file, including a step that no workflow uses.
 
 **Callable contract.** The callable interface is unchanged. For a directory output, `outputs[name]` is a `Path` that does not exist yet; NIPACT creates only its parent, and the callable creates and finishes the tree before returning. For a directory input, `inputs[name]` holds one `Path` per tree, and the callable reads members by relative path, such as `inputs["maps"][0] / "label-high.npy"`. Callables must not modify their inputs.
 

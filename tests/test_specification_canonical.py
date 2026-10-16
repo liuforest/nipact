@@ -167,6 +167,7 @@ def _project(*, context: str = "canonical") -> LoadedWorkflowProject:
         ),
     }
     return LoadedWorkflowProject(
+        declarations={},
         project_root=Path("/project"),
         context=context,
         runtime_root=Path("/runtime"),

@@ -20,7 +20,11 @@ from .specification_config import (
     SpecificationRegistrations,
     parse_specification_registrations,
 )
-from .workflow import LoadedWorkflowProject, load_workflow_project
+from .workflow import (
+    LoadedWorkflowProject,
+    load_workflow_project,
+    warn_unusable_declarations,
+)
 
 type StrictValue = (
     None
@@ -105,6 +109,7 @@ def load_specification_project(
         project_dir=project_dir,
         context=context,
     )
+    warn_unusable_declarations(workflow_project)
     registrations = parse_specification_registrations(
         _read_project_config(workflow_project.project_root / "nipact.yaml")
     )

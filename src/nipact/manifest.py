@@ -173,6 +173,8 @@ def build_manifest(*, description: str, entities: Iterable[object]) -> Manifest:
 
 def parse_manifest(payload: Mapping[str, Any], *, label: str = "manifest") -> Manifest:
     """Parse a minimal manifest mapping with description and entities fields."""
+    if any(not isinstance(key, str) for key in payload):
+        raise ValidationError(f"{label} mapping keys must be strings")
     keys = set(payload)
     unknown = sorted(keys - MANIFEST_FIELDS)
     if unknown:
@@ -189,11 +191,15 @@ def parse_manifest(payload: Mapping[str, Any], *, label: str = "manifest") -> Ma
 
 def load_manifest(path: Path) -> Manifest:
     """Load and parse a minimal YAML manifest file."""
-    if not path.is_file():
-        raise ValidationError(f"missing manifest file: {path}")
     try:
-        payload = yaml.safe_load(path.read_text(encoding="utf-8"))
-    except yaml.YAMLError as exc:
+        if not path.is_file():
+            raise ValidationError(f"missing manifest file: {path}")
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as exc:
+        raise ValidationError(f"invalid manifest YAML file {path}: {exc}") from exc
+    try:
+        payload = yaml.safe_load(text)
+    except (yaml.YAMLError, ValueError) as exc:
         raise ValidationError(f"invalid manifest YAML file {path}: {exc}") from exc
     if not isinstance(payload, dict):
         raise ValidationError(f"manifest file must contain a mapping: {path}")
