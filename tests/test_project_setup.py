@@ -446,6 +446,168 @@ def _assert_generic_validate_passes(
     assert "PASS: validate" in output
 
 
+def test_init_existing_project_preserves_staged_files_and_catalogs_valid_manifests(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    project_dir, runtime_dir = _write_generic_prepared_project(tmp_path)
+    _write_yaml(
+        project_dir / "manifests/unused.yaml",
+        {"description": "Unused catalog population", "entities": ["sub_001", "sub_002"]},
+    )
+    (project_dir / "manifests/broken.yaml").write_text("entities: [\n")
+    staged_files = {
+        runtime_dir / "data/source/sub_001.txt": b"staged source\n",
+        runtime_dir / "outputs/v1/loose.txt": b"unregistered output\n",
+        runtime_dir / "notes.txt": b"runtime notes\n",
+    }
+    for path, contents in staged_files.items():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(contents)
+    index_path = tmp_path / "nipact.contexts.yaml"
+    index_path.write_text("contexts:\n  mini:\n    project_dir: generic_project\n")
+    index_before = index_path.read_bytes()
+    declarations_before = {
+        path.relative_to(project_dir): path.read_bytes()
+        for path in project_dir.rglob("*")
+        if path.is_file()
+    }
+    nested_dir = tmp_path / "workspace/nested"
+    nested_dir.mkdir(parents=True)
+
+    assert _run_main_from(nested_dir, ["init"]) == 0
+
+    captured = capsys.readouterr()
+    selection_lines = [
+        line for line in captured.err.splitlines() if line.startswith("Selected project:")
+    ]
+    assert len(selection_lines) == 1
+    assert str(project_dir) in selection_lines[0] and "mini" in selection_lines[0]
+    assert captured.err.count("WARNING:") == 1
+    assert "manifests/broken.yaml" in captured.err
+    assert "nipact validate" in captured.err
+    summary = dict(
+        line.split("=", maxsplit=1)
+        for line in captured.out.splitlines()
+        if "=" in line
+    )
+    assert summary["context"] == "mini"
+    assert summary["manifest_count"] == "2"
+    assert not {"context_index", "demo", "source_index", "source_file_count"} & summary.keys()
+    assert "PASS: init" in captured.out
+    assert index_path.read_bytes() == index_before
+    assert not (nested_dir / "nipact.contexts.yaml").exists()
+    assert {
+        path.relative_to(project_dir): path.read_bytes()
+        for path in project_dir.rglob("*")
+        if path.is_file()
+    } == declarations_before
+    assert all(path.read_bytes() == contents for path, contents in staged_files.items())
+    assert all(
+        (runtime_dir / path).is_dir()
+        for path in ("data", "database", "outputs/v1", "manifests/generated")
+    )
+    with sqlite3.connect(runtime_dir / "database/registry.db") as conn:
+        assert conn.execute(
+            "SELECT context, runtime_path, storage_layout_version FROM contexts"
+        ).fetchall() == [("mini", str(runtime_dir), 1)]
+        assert conn.execute(
+            """
+            SELECT d.manifest_name, d.declared_path, v.entity_count, v.canonical_body
+            FROM manifest_declarations d
+            JOIN manifest_values v
+              ON v.value_schema = d.last_validated_manifest_value_schema
+             AND v.manifest_digest = d.last_validated_manifest_digest
+            ORDER BY d.manifest_name
+            """
+        ).fetchall() == [
+            ("subjects", "manifests/subjects.yaml", 1, "sub_001"),
+            ("unused", "manifests/unused.yaml", 2, "sub_001\nsub_002"),
+        ]
+        assert conn.execute("SELECT COUNT(*) FROM manifest_values").fetchone()[0] == 2
+        for table in ("artifacts", "workflow_runs", "published_outputs"):
+            assert conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] == 0
+
+
+def test_init_existing_project_creates_missing_runtime_and_refuses_reinitialization(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    project_dir, runtime_dir = _write_generic_prepared_project(tmp_path)
+    runtime_dir.rmdir()
+    arguments = ["init", "--project-dir", str(project_dir)]
+
+    assert _run_main_from(tmp_path, arguments) == 0
+    captured = capsys.readouterr()
+    assert "PASS: init" in captured.out
+    assert captured.err == ""
+    assert (runtime_dir / "database/registry.db").is_file()
+    assert (runtime_dir / "outputs/v1").is_dir()
+    assert not (tmp_path / "nipact.contexts.yaml").exists()
+    runtime_before = {
+        path.relative_to(runtime_dir): path.read_bytes() if path.is_file() else None
+        for path in runtime_dir.rglob("*")
+    }
+
+    assert _run_main_from(tmp_path, arguments) == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "registry already exists" in captured.err
+    assert {
+        path.relative_to(runtime_dir): path.read_bytes() if path.is_file() else None
+        for path in runtime_dir.rglob("*")
+    } == runtime_before
+    assert not (tmp_path / "nipact.contexts.yaml").exists()
+
+
+@pytest.mark.parametrize(
+    ("runtime_path", "diagnostic"),
+    [
+        (".", "project dir and runtime dir must be different"),
+        ("runtime", "project dir and runtime dir must not contain each other"),
+        ("..", "project dir and runtime dir must not contain each other"),
+    ],
+)
+def test_init_existing_project_refuses_overlapping_roots_before_writes(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    runtime_path: str,
+    diagnostic: str,
+) -> None:
+    project_dir, _runtime_dir = _write_generic_prepared_project(tmp_path)
+    _write_project_config(
+        project_dir, {"context": "mini", "paths": {"runtime": runtime_path}}
+    )
+    before = {
+        path.relative_to(tmp_path): path.read_bytes() if path.is_file() else None
+        for path in tmp_path.rglob("*")
+    }
+
+    assert _run_main_from(tmp_path, ["init", "--project-dir", str(project_dir)]) == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert diagnostic in captured.err
+    assert {
+        path.relative_to(tmp_path): path.read_bytes() if path.is_file() else None
+        for path in tmp_path.rglob("*")
+    } == before
+
+
+def test_init_existing_project_load_failure_precedes_runtime_creation(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    project_dir, runtime_dir = _write_generic_prepared_project(tmp_path)
+    runtime_dir.rmdir()
+    (project_dir / "sources.yaml").write_text("entities: [\n")
+
+    assert _run_main_from(tmp_path, ["init", "--project-dir", str(project_dir)]) == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "sources.yaml" in captured.err and "invalid YAML" in captured.err
+    assert not runtime_dir.exists()
+
+
 def test_init_creates_project_runtime_databases_and_validates(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
