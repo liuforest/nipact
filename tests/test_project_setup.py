@@ -69,7 +69,6 @@ def _init_demo(
     )
     output = capsys.readouterr().out
     assert "PASS: init" in output
-    assert "manifest_hash=90ddcf303284f890" in output
     return project_dir, runtime_dir
 
 
@@ -589,7 +588,7 @@ def test_registry_manifest_values_deduplicate_and_reject_key_collisions(
         "alias": "manifests/alias.yaml",
     }
 
-    registry_module.initialize_prepared_demo_registry_db(
+    registry_module.initialize_registry_db(
         registry_path,
         context="example",
         runtime_root=tmp_path,
@@ -621,7 +620,7 @@ def test_registry_manifest_values_deduplicate_and_reject_key_collisions(
         ValidationError,
         match="manifest value does not match its schema-qualified key",
     ):
-        registry_module.initialize_prepared_demo_registry_db(
+        registry_module.initialize_registry_db(
             registry_path,
             context="example",
             runtime_root=tmp_path,

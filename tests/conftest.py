@@ -24,7 +24,7 @@ from nipact.manifest import load_manifest
 from nipact.registry import (
     REGISTRY_DB_PATH,
     REGISTRY_V19_BACKUP_FILENAME,
-    initialize_prepared_demo_registry_db,
+    initialize_registry_db,
     list_artifacts,
     migrate_registry_db,
 )
@@ -440,7 +440,7 @@ def write_compact_colors_project(tmp_path: Path) -> tuple[Path, Path]:
         json.dumps({"records": [{"entity_id": entity} for entity in entities]}) + "\n",
         encoding="utf-8",
     )
-    initialize_prepared_demo_registry_db(
+    initialize_registry_db(
         runtime_dir / REGISTRY_DB_PATH,
         context="colors",
         runtime_root=runtime_dir,

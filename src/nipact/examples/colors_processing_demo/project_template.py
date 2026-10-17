@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
 from typing import Any
 
 from ...manifest import Manifest, build_manifest
@@ -39,6 +41,17 @@ MANIFEST_DESCRIPTIONS = {
     ANALYSIS_COHORT_NAME: "Full deterministic colors source population",
     FIT_COHORT_NAME: "Outer two radial bins used for the Pattern B fit cohort",
 }
+
+
+def source_file_paths() -> list[str]:
+    return [SOURCE_ARTIFACT_PATH]
+
+
+def write_runtime_sources(runtime_root: Path) -> None:
+    (runtime_root / SOURCE_ARTIFACT_PATH).write_text(
+        json.dumps(source_payload(), indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
 
 
 def source_payload() -> dict[str, Any]:

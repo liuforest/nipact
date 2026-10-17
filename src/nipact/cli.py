@@ -1098,12 +1098,6 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(f"source_index={result.source_index}")
             print(f"manifest_count={result.manifest_count}")
             print(f"source_file_count={result.source_file_count}")
-            if result.source_hash is not None and result.manifest_hash is not None:
-                print("source_data=data/color_source.json")
-                print("source_manifest=init")
-                print("init_entities=200")
-                print(f"manifest_hash={result.manifest_hash}")
-                print(f"source_hash={result.source_hash}")
             print("databases=database/registry.db")
             print("runtime_dirs=data,database,outputs,manifests/generated")
             _print_pass("PASS: init")

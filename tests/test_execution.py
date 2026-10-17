@@ -253,7 +253,7 @@ def uppercase_text_file(*, inputs, outputs, params, address):
             encoding="utf-8",
         )
 
-    registry_module.initialize_prepared_demo_registry_db(
+    registry_module.initialize_registry_db(
         runtime_dir / "database/registry.db",
         context="mini",
         runtime_root=runtime_dir,
@@ -443,7 +443,7 @@ def consume_qc_file(*, inputs, outputs, params, address):
             encoding="utf-8",
         )
 
-    registry_module.initialize_prepared_demo_registry_db(
+    registry_module.initialize_registry_db(
         runtime_dir / "database/registry.db",
         context="multi",
         runtime_root=runtime_dir,

@@ -246,7 +246,7 @@ def later(*, inputs, outputs, params, address):
         name: load_manifest(project_dir / f"manifests/{name}.yaml")
         for name in ("subjects", "selected", "empty_fit")
     }
-    registry_module.initialize_prepared_demo_registry_db(
+    registry_module.initialize_registry_db(
         runtime_dir / "database/registry.db",
         context="adapter",
         runtime_root=runtime_dir,
