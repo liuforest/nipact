@@ -4,7 +4,6 @@ from pathlib import Path
 
 import pytest
 
-import nipact.context_index as context_index_module
 import nipact.project_context as project_context_module
 import nipact.registry as registry_module
 from nipact._version import __version__
@@ -73,19 +72,16 @@ def test_cli_version_prints_package_version(capsys: pytest.CaptureFixture[str]) 
     assert capsys.readouterr().out.strip() == f"nipact {__version__}"
 
 
-def test_registry_migrate_parser_requires_context_and_has_help(
+def test_registry_migrate_help_describes_project_selection(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    with pytest.raises(SystemExit) as exc_info:
-        main(["registry", "migrate"])
-    assert exc_info.value.code == 2
-    assert "--context" in capsys.readouterr().err
-
     with pytest.raises(SystemExit) as exc_info:
         main(["registry", "migrate", "--help"])
     assert exc_info.value.code == 0
     help_text = " ".join(capsys.readouterr().out.split())
     assert "migrate an exact schema-19 registry to schema 20" in help_text
+    assert "--context" in help_text and "If omitted" in help_text
+    assert "parents" in help_text and "must match" in help_text
 
 
 def _patch_registry_migration_route(
@@ -103,10 +99,8 @@ def _patch_registry_migration_route(
     )
     routed: list[tuple[Path, str]] = []
 
-    def resolve_project_dir(*, project_dir: Path | None, context: str) -> Path:
-        assert project_dir == Path("project")
-        assert context == "fixture"
-        return resolved.project_root
+    project_dir.mkdir()
+    (project_dir / "nipact.yaml").write_text("context: fixture\n", encoding="utf-8")
 
     def resolve_for_migration(*, project_dir: Path, context: str) -> object:
         routed.append((project_dir, context))
@@ -120,7 +114,6 @@ def _patch_registry_migration_route(
             raise result
         return result
 
-    monkeypatch.setattr(context_index_module, "resolve_project_dir", resolve_project_dir)
     monkeypatch.setattr(
         project_context_module,
         "resolve_project_context_for_migration",
@@ -228,6 +221,7 @@ def test_registry_migrate_failure_has_no_partial_stdout(
         runtime_dir=tmp_path / "runtime",
         result=ValidationError("migration failed"),
     )
+    monkeypatch.chdir(tmp_path)
 
     assert main(
         [
@@ -427,6 +421,17 @@ def test_workflow_graph_command_prints_json_only(
         "analysis_cohort",
     }
 
+    assert _run_main_from(
+        project_dir / "steps",
+        ["workflow", "graph", "--workflow", "base", "--step", "color_sector_analysis"],
+    ) == 0
+    captured = capsys.readouterr()
+    assert json.loads(captured.out) == graph
+    selection_lines = captured.err.splitlines()
+    assert len(selection_lines) == 1
+    assert str(project_dir.resolve()) in selection_lines[0]
+    assert "colors" in selection_lines[0]
+
     (project_dir / "workflows/draft.yaml").write_text("steps: [\n")
     assert (
         main(
@@ -520,7 +525,10 @@ def test_workflow_run_command_executes_step(
 
     captured = capsys.readouterr()
     output = captured.out.splitlines()
-    assert captured.err == ""
+    selection_lines = captured.err.splitlines()
+    assert len(selection_lines) == 1
+    assert str(project_dir.resolve()) in selection_lines[0]
+    assert "colors" in selection_lines[0]
     assert "\r" not in captured.out
     assert "\r" not in captured.err
     assert output[:10] == [

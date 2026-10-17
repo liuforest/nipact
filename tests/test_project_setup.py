@@ -766,7 +766,7 @@ def test_validate_fails_for_missing_project_config(
         )
         == 1
     )
-    assert "missing YAML file" in capsys.readouterr().err
+    assert "missing project config" in capsys.readouterr().err
 
 
 def test_validate_accepts_registered_published_output(
