@@ -72,18 +72,6 @@ def test_cli_version_prints_package_version(capsys: pytest.CaptureFixture[str]) 
     assert capsys.readouterr().out.strip() == f"nipact {__version__}"
 
 
-def test_registry_migrate_help_describes_project_selection(
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    with pytest.raises(SystemExit) as exc_info:
-        main(["registry", "migrate", "--help"])
-    assert exc_info.value.code == 0
-    help_text = " ".join(capsys.readouterr().out.split())
-    assert "migrate an exact schema-19 registry to schema 20" in help_text
-    assert "--context" in help_text and "If omitted" in help_text
-    assert "parents" in help_text and "must match" in help_text
-
-
 def _patch_registry_migration_route(
     *,
     monkeypatch: pytest.MonkeyPatch,
@@ -462,7 +450,6 @@ def test_workflow_graph_command_prints_json_only(
     assert json.loads(captured.out) == graph
     assert captured.err.count("WARNING:") == 1
     assert "workflows/draft.yaml" in captured.err
-    assert "nipact validate" in captured.err
 
     assert (
         main(

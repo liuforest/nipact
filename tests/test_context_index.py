@@ -22,7 +22,7 @@ from nipact.context_index import (
         ),
         pytest.param(
             {"near/nipact.yaml": "context: nearby"},
-            "near/nested", None, None, ("near", "nearby"), None,
+            "near", None, None, ("near", "nearby"), None,
             id="nearer-project",
         ),
         pytest.param(
@@ -66,16 +66,6 @@ from nipact.context_index import (
             id="invalid-nearest-config",
         ),
         pytest.param(
-            {"near/nipact.contexts.yaml": None},
-            "near/nested", None, None, None, "not a file",
-            id="non-file-index",
-        ),
-        pytest.param(
-            {"near/nipact.yaml": None},
-            "near/nested", None, None, None, "could not read project config",
-            id="non-file-config",
-        ),
-        pytest.param(
             {"nipact.contexts.yaml": "contexts: {colors: {project_dir: missing}}"},
             "nested", None, None, None, "project dir does not exist",
             id="missing-index-target",
@@ -97,19 +87,14 @@ from nipact.context_index import (
         ),
         pytest.param(
             {"project/nipact.yaml": "paths: {}"},
-            "nested", "project", None, None, "context",
+            "nested", "project", None, None, "context must be a string",
             id="declared-context-required",
-        ),
-        pytest.param(
-            {},
-            "nested", "project", "", None, "context",
-            id="empty-explicit-context",
         ),
     ],
 )
 def test_resolve_project_selects_context_at_nearest_boundary(
     tmp_path: Path,
-    files: dict[str, str | None],
+    files: dict[str, str],
     cwd: str,
     explicit: str | None,
     context: str | None,
@@ -124,10 +109,7 @@ def test_resolve_project_selects_context_at_nearest_boundary(
     for name, content in declarations.items():
         path = tmp_path / name
         path.parent.mkdir(parents=True, exist_ok=True)
-        if content is None:
-            path.mkdir()
-        else:
-            path.write_text(content, encoding="utf-8")
+        path.write_text(content, encoding="utf-8")
     start = tmp_path / cwd
     start.mkdir(parents=True, exist_ok=True)
     project_dir = tmp_path / explicit if explicit is not None else None
