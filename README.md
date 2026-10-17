@@ -65,6 +65,32 @@ Specification sets and libraries remain explicitly registered with `specificatio
 
 To migrate an existing project, inventory the direct declaration files first and check that the old `sources.index`, `steps.directory`, workflow map and manifest map exactly match the conventional names and paths. Then remove those four obsolete top-level sections, preserving `context`, `paths.runtime`, specification registrations, filenames, scientific declarations and nonempty overrides. Move unwanted declarations outside the direct discovery directories; a nested `parked/` directory is supported. Removing repeated names, output scopes and empty local overrides is optional for projects already using the conventional layout. Run `nipact validate --context CONTEXT --project-dir /path/to/project`; add `--outputs` when you want to re-hash accepted output contents.
 
+## Selecting a project
+
+**Source checkout after `0.0.1a18`:** project commands can infer the context from `nipact.yaml`. These selection conveniences are not part of the pinned PyPI release above.
+
+From a project subdirectory, omit both selection flags:
+
+```bash
+cd /path/to/project/steps
+nipact workflow list
+```
+
+An explicit path selects that project directly and can also omit the context:
+
+```bash
+nipact workflow list --project-dir /path/to/project
+```
+
+Without `--project-dir`, NIPACT searches the current directory and its parents and stops at the nearest `nipact.contexts.yaml` or `nipact.yaml`. An index takes precedence when both are in the same directory. A selected invalid marker fails there. An index with one entry selects it automatically; an empty index needs a project entry, and one with several entries requires `--context`:
+
+```bash
+cd /path/to/workspace
+nipact workflow list --context analysis
+```
+
+A supplied `--context` and a selected index key must match the context declared in the project's `nipact.yaml`. Relative index paths resolve from the index directory. After successful discovery, NIPACT prints one line with the absolute project root and context on stderr before running the command; `--project-dir` suppresses that selection line. Structured stdout remains available for JSON consumers.
+
 ## Specification sets
 
 The current source checkout includes specification sets as an optional finite overlay on ordinary workflows. A project can continue to define and run only steps and workflows; specification declarations are loaded only when a `specifications` command selects a registered key or an explicit file.
@@ -244,7 +270,7 @@ NOTES:
 
 `init` creates a generated demo project plus mutable runtime files. The project contains `nipact.yaml`, `sources.yaml`, manifests, step YAML, and workflow YAML.
 
-The runtime contains demo source files under `data/` and `database/registry.db`. It also writes `nipact.contexts.yaml` in the current workspace so later commands can resolve `--context <demo>` to the generated project root. The context index is workspace-local state; this repository ignores the root file so source-checkout testing does not add tutorial state to version control. `validate` is read-only.
+The runtime contains demo source files under `data/` and `database/registry.db`. It also writes `nipact.contexts.yaml` in the current workspace so later commands can select the generated project root from that workspace or its subdirectories. Pass `--context <demo>` when the index contains several demos. The context index is workspace-local state; this repository ignores the root file so source-checkout testing does not add tutorial state to version control. `validate` is read-only.
 
 Workflow inspection and execution:
 

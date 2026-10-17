@@ -13,39 +13,72 @@ from .identity import validate_path_token
 CONTEXT_INDEX_FILENAME = "nipact.contexts.yaml"
 
 
-def resolve_project_dir(
+def resolve_project(
     *,
     project_dir: Path | None,
-    context: str,
+    context: str | None,
     cwd: Path | None = None,
-) -> Path:
-    """Resolve a concrete project root for project-scoped commands."""
-    context = validate_path_token(context, label="context")
-    if project_dir is not None:
-        return project_dir.expanduser().resolve()
-
-    workspace_root = (cwd or Path.cwd()).expanduser().resolve()
-    index_path = workspace_root / CONTEXT_INDEX_FILENAME
-    if index_path.exists():
-        entries = _read_index(index_path)
-        raw_project_dir = entries.get(context)
-        if raw_project_dir is None:
+) -> tuple[Path, str]:
+    """Select a project root and its declared context without loading runtime state."""
+    if context is not None:
+        context = validate_path_token(context, label="context")
+    if project_dir is None:
+        start = (cwd or Path.cwd()).expanduser().resolve()
+        for directory in (start, *start.parents):
+            index_path = directory / CONTEXT_INDEX_FILENAME
+            if index_path.exists():
+                entries = _read_index(index_path)
+                if context is None:
+                    if len(entries) != 1:
+                        selection_help = (
+                            "pass --context to select one"
+                            if entries
+                            else "add an index entry or pass --project-dir"
+                        )
+                        raise ValidationError(
+                            f"{index_path} has {len(entries)} contexts; {selection_help}"
+                        )
+                    context = next(iter(entries))
+                if context not in entries:
+                    raise ValidationError(
+                        f"context {context!r} is not registered in {index_path}"
+                    )
+                project_dir = _resolve_index_project_dir(
+                    workspace_root=directory,
+                    raw_project_dir=entries[context],
+                )
+                break
+            if (directory / "nipact.yaml").exists():
+                project_dir = directory
+                break
+        else:
             raise ValidationError(
-                f"context {context!r} is not registered in {CONTEXT_INDEX_FILENAME}"
+                "could not resolve project dir; no nipact.contexts.yaml or "
+                "nipact.yaml found in the current directory or its parents; "
+                "pass --project-dir"
             )
-        return _resolve_index_project_dir(
-            workspace_root=workspace_root,
-            raw_project_dir=raw_project_dir,
-        )
 
-    if (workspace_root / "nipact.yaml").is_file():
-        return workspace_root
+    project_root = project_dir.expanduser().resolve()
+    if not project_root.is_dir():
+        raise ValidationError(f"project dir does not exist: {project_root}")
+    declared_context = _read_project_context(project_root / "nipact.yaml")
+    if context is not None and context != declared_context:
+        raise ValidationError(f"context mismatch in nipact.yaml: expected {context!r}")
+    return project_root, declared_context
 
-    raise ValidationError(
-        "could not resolve project dir; run from a workspace root containing "
-        f"{CONTEXT_INDEX_FILENAME}, run from a project root containing "
-        "nipact.yaml, or pass --project-dir"
-    )
+
+def _read_project_context(config_path: Path) -> str:
+    try:
+        payload = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    except FileNotFoundError as exc:
+        raise ValidationError(f"missing project config: {config_path}") from exc
+    except OSError as exc:
+        raise ValidationError(f"could not read project config: {config_path}") from exc
+    except yaml.YAMLError as exc:
+        raise ValidationError(f"invalid YAML file {config_path}: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise ValidationError(f"project config must contain a mapping: {config_path}")
+    return validate_path_token(payload.get("context"), label="context")
 
 
 def preflight_context_index_update(

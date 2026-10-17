@@ -10,7 +10,6 @@ from types import SimpleNamespace
 import pytest
 import yaml
 
-import nipact.context_index as context_index_module
 import nipact.execution as ordinary_execution_module
 import nipact.project_context as project_context_module
 import nipact.registry as registry_module
@@ -231,13 +230,10 @@ def test_preview_and_freeze_route_one_selected_source_to_one_service(
     expected_source: object,
 ) -> None:
     snapshot = decode_specification_snapshot(_CANONICAL_GOLDEN.read_bytes())
-    project_dir = tmp_path / "resolved-project"
+    project_dir = tmp_path / "selected-project"
+    project_dir.mkdir()
+    (project_dir / "nipact.yaml").write_text("context: canonical\n", encoding="utf-8")
     calls: list[tuple[str, Path, str, object]] = []
-
-    def resolve_project_dir(*, project_dir: Path | None, context: str) -> Path:
-        assert project_dir == Path("selected-project")
-        assert context == "canonical"
-        return tmp_path / "resolved-project"
 
     def compile_route(
         *, project_dir: Path, context: str, source: object
@@ -255,7 +251,6 @@ def test_preview_and_freeze_route_one_selected_source_to_one_service(
         calls.append(("freeze", project_dir, context, source))
         return SpecificationFreezeResult(snapshot=snapshot, inserted=True)
 
-    monkeypatch.setattr(context_index_module, "resolve_project_dir", resolve_project_dir)
     monkeypatch.setattr(execution_module, "compile_specification_snapshot", compile_route)
     monkeypatch.setattr(execution_module, "freeze_specification_snapshot", freeze_route)
     monkeypatch.chdir(tmp_path)
@@ -494,11 +489,8 @@ def test_run_projects_returned_members_and_exit_status_exactly(
     )
     calls: list[tuple[str, dict[str, object]]] = []
 
-    monkeypatch.setattr(
-        context_index_module,
-        "resolve_project_dir",
-        lambda **_kwargs: project_dir,
-    )
+    project_dir.mkdir()
+    (project_dir / "nipact.yaml").write_text("context: analysis\n", encoding="utf-8")
 
     def run_member(**kwargs: object) -> SpecificationMemberRunResult:
         calls.append(("member", kwargs))
@@ -599,11 +591,9 @@ def test_raised_run_failure_uses_error_path_without_partial_json(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    monkeypatch.setattr(
-        context_index_module,
-        "resolve_project_dir",
-        lambda **_kwargs: tmp_path / "project",
-    )
+    project_dir = tmp_path / "project"
+    project_dir.mkdir()
+    (project_dir / "nipact.yaml").write_text("context: analysis\n", encoding="utf-8")
     monkeypatch.setattr(
         execution_module,
         "run_specification_member",
@@ -619,6 +609,8 @@ def test_raised_run_failure_uses_error_path_without_partial_json(
             "member-1",
             "--context",
             "analysis",
+            "--project-dir",
+            str(project_dir),
         ]
     ) == 1
 
@@ -795,10 +787,9 @@ def test_results_serializes_the_complete_typed_projection_without_inference(
     )
     reads: list[tuple[Path, str, str]] = []
 
-    monkeypatch.setattr(
-        context_index_module,
-        "resolve_project_dir",
-        lambda **_kwargs: resolved.project_root,
+    resolved.project_root.mkdir()
+    (resolved.project_root / "nipact.yaml").write_text(
+        "context: canonical\n", encoding="utf-8"
     )
     monkeypatch.setattr(
         project_context_module,
@@ -825,6 +816,8 @@ def test_results_serializes_the_complete_typed_projection_without_inference(
             snapshot.snapshot_digest,
             "--context",
             "canonical",
+            "--project-dir",
+            str(resolved.project_root),
         ]
     ) == 0
 

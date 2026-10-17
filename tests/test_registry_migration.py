@@ -10,6 +10,7 @@ import pytest
 
 import nipact.execution as execution_module
 import nipact.registry as registry_module
+import nipact.workflow as workflow_module
 from conftest import (
     RegistryV18Fixture,
     RegistryV20Fixture,
@@ -902,7 +903,7 @@ def test_registry_dependent_commands_reject_v19_before_any_mutation(
 ) -> None:
     fixture = registry_v19_fixture
     if command == "validate":
-        argv = ["validate", *_project_args(fixture)]
+        argv = ["validate", "--project-dir", str(fixture.project_dir)]
     elif command == "trace":
         argv = [
             "trace",
@@ -961,11 +962,29 @@ def test_registry_migrate_resolves_project_from_context_index(
         "    project_dir: project\n",
         encoding="utf-8",
     )
-    monkeypatch.chdir(workspace)
+    nested = workspace / "workspace-tools/nested"
+    nested.mkdir(parents=True)
+    monkeypatch.chdir(nested)
 
-    assert main(["registry", "migrate", "--context", fixture.context]) == 0
+    def reject_callable(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("migration loaded a workflow callable")
 
-    output = capsys.readouterr().out.splitlines()
+    monkeypatch.setattr(workflow_module, "_validate_callable", reject_callable)
+    # Prove full loading reaches the tripwire with this fixture's real steps.
+    with pytest.raises(AssertionError, match="loaded a workflow callable"):
+        workflow_module.load_workflow_project(
+            project_dir=fixture.project_dir, context=fixture.context
+        )
+
+    assert main(["registry", "migrate"]) == 0
+
+    captured = capsys.readouterr()
+    selection_lines = captured.err.splitlines()
+    assert len(selection_lines) == 1
+    assert str(fixture.project_dir.resolve()) in selection_lines[0]
+    assert fixture.context in selection_lines[0]
+    assert _schema_version(fixture.registry_path) == 20
+    output = captured.out.splitlines()
     assert f"context={fixture.context}" in output
     assert "status=migrated" in output
     assert "from_schema=19" in output

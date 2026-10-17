@@ -81,20 +81,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="validate a NIPACT project context",
         description="Validate a NIPACT project context without mutating runtime files.",
     )
-    validate_parser.add_argument(
-        "--project-dir",
-        default=None,
-        type=Path,
-        help=(
-            "Project directory containing nipact.yaml. If omitted, resolve from "
-            "nipact.contexts.yaml or the current project root."
-        ),
-    )
-    validate_parser.add_argument(
-        "--context",
-        required=True,
-        help="Context name expected in nipact.yaml.",
-    )
+    _add_project_context_args(validate_parser)
     validate_parser.add_argument(
         "--outputs",
         action="store_true",
@@ -106,20 +93,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="serve the local provenance GUI",
         description="Serve the read-only local NIPACT provenance GUI.",
     )
-    gui_parser.add_argument(
-        "--context",
-        required=True,
-        help="Context name expected in nipact.yaml.",
-    )
-    gui_parser.add_argument(
-        "--project-dir",
-        type=Path,
-        default=None,
-        help=(
-            "Project directory containing nipact.yaml. If omitted, resolve from "
-            "nipact.contexts.yaml or the current project root."
-        ),
-    )
+    _add_project_context_args(gui_parser)
     gui_parser.add_argument(
         "--port",
         type=_positive_int,
@@ -346,14 +320,19 @@ def _add_project_context_args(parser: argparse.ArgumentParser) -> None:
         default=None,
         type=Path,
         help=(
-            "Project directory containing nipact.yaml. If omitted, resolve from "
-            "nipact.contexts.yaml or the current project root."
+            "Project directory containing nipact.yaml. If omitted, search the "
+            "current directory and parents for the nearest nipact.contexts.yaml "
+            "or nipact.yaml; the context index takes precedence in the same directory."
         ),
     )
     parser.add_argument(
         "--context",
-        required=True,
-        help="Context name expected in nipact.yaml.",
+        default=None,
+        help=(
+            "Context to select from a workspace index. If omitted, infer from "
+            "nipact.yaml or select the only index entry. A supplied context must "
+            "match the project's declared context."
+        ),
     )
 
 
@@ -417,7 +396,7 @@ def _print_pass(text: str) -> None:
 def _run_specifications_command(args: argparse.Namespace) -> int:
     from .errors import ValidationError
 
-    project_dir = _resolve_project_dir_arg(args)
+    project_dir = args.project_dir
     if args.specifications_command == "preview":
         from .specification_execution import compile_specification_snapshot
 
@@ -642,7 +621,7 @@ def _print_json_document(payload: Mapping[str, Any]) -> None:
 def _run_workflow_command(args: argparse.Namespace) -> int | None:
     from .errors import ValidationError
 
-    project_dir = _resolve_project_dir_arg(args)
+    project_dir = args.project_dir
     if args.workflow_command == "run":
         from .cli_feedback import CliFeedback
         from .execution import build_run_plan, execute_run_plan
@@ -880,7 +859,7 @@ def _run_registry_command(args: argparse.Namespace) -> None:
     if args.registry_command != "migrate":
         raise ValidationError(f"unknown registry command: {args.registry_command}")
 
-    project_dir = _resolve_project_dir_arg(args)
+    project_dir = args.project_dir
     resolved = resolve_project_context_for_migration(
         project_dir=project_dir,
         context=args.context,
@@ -909,7 +888,7 @@ def _run_registry_command(args: argparse.Namespace) -> None:
 
 
 def _run_trace_command(args: argparse.Namespace) -> None:
-    project_dir = _resolve_project_dir_arg(args)
+    project_dir = args.project_dir
     registry_path = _trace_registry_path(
         project_dir=project_dir,
         context=args.context,
@@ -926,7 +905,7 @@ def _run_gui_command(args: argparse.Namespace) -> None:
 
     import uvicorn
 
-    project_dir = _resolve_project_dir_arg(args)
+    project_dir = args.project_dir
     app = create_gui_app(project_dir=project_dir, context=args.context)
     url = f"http://127.0.0.1:{args.port}/"
     print(url)
@@ -994,12 +973,6 @@ def _trace_registry_path(*, project_dir: Path, context: str) -> Path:
     from .project_context import resolve_project_context
 
     return resolve_project_context(project_dir=project_dir, context=context).registry_path
-
-
-def _resolve_project_dir_arg(args: argparse.Namespace) -> Path:
-    from .context_index import resolve_project_dir
-
-    return resolve_project_dir(project_dir=args.project_dir, context=args.context)
 
 
 def _print_trace_summary(graph: dict[str, Any]) -> None:
@@ -1078,6 +1051,20 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     try:
+        if args.command != "init":
+            from .context_index import resolve_project
+
+            discovered = args.project_dir is None
+            args.project_dir, args.context = resolve_project(
+                project_dir=args.project_dir,
+                context=args.context,
+            )
+            if discovered:
+                print(
+                    f"Selected project: {args.project_dir} (context: {args.context})",
+                    file=sys.stderr,
+                )
+
         if args.command == "init":
             from .project_setup import init_project
             from .context_index import (
@@ -1123,7 +1110,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         elif args.command == "validate":
             from .project_setup import validate_project
 
-            project_dir = _resolve_project_dir_arg(args)
+            project_dir = args.project_dir
             result = validate_project(
                 project_dir=project_dir,
                 context=args.context,
