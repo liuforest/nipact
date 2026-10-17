@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-import json
 import os
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -17,7 +16,6 @@ from .examples.dynamic_functional_connectivity_demo import (
 )
 from .examples.fmri_preprocessing_demo import project_template as fmri_template
 from .errors import ValidationError
-from .hashing import sha256_digest, short_hash
 from .identity import validate_path_token
 from .manifest import Manifest
 from . import registry
@@ -29,6 +27,7 @@ if TYPE_CHECKING:
 _PROJECT_DIRECTORIES = ("manifests", "steps", "workflows")
 _RUNTIME_DIRECTORIES = ("data", "database", "outputs", "manifests/generated")
 _PREPARED_DEMO_TEMPLATES = {
+    colors_template.SUPPORTED_DEMO: colors_template,
     fmri_template.SUPPORTED_DEMO: fmri_template,
     dfc_template.SUPPORTED_DEMO: dfc_template,
     directories_template.SUPPORTED_DEMO: directories_template,
@@ -54,8 +53,6 @@ class InitResult:
     source_index: str
     manifest_count: int
     source_file_count: int
-    source_hash: str | None = None
-    manifest_hash: str | None = None
 
 
 @dataclass(frozen=True)
@@ -84,13 +81,6 @@ def init_project(
     runtime_dir: Path,
     context: str | None,
 ) -> InitResult:
-    if demo == colors_template.SUPPORTED_DEMO:
-        return _init_colors_project(
-            demo=demo,
-            project_dir=project_dir,
-            runtime_dir=runtime_dir,
-            context=context,
-        )
     template = _prepared_demo_template(demo)
     if template is None:
         supported = ", ".join(_SUPPORTED_DEMOS)
@@ -101,61 +91,6 @@ def init_project(
         project_dir=project_dir,
         runtime_dir=runtime_dir,
         context=context,
-    )
-
-
-def _init_colors_project(
-    *,
-    demo: str,
-    project_dir: Path,
-    runtime_dir: Path,
-    context: str | None,
-) -> InitResult:
-    context = _validate_context(demo if context is None else context)
-
-    project_root = project_dir.expanduser().resolve()
-    runtime_root = runtime_dir.expanduser().resolve()
-    _validate_project_runtime_roots(project_root, runtime_root)
-
-    _require_empty_target(project_root, "project dir")
-    _require_empty_target(runtime_root, "runtime dir")
-
-    _create_project_runtime_dirs(project_root, runtime_root)
-
-    source_payload = colors_template.source_payload()
-    source_digest = _json_digest(source_payload)
-    source_hash = short_hash(source_digest)
-    source_path = runtime_root / colors_template.SOURCE_ARTIFACT_PATH
-    _write_json(source_path, source_payload)
-
-    manifests = colors_template.build_manifests()
-    _write_project_files(
-        template=colors_template,
-        project_root=project_root,
-        runtime_root=runtime_root,
-        runtime_arg=runtime_dir,
-        context=context,
-        manifests=manifests,
-    )
-
-    registry.initialize_registry_db(
-        runtime_root / registry.REGISTRY_DB_PATH,
-        context=context,
-        runtime_root=runtime_root,
-        manifests=manifests,
-        manifest_paths=colors_template.manifest_paths(),
-    )
-
-    return InitResult(
-        project_root=project_root,
-        runtime_root=runtime_root,
-        context=context,
-        demo=demo,
-        source_index=colors_template.SOURCE_INDEX_PATH,
-        manifest_count=len(manifests),
-        source_file_count=1,
-        source_hash=source_hash,
-        manifest_hash=manifests[colors_template.ANALYSIS_COHORT_NAME].manifest_hash,
     )
 
 
@@ -189,7 +124,7 @@ def _init_prepared_demo_project(
         manifests=manifests,
     )
 
-    registry.initialize_prepared_demo_registry_db(
+    registry.initialize_registry_db(
         runtime_root / registry.REGISTRY_DB_PATH,
         context=context,
         runtime_root=runtime_root,
@@ -359,15 +294,3 @@ def _path_contains_or_same(parent: Path, child: Path) -> bool:
 
 def _write_yaml(path: Path, payload: dict[str, Any]) -> None:
     path.write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")
-
-
-def _write_json(path: Path, payload: dict[str, Any]) -> None:
-    path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-
-
-def _json_digest(payload: Any) -> str:
-    return sha256_digest(_canonical_json(payload).encode("utf-8"))
-
-
-def _canonical_json(payload: Any) -> str:
-    return json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)

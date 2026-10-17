@@ -507,7 +507,7 @@ def step_apply_file(*, inputs, outputs, params, address):
             encoding="utf-8",
         )
 
-    registry_module.initialize_prepared_demo_registry_db(
+    registry_module.initialize_registry_db(
         runtime_dir / "database/registry.db",
         context="cache",
         runtime_root=runtime_dir,

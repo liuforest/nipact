@@ -598,36 +598,6 @@ def initialize_registry_db(
         )
 
 
-def initialize_prepared_demo_registry_db(
-    path: Path,
-    *,
-    context: str,
-    runtime_root: Path,
-    manifests: dict[str, Manifest],
-    manifest_paths: dict[str, str],
-) -> None:
-    """Create the small prepared-project registry surface for synthetic demos."""
-    _initialize_storage_layout(runtime_root)
-    with _connect(path) as conn:
-        _create_schema(conn)
-        conn.execute(
-            """
-            INSERT INTO contexts (context, runtime_path, storage_layout_version)
-            VALUES (?, ?, ?)
-            ON CONFLICT(context) DO UPDATE SET
-                runtime_path = excluded.runtime_path,
-                storage_layout_version = excluded.storage_layout_version
-            """,
-            (context, str(runtime_root), STORAGE_LAYOUT_VERSION),
-        )
-        _insert_manifest_declarations(
-            conn,
-            context=context,
-            manifests=manifests,
-            manifest_paths=manifest_paths,
-        )
-
-
 def insert_or_verify_specification_snapshot(
     path: Path,
     *,
