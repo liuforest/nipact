@@ -65,7 +65,7 @@ def build_parser() -> argparse.ArgumentParser:
     init_parser.add_argument(
         "--runtime-dir",
         type=Path,
-        help="Required with --demo: create mutable demo runtime files here. Otherwise use nipact.yaml.",
+        help="Required with --demo: create mutable demo runtime files here. Rejected otherwise (runtime root comes from nipact.yaml).",
     )
     init_parser.add_argument(
         "--context",

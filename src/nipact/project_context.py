@@ -6,8 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-import yaml
-
+from .context_index import read_project_config
 from .errors import ValidationError
 from .identity import validate_path_token
 from .registry import REGISTRY_DB_PATH, read_context_runtime_path
@@ -57,7 +56,7 @@ def _resolve_project_context_paths(
         raise ValidationError(f"project dir does not exist: {project_dir}")
 
     config_path = project_root / "nipact.yaml"
-    config = _read_project_config(config_path)
+    config = read_project_config(config_path)
     parse_specification_registrations(config)
     if config.get("context") != context:
         raise ValidationError(f"context mismatch in nipact.yaml: expected {context!r}")
@@ -73,20 +72,6 @@ def _resolve_project_context_paths(
         registry_path=registry_path,
         context=context,
     )
-
-
-def _read_project_config(config_path: Path) -> dict[str, Any]:
-    try:
-        payload = yaml.safe_load(config_path.read_text(encoding="utf-8"))
-    except FileNotFoundError as exc:
-        raise ValidationError(f"missing project config: {config_path}") from exc
-    except OSError as exc:
-        raise ValidationError(f"could not read project config: {config_path}") from exc
-    except yaml.YAMLError as exc:
-        raise ValidationError(f"invalid YAML file {config_path}: {exc}") from exc
-    if not isinstance(payload, dict):
-        raise ValidationError(f"project config must contain a mapping: {config_path}")
-    return payload
 
 
 def _runtime_root(*, project_root: Path, config: dict[str, Any]) -> Path:

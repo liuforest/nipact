@@ -32,12 +32,6 @@ _PREPARED_DEMO_TEMPLATES = {
     dfc_template.SUPPORTED_DEMO: dfc_template,
     directories_template.SUPPORTED_DEMO: directories_template,
 }
-_SUPPORTED_DEMOS = (
-    colors_template.SUPPORTED_DEMO,
-    fmri_template.SUPPORTED_DEMO,
-    dfc_template.SUPPORTED_DEMO,
-    directories_template.SUPPORTED_DEMO,
-)
 
 
 class ProjectSetupError(RuntimeError):
@@ -74,26 +68,6 @@ class ValidateResult:
         )
 
 
-def init_project(
-    *,
-    demo: str,
-    project_dir: Path,
-    runtime_dir: Path,
-    context: str | None,
-) -> InitResult:
-    template = _prepared_demo_template(demo)
-    if template is None:
-        supported = ", ".join(_SUPPORTED_DEMOS)
-        raise ProjectSetupError(f"unknown demo {demo!r}; expected one of: {supported}")
-    return _init_prepared_demo_project(
-        template=template,
-        demo=demo,
-        project_dir=project_dir,
-        runtime_dir=runtime_dir,
-        context=context,
-    )
-
-
 def init_existing_project(*, project_dir: Path, context: str) -> LoadedWorkflowProject:
     from .workflow import warn_unusable_declarations
 
@@ -124,14 +98,17 @@ def init_existing_project(*, project_dir: Path, context: str) -> LoadedWorkflowP
     return loaded
 
 
-def _init_prepared_demo_project(
+def init_project(
     *,
-    template: Any,
     demo: str,
     project_dir: Path,
     runtime_dir: Path,
     context: str | None,
 ) -> InitResult:
+    template = _PREPARED_DEMO_TEMPLATES.get(demo)
+    if template is None:
+        supported = ", ".join(_PREPARED_DEMO_TEMPLATES)
+        raise ProjectSetupError(f"unknown demo {demo!r}; expected one of: {supported}")
     context = _validate_context(demo if context is None else context)
 
     project_root = project_dir.expanduser().resolve()
@@ -229,10 +206,6 @@ def _load_workflow_project(project_root: Path, *, context: str) -> Any:
         )
     except ValidationError as exc:
         raise ProjectSetupError(str(exc)) from exc
-
-
-def _prepared_demo_template(demo: str) -> Any | None:
-    return _PREPARED_DEMO_TEMPLATES.get(demo)
 
 
 def _require_empty_target(path: Path, label: str) -> None:

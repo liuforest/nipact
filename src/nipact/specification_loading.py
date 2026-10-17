@@ -14,6 +14,7 @@ from yaml.events import AliasEvent
 from yaml.nodes import MappingNode, Node, ScalarNode, SequenceNode
 from yaml.resolver import BaseResolver
 
+from .context_index import read_project_config
 from .errors import ValidationError
 from .identity import validate_path_token
 from .specification_config import (
@@ -111,7 +112,7 @@ def load_specification_project(
     )
     warn_unusable_declarations(workflow_project)
     registrations = parse_specification_registrations(
-        _read_project_config(workflow_project.project_root / "nipact.yaml")
+        read_project_config(workflow_project.project_root / "nipact.yaml")
     )
     specification = _load_selected_specification(
         project_root=workflow_project.project_root,
@@ -353,17 +354,3 @@ def _validate_strict_value(value: object, *, origin: str) -> None:
             _validate_strict_value(child, origin=origin)
         return
     raise ValidationError(f"unsupported YAML scalar type: {origin}")
-
-
-def _read_project_config(path: Path) -> dict[str, Any]:
-    try:
-        payload = yaml.safe_load(path.read_text(encoding="utf-8"))
-    except FileNotFoundError as exc:
-        raise ValidationError(f"missing project config: {path}") from exc
-    except OSError as exc:
-        raise ValidationError(f"could not read project config: {path}") from exc
-    except yaml.YAMLError as exc:
-        raise ValidationError(f"invalid YAML file {path}: {exc}") from exc
-    if not isinstance(payload, dict):
-        raise ValidationError(f"project config must contain a mapping: {path}")
-    return payload

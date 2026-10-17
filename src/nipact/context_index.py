@@ -1,9 +1,10 @@
-"""Workspace-local context index helpers."""
+"""Project selection, workspace context index helpers, and nipact.yaml reading."""
 
 from __future__ import annotations
 
 import os
 from pathlib import Path
+from typing import Any
 
 import yaml
 
@@ -61,24 +62,26 @@ def resolve_project(
     project_root = project_dir.expanduser().resolve()
     if not project_root.is_dir():
         raise ValidationError(f"project dir does not exist: {project_root}")
-    declared_context = _read_project_context(project_root / "nipact.yaml")
+    declared_context = validate_path_token(
+        read_project_config(project_root / "nipact.yaml").get("context"), label="context"
+    )
     if context is not None and context != declared_context:
         raise ValidationError(f"context mismatch in nipact.yaml: expected {context!r}")
     return project_root, declared_context
 
 
-def _read_project_context(config_path: Path) -> str:
+def read_project_config(config_path: Path) -> dict[str, Any]:
     try:
         payload = yaml.safe_load(config_path.read_text(encoding="utf-8"))
     except FileNotFoundError as exc:
         raise ValidationError(f"missing project config: {config_path}") from exc
-    except OSError as exc:
+    except (OSError, UnicodeError) as exc:
         raise ValidationError(f"could not read project config: {config_path}") from exc
     except yaml.YAMLError as exc:
         raise ValidationError(f"invalid YAML file {config_path}: {exc}") from exc
     if not isinstance(payload, dict):
         raise ValidationError(f"project config must contain a mapping: {config_path}")
-    return validate_path_token(payload.get("context"), label="context")
+    return payload
 
 
 def preflight_context_index_update(

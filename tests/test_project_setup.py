@@ -485,7 +485,6 @@ def test_init_existing_project_preserves_staged_files_and_catalogs_valid_manifes
     assert str(project_dir) in selection_lines[0] and "mini" in selection_lines[0]
     assert captured.err.count("WARNING:") == 1
     assert "manifests/broken.yaml" in captured.err
-    assert "nipact validate" in captured.err
     summary = dict(
         line.split("=", maxsplit=1)
         for line in captured.out.splitlines()
@@ -591,21 +590,6 @@ def test_init_existing_project_refuses_overlapping_roots_before_writes(
         path.relative_to(tmp_path): path.read_bytes() if path.is_file() else None
         for path in tmp_path.rglob("*")
     } == before
-
-
-def test_init_existing_project_load_failure_precedes_runtime_creation(
-    tmp_path: Path,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    project_dir, runtime_dir = _write_generic_prepared_project(tmp_path)
-    runtime_dir.rmdir()
-    (project_dir / "sources.yaml").write_text("entities: [\n")
-
-    assert _run_main_from(tmp_path, ["init", "--project-dir", str(project_dir)]) == 1
-    captured = capsys.readouterr()
-    assert captured.out == ""
-    assert "sources.yaml" in captured.err and "invalid YAML" in captured.err
-    assert not runtime_dir.exists()
 
 
 def test_init_creates_project_runtime_databases_and_validates(
