@@ -50,30 +50,27 @@ def build_parser() -> argparse.ArgumentParser:
 
     init_parser = subparsers.add_parser(
         "init",
-        help="initialize a packaged demo project",
-        description="Initialize a packaged NIPACT demo project.",
+        help="initialize an existing project runtime or create a packaged demo",
+        description="Initialize an existing NIPACT project runtime or create a packaged demo.",
     )
     init_parser.add_argument(
         "--demo",
-        required=True,
-        help="Packaged demo name. Supported demos: colors, fmri, dfc, directories.",
+        help="Create a packaged demo: colors, fmri, dfc, or directories. Requires both directory flags.",
     )
     init_parser.add_argument(
         "--project-dir",
-        required=True,
         type=Path,
-        help="Directory where project config, manifests, steps, and workflows are created.",
+        help="Existing project directory; discover from the current directory and parents if omitted. With --demo, create the project here.",
     )
     init_parser.add_argument(
         "--runtime-dir",
-        required=True,
         type=Path,
-        help="Directory where mutable demo runtime files are created.",
+        help="Required with --demo: create mutable demo runtime files here. Otherwise use nipact.yaml.",
     )
     init_parser.add_argument(
         "--context",
         default=None,
-        help="Context name to write into the generated project config. Defaults to --demo.",
+        help="Must match nipact.yaml for an existing project. With --demo, write this context; defaults to the demo name.",
     )
 
     validate_parser = subparsers.add_parser(
@@ -1051,7 +1048,21 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     try:
-        if args.command != "init":
+        if args.command == "init":
+            from .errors import ValidationError
+
+            if args.demo is None and args.runtime_dir is not None:
+                raise ValidationError("--runtime-dir requires --demo")
+            if args.demo is not None:
+                missing = []
+                if args.project_dir is None:
+                    missing.append("--project-dir")
+                if args.runtime_dir is None:
+                    missing.append("--runtime-dir")
+                if missing:
+                    raise ValidationError(f"--demo requires {' and '.join(missing)}")
+
+        if args.command != "init" or args.demo is None:
             from .context_index import resolve_project
 
             discovered = args.project_dir is None
@@ -1066,38 +1077,48 @@ def main(argv: Sequence[str] | None = None) -> int:
                 )
 
         if args.command == "init":
-            from .project_setup import init_project
-            from .context_index import (
-                preflight_context_index_update,
-                update_context_index,
-            )
+            from .project_setup import init_existing_project, init_project
 
-            effective_context = args.context or args.demo
-            preflight_context_index_update(
-                workspace_dir=Path.cwd(),
-                context=effective_context,
-                project_dir=args.project_dir,
-            )
+            if args.demo is None:
+                result = init_existing_project(
+                    project_dir=args.project_dir,
+                    context=args.context,
+                )
+                manifest_count = len(result.manifests)
+            else:
+                from .context_index import (
+                    preflight_context_index_update,
+                    update_context_index,
+                )
 
-            result = init_project(
-                demo=args.demo,
-                project_dir=args.project_dir,
-                runtime_dir=args.runtime_dir,
-                context=args.context,
-            )
-            context_index_path = update_context_index(
-                workspace_dir=Path.cwd(),
-                context=result.context,
-                project_dir=result.project_root,
-            )
+                effective_context = args.context or args.demo
+                preflight_context_index_update(
+                    workspace_dir=Path.cwd(),
+                    context=effective_context,
+                    project_dir=args.project_dir,
+                )
+                result = init_project(
+                    demo=args.demo,
+                    project_dir=args.project_dir,
+                    runtime_dir=args.runtime_dir,
+                    context=args.context,
+                )
+                context_index_path = update_context_index(
+                    workspace_dir=Path.cwd(),
+                    context=result.context,
+                    project_dir=result.project_root,
+                )
+                manifest_count = result.manifest_count
             print(f"project_root={_display_path(result.project_root)}")
             print(f"runtime_root={_display_path(result.runtime_root)}")
             print(f"context={result.context}")
-            print(f"context_index={_display_path(context_index_path)}")
-            print(f"demo={args.demo}")
-            print(f"source_index={result.source_index}")
-            print(f"manifest_count={result.manifest_count}")
-            print(f"source_file_count={result.source_file_count}")
+            if args.demo is not None:
+                print(f"context_index={_display_path(context_index_path)}")
+                print(f"demo={args.demo}")
+                print(f"source_index={result.source_index}")
+            print(f"manifest_count={manifest_count}")
+            if args.demo is not None:
+                print(f"source_file_count={result.source_file_count}")
             print("databases=database/registry.db")
             print("runtime_dirs=data,database,outputs,manifests/generated")
             _print_pass("PASS: init")

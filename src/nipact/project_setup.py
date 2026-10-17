@@ -1,4 +1,4 @@
-"""Minimal project setup helpers for packaged demo projects."""
+"""Runtime initialization, packaged demo creation, and project validation."""
 
 from __future__ import annotations
 
@@ -21,7 +21,7 @@ from .manifest import Manifest
 from . import registry
 
 if TYPE_CHECKING:
-    from .workflow import DeclarationRecord
+    from .workflow import DeclarationRecord, LoadedWorkflowProject
 
 
 _PROJECT_DIRECTORIES = ("manifests", "steps", "workflows")
@@ -92,6 +92,36 @@ def init_project(
         runtime_dir=runtime_dir,
         context=context,
     )
+
+
+def init_existing_project(*, project_dir: Path, context: str) -> LoadedWorkflowProject:
+    from .workflow import warn_unusable_declarations
+
+    loaded = _load_workflow_project(project_dir, context=context)
+    _validate_project_runtime_roots(loaded.project_root, loaded.runtime_root)
+    registry_path = loaded.runtime_root / registry.REGISTRY_DB_PATH
+    if registry_path.exists() or registry_path.is_symlink():
+        raise ProjectSetupError(f"registry already exists: {registry_path}")
+    manifest_paths = {
+        name: loaded.manifest_paths[name].relative_to(loaded.project_root).as_posix()
+        for name in loaded.manifests
+    }
+    warn_unusable_declarations(loaded)
+    try:
+        for relative_dir in _RUNTIME_DIRECTORIES:
+            (loaded.runtime_root / relative_dir).mkdir(parents=True, exist_ok=True)
+        registry.initialize_registry_db(
+            registry_path,
+            context=loaded.context,
+            runtime_root=loaded.runtime_root,
+            manifests=loaded.manifests,
+            manifest_paths=manifest_paths,
+        )
+    except OSError as exc:
+        raise ProjectSetupError(
+            f"could not initialize runtime dir {loaded.runtime_root}: {exc}"
+        ) from exc
+    return loaded
 
 
 def _init_prepared_demo_project(

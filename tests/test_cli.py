@@ -238,21 +238,32 @@ def test_registry_migrate_failure_has_no_partial_stdout(
     assert captured.err == "error: migration failed\n"
 
 
-def test_cli_init_requires_demo_flag() -> None:
-    with pytest.raises(SystemExit) as exc_info:
-        main(
-            [
-                "init",
-                "--project-dir",
-                "project",
-                "--runtime-dir",
-                "runtime",
-                "--context",
-                "colors",
-            ]
-        )
-
-    assert exc_info.value.code == 2
+@pytest.mark.parametrize(
+    ("arguments", "diagnostic"),
+    [
+        (["--runtime-dir", "runtime"], "--runtime-dir requires --demo"),
+        (
+            ["--demo", "colors", "--runtime-dir", "runtime"],
+            "--demo requires --project-dir",
+        ),
+        (
+            ["--demo", "colors", "--project-dir", "project"],
+            "--demo requires --runtime-dir",
+        ),
+    ],
+)
+def test_cli_init_rejects_invalid_flag_combinations_before_discovery(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    arguments: list[str],
+    diagnostic: str,
+) -> None:
+    assert _run_main_from(tmp_path, ["init", *arguments]) == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err.startswith("error:")
+    assert diagnostic in captured.err
+    assert list(tmp_path.iterdir()) == []
 
 
 def test_cli_init_defaults_context_to_demo(

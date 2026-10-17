@@ -91,6 +91,27 @@ nipact workflow list --context analysis
 
 A supplied `--context` and a selected index key must match the context declared in the project's `nipact.yaml`. Relative index paths resolve from the index directory. After successful discovery, NIPACT prints one line with the absolute project root and context on stderr before running the command; `--project-dir` suppresses that selection line. Structured stdout remains available for JSON consumers.
 
+## Initializing an existing project
+
+**Source checkout after `0.0.1a18`:** initialize runtime storage for existing declarations from the project root or a subdirectory:
+
+```bash
+cd /path/to/project/steps
+nipact init
+nipact validate
+```
+
+Or select the project explicitly:
+
+```bash
+nipact init --project-dir /path/to/project
+nipact validate --project-dir /path/to/project
+```
+
+Context and runtime root come from `nipact.yaml`; a supplied `--context` must match. `--runtime-dir` requires `--demo`. Existing-project initialization creates a missing runtime and accepts staged data and other files. It refuses an existing `database/registry.db` or overlapping project and runtime roots before writing runtime state.
+
+Initialization uses ordinary project loading: malformed configuration or `sources.yaml`, and missing or empty `steps/`, `workflows/` or `manifests/` directories still fail. It warns about unusable declarations and catalogs only valid manifests, including unused ones. It leaves declarations, staged files and existing output contents untouched, records no source or output provenance, executes no workflow, and creates or updates no workspace index. Successful initialization does not certify runnable workflows; use `nipact validate` to diagnose declaration and registry problems.
+
 ## Specification sets
 
 The current source checkout includes specification sets as an optional finite overlay on ordinary workflows. A project can continue to define and run only steps and workflows; specification declarations are loaded only when a `specifications` command selects a registered key or an explicit file.
@@ -266,11 +287,11 @@ nipact validate --context directories
 ```
 
 NOTES:
-`--project-dir` and `--runtime-dir` must be empty and must not contain each other.
+For `init --demo`, `--project-dir` and `--runtime-dir` are required, must be empty and must not contain each other.
 
-`init` creates a generated demo project plus mutable runtime files. The project contains `nipact.yaml`, `sources.yaml`, manifests, step YAML, and workflow YAML.
+`init --demo` creates a generated demo project plus mutable runtime files. The project contains `nipact.yaml`, `sources.yaml`, manifests, step YAML, and workflow YAML.
 
-The runtime contains demo source files under `data/` and `database/registry.db`. It also writes `nipact.contexts.yaml` in the current workspace so later commands can select the generated project root from that workspace or its subdirectories. Pass `--context <demo>` when the index contains several demos. The context index is workspace-local state; this repository ignores the root file so source-checkout testing does not add tutorial state to version control. `validate` is read-only.
+The runtime contains demo source files under `data/` and `database/registry.db`. `init --demo` also writes `nipact.contexts.yaml` in the current workspace so later commands can select the generated project root from that workspace or its subdirectories. Pass `--context <demo>` when the index contains several demos. The context index is workspace-local state; this repository ignores the root file so source-checkout testing does not add tutorial state to version control. `validate` is read-only.
 
 Workflow inspection and execution:
 
